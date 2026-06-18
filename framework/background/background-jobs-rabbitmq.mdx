@@ -1,0 +1,503 @@
+---
+title: "Background Jobs · RabbitMQ adapter"
+sidebarTitle: "Jobs · RabbitMQ"
+description: "RabbitMqBackgroundJobManager, JobQueueManager, per-args JobQueue<TArgs>, delayed queue via dead-letter, prefetch, and reject-semantics in Volo.Abp.BackgroundJobs.RabbitMQ."
+---
+
+`Volo.Abp.BackgroundJobs.RabbitMQ` ships an adapter that turns each
+ABP job‑args type into a dedicated RabbitMQ queue. The manager forwards
+to a `JobQueueManager` that lazily resolves a `IJobQueue<TArgs>` and
+publishes the serialized message. Consumption uses
+`AsyncEventingBasicConsumer` with `autoAck: false`, so failures map to
+`BasicReject` and the executer's exception type drives whether messages
+go back to the queue.
+
+Delayed jobs use the *dead‑letter* trick: a second per‑type queue with
+`x‑dead‑letter‑routing‑key` pointing at the live queue, and TTL set per
+message via `BasicProperties.Expiration`.
+
+<CardGroup cols={2}>
+  <Card title="Abstractions" icon="cube" href="/framework/background/background-jobs-abstractions">
+    The IBackgroundJobManager contract this adapter implements.
+  </Card>
+  <Card title="Default engine" icon="gears" href="/framework/background/background-jobs">
+    What the RabbitMQ adapter replaces.
+  </Card>
+  <Card title="Hangfire adapter" icon="fire" href="/framework/background/background-jobs-hangfire">
+    Alternative engine with a built-in dashboard.
+  </Card>
+  <Card title="Quartz adapter" icon="clock" href="/framework/background/background-jobs-quartz">
+    Alternative engine for scheduling-heavy workloads.
+  </Card>
+</CardGroup>
+
+## File inventory
+
+Source path: `framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/`.
+
+| File | Purpose |
+| --- | --- |
+| `AbpBackgroundJobsRabbitMqModule.cs` | Module — registers `IJobQueue<>`, starts/stops `IJobQueueManager` |
+| `RabbitMqBackgroundJobManager.cs` | `IBackgroundJobManager` that delegates to a per‑args queue |
+| `IJobQueue.cs` | `EnqueueAsync` + `IRunnable + IDisposable` contract |
+| `JobQueue.cs` | The per‑args queue: declares queue + delayed queue, consumes messages |
+| `IJobQueueManager.cs` | Per‑process registry of running `IJobQueue` instances |
+| `JobQueueManager.cs` | Lazy initialization + start/stop fan‑out |
+| `JobQueueConfiguration.cs` | `QueueDeclareConfiguration` subclass with `DelayedQueueName` |
+| `AbpRabbitMqBackgroundJobOptions.cs` | Per‑type overrides + default queue‑name prefixes + prefetch |
+
+## Module wire‑up
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/AbpBackgroundJobsRabbitMqModule.cs
+[DependsOn(
+    typeof(AbpBackgroundJobsAbstractionsModule),
+    typeof(AbpRabbitMqModule),
+    typeof(AbpThreadingModule)
+)]
+public class AbpBackgroundJobsRabbitMqModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddSingleton(typeof(IJobQueue<>), typeof(JobQueue<>));
+    }
+
+    public async override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+        => await context.ServiceProvider.GetRequiredService<IJobQueueManager>().StartAsync();
+
+    public async override Task OnApplicationShutdownAsync(ApplicationShutdownContext context)
+        => await context.ServiceProvider.GetRequiredService<IJobQueueManager>().StopAsync();
+}
+```
+
+The open‑generic `IJobQueue<>` → `JobQueue<>` registration is the key
+line. Each per‑args queue is a singleton. The manager's `StartAsync`
+walks every job configuration in `AbpBackgroundJobOptions` and resolves
+the corresponding `IJobQueue<TArgs>` — that resolution declares the
+queue, declares the delayed queue, and (when `IsJobExecutionEnabled`)
+attaches a consumer.
+
+## `RabbitMqBackgroundJobManager`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/RabbitMqBackgroundJobManager.cs
+[Dependency(ReplaceServices = true)]
+public class RabbitMqBackgroundJobManager : IBackgroundJobManager, ITransientDependency
+{
+    public async Task<string> EnqueueAsync<TArgs>(
+        TArgs args,
+        BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+        TimeSpan? delay = null)
+    {
+        var jobQueue = await _jobQueueManager.GetAsync<TArgs>();
+        return (await jobQueue.EnqueueAsync(args, priority, delay))!;
+    }
+}
+```
+
+The manager is one line of meaningful logic: resolve the queue, push.
+
+| Aspect | Implementation |
+| --- | --- |
+| Returned id | `null` (the inner queue always returns `null`; the manager force‑unwraps) |
+| Priority parameter | **Ignored.** Marked `//TODO: How to handle priority` in `JobQueue.PublishAsync` |
+| Delay parameter | Routes to the delayed queue with `BasicProperties.Expiration = delay.TotalMilliseconds.ToString()` |
+| Serializer | `IRabbitMqSerializer` from `Volo.Abp.RabbitMQ` — independent of `IBackgroundJobSerializer` |
+
+<Warning>
+  Calls like `await mgr.EnqueueAsync(args)` return a string, but with this adapter the value is the result of `null!` — i.e. `null` cast as `string` (compiler‑suppressed). Do not parse or compare it. Use the args type or `RabbitMQ` headers to correlate.
+</Warning>
+
+## `JobQueueManager`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/JobQueueManager.cs
+public class JobQueueManager : IJobQueueManager, ISingletonDependency
+{
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        if (!Options.IsJobExecutionEnabled) return;
+
+        foreach (var jobConfiguration in Options.GetJobs())
+        {
+            var jobQueue = (IRunnable)ServiceProvider.GetRequiredService(typeof(IJobQueue<>).MakeGenericType(jobConfiguration.ArgsType));
+            await jobQueue.StartAsync(cancellationToken);
+            JobQueues[jobConfiguration.JobName] = jobQueue;
+        }
+    }
+
+    public async Task<IJobQueue<TArgs>> GetAsync<TArgs>()
+    {
+        var jobConfiguration = Options.GetJob(typeof(TArgs));
+
+        if (JobQueues.TryGetValue(jobConfiguration.JobName, out var jobQueue))
+        {
+            return (IJobQueue<TArgs>)jobQueue;
+        }
+
+        using (await SyncSemaphore.LockAsync())
+        {
+            if (JobQueues.TryGetValue(jobConfiguration.JobName, out jobQueue))
+                return (IJobQueue<TArgs>)jobQueue;
+
+            jobQueue = (IJobQueue<TArgs>)ServiceProvider
+                .GetRequiredService(typeof(IJobQueue<>).MakeGenericType(typeof(TArgs)));
+
+            await jobQueue.StartAsync();
+
+            JobQueues.TryAdd(jobConfiguration.JobName, jobQueue);
+
+            return (IJobQueue<TArgs>)jobQueue;
+        }
+    }
+}
+```
+
+| Behaviour | Notes |
+| --- | --- |
+| Start (consumers enabled) | At app init, every registered job's queue is created **and a consumer is attached** |
+| Start (consumers disabled) | When `IsJobExecutionEnabled = false`, `StartAsync` returns early — no queues are declared, no consumers attached. `GetAsync` lazily declares on demand for enqueue only |
+| Lazy `GetAsync` | Double‑checked lock + `ConcurrentDictionary`, indexed by **job name** (not args type) |
+| Stop | Calls `StopAsync` (which disposes the channel) on every running queue |
+
+The split between `StartAsync` (eager, for executors) and `GetAsync`
+(lazy, for publishers) is what lets a publish‑only process avoid
+attaching consumers.
+
+## `JobQueueConfiguration`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/JobQueueConfiguration.cs
+public class JobQueueConfiguration : QueueDeclareConfiguration
+{
+    public Type JobArgsType { get; }
+    public string? ConnectionName { get; set; }
+    public string DelayedQueueName { get; set; }
+
+    public virtual QueueDeclareOk DeclareDelayed(IModel channel)
+    {
+        var delayedArguments = new Dictionary<string, object>(Arguments)
+        {
+            ["x-dead-letter-routing-key"] = QueueName,
+            ["x-dead-letter-exchange"] = string.Empty
+        };
+
+        return channel.QueueDeclare(
+            queue: DelayedQueueName,
+            durable: Durable,
+            exclusive: Exclusive,
+            autoDelete: AutoDelete,
+            arguments: delayedArguments
+        );
+    }
+}
+```
+
+`QueueDeclareConfiguration` is the base RabbitMQ wrapper from
+`Volo.Abp.RabbitMQ`. It carries `QueueName`, `Durable`, `Exclusive`,
+`AutoDelete`, `PrefetchCount`, and a `Dictionary<string, object>
+Arguments` that becomes the RabbitMQ `x-args` map.
+
+### The delayed queue trick
+
+Each job type gets two queues:
+
+| Queue | Role | Arguments |
+| --- | --- | --- |
+| `AbpBackgroundJobs.{JobName}` (live) | Receives ready‑to‑run messages | (default) |
+| `AbpBackgroundJobsDelayed.{JobName}` (delayed) | Holds delayed messages with per‑message TTL | `x-dead-letter-routing-key = QueueName`, `x-dead-letter-exchange = ""` |
+
+When you publish to the delayed queue with `BasicProperties.Expiration
+= "30000"`, RabbitMQ expires the message after 30 s and (because of the
+dead‑letter wiring) republishes it to the *default exchange* with
+routing key = live queue name. The consumer on the live queue picks it
+up immediately. No plug‑ins required.
+
+## `JobQueue<TArgs>`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/JobQueue.cs
+public class JobQueue<TArgs> : IJobQueue<TArgs>
+{
+    private const string ChannelPrefix = "JobQueue.";
+
+    protected BackgroundJobConfiguration JobConfiguration { get; }
+    protected JobQueueConfiguration QueueConfiguration { get; }
+    protected IChannelAccessor? ChannelAccessor { get; private set; }
+    protected AsyncEventingBasicConsumer? Consumer { get; private set; }
+```
+
+The constructor pulls everything it needs from DI and then picks the
+queue config:
+
+```csharp
+JobConfiguration = AbpBackgroundJobOptions.GetJob(typeof(TArgs));
+QueueConfiguration = GetOrCreateJobQueueConfiguration();
+
+protected virtual JobQueueConfiguration GetOrCreateJobQueueConfiguration()
+{
+    return AbpRabbitMqBackgroundJobOptions.JobQueues.GetOrDefault(typeof(TArgs)) ??
+           new JobQueueConfiguration(
+               typeof(TArgs),
+               AbpRabbitMqBackgroundJobOptions.DefaultQueueNamePrefix + JobConfiguration.JobName,
+               AbpRabbitMqBackgroundJobOptions.DefaultDelayedQueueNamePrefix + JobConfiguration.JobName,
+               prefetchCount: AbpRabbitMqBackgroundJobOptions.PrefetchCount
+           );
+}
+```
+
+If the application has registered a `JobQueueConfiguration` in
+`AbpRabbitMqBackgroundJobOptions.JobQueues` for the args type, that
+wins. Otherwise the queue names are derived from the prefix options
+and the job name (e.g. `AbpBackgroundJobs.SendWelcomeArgs`).
+
+### `EnsureInitializedAsync`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/JobQueue.cs
+protected virtual Task EnsureInitializedAsync()
+{
+    if (ChannelAccessor != null) return Task.CompletedTask;
+
+    ChannelAccessor = ChannelPool.Acquire(
+        ChannelPrefix + QueueConfiguration.QueueName,
+        QueueConfiguration.ConnectionName
+    );
+
+    var result = QueueConfiguration.Declare(ChannelAccessor.Channel);
+    Logger.LogDebug($"RabbitMQ Queue '{QueueConfiguration.QueueName}' has {result.MessageCount} messages and {result.ConsumerCount} consumers.");
+
+    QueueConfiguration.DeclareDelayed(ChannelAccessor.Channel);
+
+    if (AbpBackgroundJobOptions.IsJobExecutionEnabled)
+    {
+        if (QueueConfiguration.PrefetchCount.HasValue)
+        {
+            ChannelAccessor.Channel.BasicQos(0, QueueConfiguration.PrefetchCount.Value, false);
+        }
+
+        Consumer = new AsyncEventingBasicConsumer(ChannelAccessor.Channel);
+        Consumer.Received += MessageReceived;
+
+        ChannelAccessor.Channel.BasicConsume(
+            queue: QueueConfiguration.QueueName,
+            autoAck: false,
+            consumer: Consumer
+        );
+    }
+
+    return Task.CompletedTask;
+}
+```
+
+| Step | Effect |
+| --- | --- |
+| `ChannelPool.Acquire(channelName, connectionName)` | One channel per queue (the prefix is `JobQueue.`) so failures isolate per type |
+| `QueueConfiguration.Declare` | Idempotent — creates the live queue if missing, otherwise returns its stats |
+| `QueueConfiguration.DeclareDelayed` | Same but for the delayed queue, with the dead‑letter args |
+| `BasicQos(0, PrefetchCount, false)` | Per‑consumer prefetch — caps concurrent unacked messages |
+| `BasicConsume(autoAck: false, …)` | Manual ack so the executer's result decides ack/reject |
+
+### `PublishAsync`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/JobQueue.cs
+protected virtual Task PublishAsync(
+    TArgs args,
+    BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+    TimeSpan? delay = null)
+{
+    //TODO: How to handle priority
+    var routingKey = QueueConfiguration.QueueName;
+    var basicProperties = CreateBasicPropertiesToPublish();
+
+    if (delay.HasValue)
+    {
+        routingKey = QueueConfiguration.DelayedQueueName;
+        basicProperties.Expiration = delay.Value.TotalMilliseconds.ToString();
+    }
+
+    ChannelAccessor!.Channel.BasicPublish(
+        exchange: "",
+        routingKey: routingKey,
+        basicProperties: basicProperties,
+        body: Serializer.Serialize(args!)
+    );
+    return Task.CompletedTask;
+}
+
+protected virtual IBasicProperties CreateBasicPropertiesToPublish()
+{
+    var properties = ChannelAccessor!.Channel.CreateBasicProperties();
+    properties.Persistent = true;
+    return properties;
+}
+```
+
+Notes:
+
+- `exchange: ""` is the *default exchange* — RabbitMQ routes by exact
+  queue name, so `routingKey` is the destination queue.
+- `properties.Persistent = true` flags messages as persistent. Combined
+  with `durable: true` on the queue (the default in
+  `QueueDeclareConfiguration`) it gives at‑most‑once‑lost semantics
+  across broker restarts.
+- The `priority` parameter is intentionally not forwarded. To enable
+  RabbitMQ priorities you would have to declare the queue with
+  `x-max-priority` and set `BasicProperties.Priority`. The TODO in
+  source is upstream's note that this work is unimplemented.
+
+### `MessageReceived`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/JobQueue.cs
+protected virtual async Task MessageReceived(object sender, BasicDeliverEventArgs ea)
+{
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var context = new JobExecutionContext(
+            scope.ServiceProvider,
+            JobConfiguration.JobType,
+            Serializer.Deserialize(ea.Body.ToArray(), typeof(TArgs))
+        );
+
+        try
+        {
+            await JobExecuter.ExecuteAsync(context);
+            ChannelAccessor!.Channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+        }
+        catch (BackgroundJobExecutionException)
+        {
+            //TODO: Reject like that?
+            ChannelAccessor!.Channel.BasicReject(deliveryTag: ea.DeliveryTag, requeue: true);
+        }
+        catch (Exception)
+        {
+            //TODO: Reject like that?
+            ChannelAccessor!.Channel.BasicReject(deliveryTag: ea.DeliveryTag, requeue: false);
+        }
+    }
+}
+```
+
+| Outcome | Ack/Reject | Behaviour |
+| --- | --- | --- |
+| Executer succeeds | `BasicAck` | Removes from queue |
+| `BackgroundJobExecutionException` (i.e. the *job* threw) | `BasicReject(requeue: true)` | Returns to the queue head — immediate redelivery |
+| Any other exception (deserialization, DI lookup) | `BasicReject(requeue: false)` | Drops the message — broker may dead‑letter if a DLX is configured |
+
+<Warning>
+  `requeue: true` produces **tight retry loops** for poison messages. Combine it with a separate dead‑letter exchange on the live queue (`x-dead-letter-exchange`, `x-message-ttl`, retry counter in headers) if you need bounded retries. Out of the box, a job that always throws is redelivered forever.
+</Warning>
+
+## `AbpRabbitMqBackgroundJobOptions`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/Volo/Abp/BackgroundJobs/RabbitMQ/AbpRabbitMqBackgroundJobOptions.cs
+public class AbpRabbitMqBackgroundJobOptions
+{
+    public Dictionary<Type, JobQueueConfiguration> JobQueues { get; }
+    public string DefaultQueueNamePrefix { get; set; }
+    public string DefaultDelayedQueueNamePrefix { get; set; }
+    public ushort? PrefetchCount { get; set; }
+
+    public AbpRabbitMqBackgroundJobOptions()
+    {
+        JobQueues = new Dictionary<Type, JobQueueConfiguration>();
+        DefaultQueueNamePrefix = "AbpBackgroundJobs.";
+        DefaultDelayedQueueNamePrefix = "AbpBackgroundJobsDelayed.";
+    }
+}
+```
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `JobQueues` | empty | Per‑args type override — used by `JobQueue<TArgs>.GetOrCreateJobQueueConfiguration` |
+| `DefaultQueueNamePrefix` | `"AbpBackgroundJobs."` | Prefix for the live queue (concatenated with the **job name**) |
+| `DefaultDelayedQueueNamePrefix` | `"AbpBackgroundJobsDelayed."` | Prefix for the delayed queue |
+| `PrefetchCount` | `null` | Global default for `BasicQos(0, prefetchCount, false)` — `null` means no QoS |
+
+Per‑type override:
+
+```csharp
+Configure<AbpRabbitMqBackgroundJobOptions>(options =>
+{
+    options.JobQueues[typeof(SendWelcomeArgs)] = new JobQueueConfiguration(
+        jobArgsType: typeof(SendWelcomeArgs),
+        queueName: "emails.welcome",
+        delayedQueueName: "emails.welcome.delayed",
+        connectionName: "Emails",
+        durable: true,
+        prefetchCount: 16);
+});
+```
+
+The `connectionName` keys into `AbpRabbitMqOptions.Connections` on the
+base RabbitMQ module — letting you split queues across brokers.
+
+## End‑to‑end flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant Mgr as RabbitMqBackgroundJobManager
+    participant QM as JobQueueManager
+    participant Q as JobQueue&lt;TArgs&gt;
+    participant LiveQ as RabbitMQ live queue
+    participant DelQ as RabbitMQ delayed queue
+    participant Exec as BackgroundJobExecuter
+
+    App->>Mgr: EnqueueAsync(args, _, delay?)
+    Mgr->>QM: GetAsync&lt;TArgs&gt;()
+    alt cached
+        QM-->>Mgr: IJobQueue&lt;TArgs&gt;
+    else first time
+        QM->>Q: resolve from DI
+        QM->>Q: StartAsync() → declares + consumes
+    end
+    Mgr->>Q: EnqueueAsync(args, _, delay?)
+    Q->>Q: EnsureInitializedAsync()
+    alt delay null
+        Q->>LiveQ: BasicPublish(exchange="", routingKey=Live, persistent)
+    else delay > 0
+        Q->>DelQ: BasicPublish(routingKey=Delayed, Expiration=delay)
+        Note over DelQ,LiveQ: TTL expires → dead-letter routes to LiveQ
+        DelQ->>LiveQ: dead-letter (x-dead-letter-routing-key)
+    end
+    LiveQ->>Q: deliver (consumer)
+    Q->>Q: CreateScope(); deserialize TArgs
+    Q->>Exec: ExecuteAsync(JobExecutionContext)
+    alt success
+        Exec-->>Q: Task complete
+        Q->>LiveQ: BasicAck
+    else BackgroundJobExecutionException
+        Q->>LiveQ: BasicReject(requeue: true)
+    else other Exception
+        Q->>LiveQ: BasicReject(requeue: false)
+    end
+```
+
+## Gotchas
+
+- **`Priority` is silently ignored.** RabbitMQ supports priorities but
+  the adapter does not opt in. If you need it, override
+  `JobQueue<TArgs>` and set `x-max-priority` on the queue plus
+  `BasicProperties.Priority` on publish.
+- **The returned id is `null`.** The interface promises `Task<string>`
+  but the implementation forces `null` through `(await EnqueueAsync(…))!`.
+  Do not try to correlate jobs by the returned value — the RabbitMQ
+  delivery tag is per‑channel and not exposed.
+- **Poison messages loop forever** with the default `BasicReject(requeue: true)`
+  on `BackgroundJobExecutionException`. Configure a DLX with retry
+  counters or override `MessageReceived` for bounded retries.
+- **Failures *before* `BackgroundJobExecutionException` lose the
+  message.** Any non‑ABP exception thrown by deserialization,
+  `JobConfiguration` lookup, or `ServiceScopeFactory.CreateScope` is
+  `BasicReject(requeue: false)` — without a DLX it is gone.
+- **Channels are pooled per queue name.** `ChannelPrefix + QueueName`
+  becomes the pool key, so two jobs that share an args type share a
+  channel even if both are consuming. A blocking call on one will
+  back‑pressure the other.
+- **The delayed queue is per type, not shared.** This is good for
+  isolation but inflates queue count on a broker with many job types
+  — plan accordingly.
+- **`PrefetchCount` is a per‑consumer cap.** With many job types each
+  consumer has its own prefetch budget. The aggregate concurrency on
+  the broker is `prefetchCount × jobTypeCount`.
+- **`IsJobExecutionEnabled = false` only stops `StartAsync` from
+  attaching consumers.** Lazy `GetAsync` still works for publish‑only
+  use — but it also still declares the queues. If you want a strict
+  publisher with no declare side‑effects, configure the queues in the
+  consumer host instead.

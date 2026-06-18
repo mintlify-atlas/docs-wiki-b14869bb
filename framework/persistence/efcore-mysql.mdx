@@ -1,0 +1,225 @@
+---
+title: "Volo.Abp.EntityFrameworkCore.MySQL — Pomelo MySQL provider package"
+description: "AbpDbContextOptionsMySQLExtensions.UseMySQL bridges Pomelo.EntityFrameworkCore.MySql 7.0 into AbpDbContextOptions. Covers AbpMySqlModelBuilderExtensions, ServerVersion.AutoDetect, the MySqlConnector connection-string checker, sequential-GUID defaults, and collation/case-sensitivity gotchas."
+---
+
+`Volo.Abp.EntityFrameworkCore.MySQL` wires the **Pomelo.EntityFrameworkCore.MySql** community provider (not the deprecated `MySql.Data.EntityFrameworkCore`) into ABP's `AbpDbContextOptions`. It also pulls in the modern `MySqlConnector` ADO.NET driver for the connection-string checker and sets the sequential-GUID default to `SequentialAsString` so primary keys stay friendly to MySQL's `CHAR(36)` storage.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/EntityFrameworkCore/MySQL/AbpEntityFrameworkCoreMySQLModule.cs` | Module that `DependsOn(typeof(AbpEntityFrameworkCoreModule))`. Sets `AbpSequentialGuidGeneratorOptions.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString` when unset. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsMySQLExtensions.cs` | `UseMySQL(...)` and `UseMySQL<TDbContext>(...)` extensions on `AbpDbContextOptions`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextConfigurationContextMySQLExtensions.cs` | Inner `UseMySQL(...)` that calls `optionsBuilder.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString), …)`. |
+| `Volo/Abp/EntityFrameworkCore/ConnectionStrings/MySqlConnectionStringChecker.cs` | `[Dependency(ReplaceServices = true)]` checker built on `MySqlConnector` that probes the `mysql` system database. |
+| `Microsoft/EntityFrameworkCore/AbpMySqlModelBuilderExtensions.cs` | `modelBuilder.UseMySQL()` shorthand that tags the model with `EfCoreDatabaseProvider.MySql`. |
+| `Volo.Abp.EntityFrameworkCore.MySQL.csproj` | Targets `net7.0`. References `Pomelo.EntityFrameworkCore.MySql` **7.0.0** and `Microsoft.EntityFrameworkCore.Relational` **7.0.10**. |
+
+## The module
+
+```csharp
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreMySQLModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString;
+            }
+        });
+    }
+}
+```
+
+MySQL stores GUIDs either as `CHAR(36)` (the human-readable form) or `BINARY(16)`. With `CHAR(36)`, the string ordering matters; `SequentialAsString` ensures monotonically increasing textual GUIDs and clean clustered-index inserts. The Pomelo provider defaults to `CHAR(36)`; switch to binary representation by calling `npgsqlOptionsBuilder.UseMySqlOptions(opts => opts.GuidFormat = MySqlGuidFormat.Binary16)` if you prefer compact storage — at that point `SequentialAsBinary` may be a better default and you should override `AbpSequentialGuidGeneratorOptions` explicitly.
+
+## `AbpDbContextOptions.UseMySQL`
+
+```csharp
+public static class AbpDbContextOptionsMySQLExtensions
+{
+    public static void UseMySQL(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<MySqlDbContextOptionsBuilder> mySQLOptionsAction = null)
+        => options.Configure(context => context.UseMySQL(mySQLOptionsAction));
+
+    public static void UseMySQL<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<MySqlDbContextOptionsBuilder> mySQLOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+        => options.Configure<TDbContext>(context => context.UseMySQL(mySQLOptionsAction));
+}
+```
+
+The user-supplied `Action<MySqlDbContextOptionsBuilder>` lets you set Pomelo-specific options:
+
+```csharp
+Configure<AbpDbContextOptions>(options =>
+{
+    options.UseMySQL(mysql =>
+    {
+        mysql.MigrationsAssembly("MyApp.EntityFrameworkCore");
+        mysql.EnableRetryOnFailure();
+        mysql.CharSet(CharSet.Utf8Mb4);
+    });
+});
+```
+
+## `AbpDbContextConfigurationContext.UseMySQL`
+
+This is where the framework calls Pomelo's `UseMySql` with `ServerVersion.AutoDetect`:
+
+```csharp
+public static DbContextOptionsBuilder UseMySQL(
+    [NotNull] this AbpDbContextConfigurationContext context,
+    [CanBeNull] Action<MySqlDbContextOptionsBuilder> mySQLOptionsAction = null)
+{
+    if (context.ExistingConnection != null)
+    {
+        return context.DbContextOptions.UseMySql(context.ExistingConnection,
+            ServerVersion.AutoDetect(context.ConnectionString), optionsBuilder =>
+            {
+                optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+                mySQLOptionsAction?.Invoke(optionsBuilder);
+            });
+    }
+    else
+    {
+        return context.DbContextOptions.UseMySql(context.ConnectionString,
+            ServerVersion.AutoDetect(context.ConnectionString), optionsBuilder =>
+            {
+                optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+                mySQLOptionsAction?.Invoke(optionsBuilder);
+            });
+    }
+}
+```
+
+Two ABP-specific details:
+
+* **`ServerVersion.AutoDetect(context.ConnectionString)` is called eagerly.** Pomelo needs to know the server version to pick the right SQL dialect (MySQL 5.7 vs 8.0 vs MariaDB 10.6 have different JSON, CTE, window-function semantics). The auto-detect opens a transient connection at startup. If your database isn't available when the application starts (e.g. unit-test scenarios with a stubbed connection string), pin the version explicitly:
+
+  ```csharp
+  options.UseMySQL(mysql =>
+  {
+      // override AutoDetect indirectly by re-calling UseMySql with a pinned version
+  });
+  ```
+
+  …or use the `AbpDbContextConfigurationContext` directly inside `options.Configure`:
+
+  ```csharp
+  options.Configure(ctx =>
+  {
+      ctx.DbContextOptions.UseMySql(ctx.ConnectionString, new MySqlServerVersion(new Version(8, 0, 33)));
+  });
+  ```
+
+* **`QuerySplittingBehavior.SplitQuery` is forced.** As with the other providers, the user callback can opt out by calling `UseQuerySplittingBehavior(SingleQuery)`.
+
+`ExistingConnection` is supported for integration tests that share a `MySqlConnection`.
+
+## Model-builder marker
+
+```csharp
+public static class AbpMySqlModelBuilderExtensions
+{
+    public static void UseMySQL(this ModelBuilder modelBuilder)
+    {
+        modelBuilder.SetDatabaseProvider(EfCoreDatabaseProvider.MySql);
+    }
+}
+```
+
+`AbpDbContext.OnModelCreating` already auto-detects this from `Database.ProviderName == "Pomelo.EntityFrameworkCore.MySql"`; the helper is only needed when building the model outside an `AbpDbContext`.
+
+## MySQL connection-string checker
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MySqlConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        var connString = new MySqlConnectionStringBuilder(connectionString) { ConnectionLifeTime = 1 };
+
+        var oldDatabaseName = connString.Database;
+        connString.Database = "mysql";
+
+        try
+        {
+            await using var conn = new MySqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+Important details:
+
+* The checker uses **`MySqlConnector`** (the modern community-maintained driver) rather than Oracle's MySql.Data, matching what Pomelo uses under the hood. They are wire-compatible but `MySqlConnector` is faster and async-first.
+* The probe connects to the `mysql` system schema (every MySQL server ships it for grants and metadata), then `ChangeDatabaseAsync(oldDatabaseName)` to verify the application database exists. If your user has been granted access to only the application schema, drop a custom `IConnectionStringChecker` registration.
+* `ConnectionLifeTime = 1` (seconds) controls the probe's idle-pool reuse window; the open is still subject to the normal `Connection Timeout` in the connection string.
+
+## Version constraints
+
+```xml
+<TargetFramework>net7.0</TargetFramework>
+<PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="7.0.10" />
+<PackageReference Include="Pomelo.EntityFrameworkCore.MySql" Version="7.0.0" />
+```
+
+* **Pomelo 7.0.0** is pinned. Patch upgrades inside the 7.0.x line are typically safe; the next major (8.0.x) is for EF Core 8 and ABP 8.
+* `Microsoft.EntityFrameworkCore.Relational` is pinned at `7.0.10` to override the transitive version Pomelo would otherwise drag in — this lets you stay on a patched EF Core version without waiting for Pomelo to release a new package.
+
+## Registration pattern
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCoreMySQLModule))]
+public class MyApplicationEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseMySQL(mysql =>
+            {
+                mysql.MigrationsAssembly(typeof(MyApplicationEntityFrameworkCoreModule).Assembly.FullName);
+                mysql.CharSet(CharSet.Utf8Mb4);
+            });
+        });
+    }
+}
+```
+
+The `UseMySQL` overload name preserves the ABP convention (`UseSqlServer`, `UseNpgsql`, `UseMySQL`, `UseSqlite`, `UseOracle`). Internally it calls Pomelo's `UseMySql` — note the capitalisation difference.
+
+## Collation defaults and other gotchas
+
+* **`utf8mb4` is recommended, not the default everywhere.** MySQL 8.0 defaults the server-side `character_set_server` to `utf8mb4`, but older 5.7 installations still default to `latin1`. Pomelo respects whatever the server reports; force the client side via `mysql.CharSet(CharSet.Utf8Mb4)` and configure column types like `[Column(TypeName = "varchar(256)")]` to ensure your migrations emit the right `CHARACTER SET utf8mb4` clause. ABP's identity tables explicitly set `utf8mb4_unicode_ci` via the Pomelo Fluent API.
+* **Case sensitivity depends on collation, not server version.** The default `utf8mb4_general_ci` and `utf8mb4_unicode_ci` are **case-insensitive**, which means `WHERE Email = 'foo@bar.com'` will match `'FOO@BAR.COM'`. This is opposite to PostgreSQL's default behaviour — be careful when sharing schemas between providers.
+* **Identifier length limits.** MySQL caps table/column names at **64 characters**. If you migrate an aggressively-named SQL Server schema, EF migrations may fail with `Error 1059`. Use `[Table("short_name")]`/`[Column("short")]` to fit.
+* **JSON columns are real but case sensitive.** MySQL 5.7+ supports a native `JSON` type. Pomelo maps `string` properties annotated `[Column(TypeName = "json")]` to it. The `ExtraProperties` JSON column is stored as `LONGTEXT` by default; switch it explicitly if you need `JSON_EXTRACT` filtering.
+* **`SET FOREIGN_KEY_CHECKS = 0` during migration.** Some legacy MySQL schemas have ordering issues that EF migrations can't satisfy without disabling FK checks. The ABP startup templates don't disable them by default; you may need a `Pre`/`Post` SQL block in your migration if you import existing data.
+* **`ServerVersion.AutoDetect` opens a connection at startup.** If the database is unreachable when the host boots (rolling deployments, container ordering), startup fails. In production, prefer pinning the version through a wrapper extension as shown above; in development the AutoDetect cost is negligible.
+* **Sequential GUIDs and string GUIDs.** MySQL 8.0's `UUID_TO_BIN(uuid, swap_flag)` enables monotonic binary GUIDs, but EF + Pomelo store `Guid` as `CHAR(36)` by default. `SequentialAsString` matches the default storage format. Switch to `SequentialAsBinary` *only* if you also switch the column type via `mysql.SchemaName(...)` and `MySqlGuidFormat.Binary16`.
+* **`UseQuerySplittingBehavior(SplitQuery)` is forced.** MySQL handles split queries fine, but joins across many large collections can still issue several round-trips. Use `SingleQuery` overrides per query (`query.AsSingleQuery()`) when the cartesian product is small enough.
+* **MariaDB compatibility.** Pomelo's `ServerVersion.AutoDetect` returns a `MariaDbServerVersion` when applicable. Most ABP features work transparently; a few corner cases (window-function variants, CTE recursion) emit slightly different SQL.

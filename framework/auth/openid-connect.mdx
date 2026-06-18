@@ -1,0 +1,420 @@
+---
+title: "Volo.Abp.AspNetCore.Authentication.OpenIdConnect module"
+sidebarTitle: "OpenID Connect"
+description: "AddAbpOpenIdConnect, OpenIdLocalUserCreationClient, and the cookie+oidc chained pattern used by ABP MVC/Web hosts to talk to OpenIddict."
+---
+
+`Volo.Abp.AspNetCore.Authentication.OpenIdConnect` is the bridge between ASP.NET Core's `OpenIdConnectHandler` and the rest of ABP: it wires `MapAbpClaimTypes` automatically, attaches an `OnAuthorizationCodeReceived` event that forwards the multi-tenancy cookie value to the token endpoint, and adds an optional `OnTokenValidated` step that calls back into an Identity microservice to *create-or-update* the local user record. The package is small — five `.cs` files — but it is the canonical entry point for every ABP MVC, Web, and Blazor Server host that authenticates against an OpenIddict authorization server.
+
+This page walks `AddAbpOpenIdConnect`, the `OpenIdLocalUserCreationClient`, the `Cookies` + `oidc` chained scheme that ABP solution templates use, and how the tenant cookie travels through the authorization-code redemption.
+
+<CardGroup cols={2}>
+  <Card title="OAuth claim actions" icon="user-check" href="/framework/auth/oauth">
+    `MapAbpClaimTypes`, `MultipleClaimAction`, `RemoveDuplicateClaimAction` — automatically applied by `AddAbpOpenIdConnect`.
+  </Card>
+  <Card title="JWT Bearer" icon="ticket" href="/framework/auth/jwt-bearer">
+    The validator side of the same OpenIddict tokens, used by API hosts.
+  </Card>
+</CardGroup>
+
+## Package layout
+
+Source: `framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/`.
+
+| Path | Role |
+| --- | --- |
+| `Volo/Abp/AspNetCore/Authentication/OpenIdConnect/AbpAspNetCoreAuthenticationOpenIdConnectModule.cs` | Module class. Registers `IHttpClientFactory` and depends on `AbpMultiTenancyModule`, `AbpAspNetCoreAuthenticationOAuthModule`, `AbpRemoteServicesModule`. |
+| `Microsoft/Extensions/DependencyInjection/AbpOpenIdConnectExtensions.cs` | `AddAbpOpenIdConnect` (four overloads) — the wrapping that injects `MapAbpClaimTypes`, tenant-forwarding, and local-user creation. |
+| `Volo/Abp/AspNetCore/Authentication/OpenIdConnect/IOpenIdLocalUserCreationClient.cs` | `Task CreateOrUpdateAsync(TokenValidatedContext)` — the indirection point for the create-or-update HTTP call. |
+| `Volo/Abp/AspNetCore/Authentication/OpenIdConnect/OpenIdLocalUserCreationClient.cs` | Default implementation. Posts to a remote-service URL with the access token as a bearer. |
+| `Volo/Abp/AspNetCore/Authentication/OpenIdConnect/OpenIdLocalUserCreationClientOptions.cs` | `IsEnabled`, `RemoteServiceName`, `Url`, `HttpClientName`. |
+
+## The module
+
+```csharp framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/Volo/Abp/AspNetCore/Authentication/OpenIdConnect/AbpAspNetCoreAuthenticationOpenIdConnectModule.cs
+using Microsoft.Extensions.DependencyInjection;
+using Volo.Abp.AspNetCore.Authentication.OAuth;
+using Volo.Abp.Modularity;
+using Volo.Abp.MultiTenancy;
+using Volo.Abp.RemoteServices;
+
+namespace Volo.Abp.AspNetCore.Authentication.OpenIdConnect;
+
+[DependsOn(
+    typeof(AbpMultiTenancyModule),
+    typeof(AbpAspNetCoreAuthenticationOAuthModule),
+    typeof(AbpRemoteServicesModule)
+    )]
+public class AbpAspNetCoreAuthenticationOpenIdConnectModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient();
+    }
+}
+```
+
+Three depend-ons:
+
+* **`AbpMultiTenancyModule`** — `AddAbpOpenIdConnect` reads `AbpAspNetCoreMultiTenancyOptions.TenantKey` via `IOptions<>` to forward the tenant cookie to the token endpoint.
+* **`AbpAspNetCoreAuthenticationOAuthModule`** — the source of `ClaimActionCollection.MapAbpClaimTypes()`.
+* **`AbpRemoteServicesModule`** — `OpenIdLocalUserCreationClient` resolves an `IRemoteServiceConfigurationProvider` to look up the `AbpIdentity` base URL when posting create-or-update.
+
+`AddHttpClient()` registers `IHttpClientFactory` so the local-user-creation client can issue calls without polluting the host service collection.
+
+## `AddAbpOpenIdConnect` — what the wrapper layers on
+
+`AddAbpOpenIdConnect` has four overloads. The "do everything" one looks like:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/Microsoft/Extensions/DependencyInjection/AbpOpenIdConnectExtensions.cs
+public static AuthenticationBuilder AddAbpOpenIdConnect(
+    this AuthenticationBuilder builder,
+    string authenticationScheme,
+    string displayName,
+    Action<OpenIdConnectOptions> configureOptions)
+{
+    return builder.AddOpenIdConnect(authenticationScheme, displayName, options =>
+    {
+        options.ClaimActions.MapAbpClaimTypes();
+
+        options.Events ??= new OpenIdConnectEvents();
+        var authorizationCodeReceived = options.Events.OnAuthorizationCodeReceived ?? (_ => Task.CompletedTask);
+
+        options.Events.OnAuthorizationCodeReceived = receivedContext =>
+        {
+            SetAbpTenantId(receivedContext);
+            return authorizationCodeReceived.Invoke(receivedContext);
+        };
+
+        options.AccessDeniedPath = "/";
+
+        options.Events.OnTokenValidated = async (context) =>
+        {
+            var client = context.HttpContext.RequestServices.GetRequiredService<IOpenIdLocalUserCreationClient>();
+            try
+            {
+                await client.CreateOrUpdateAsync(context);
+            }
+            catch (Exception ex)
+            {
+                var logger = context.HttpContext.RequestServices.GetService<ILogger<AbpAspNetCoreAuthenticationOpenIdConnectModule>>();
+                logger?.LogException(ex);
+            }
+        };
+
+        configureOptions?.Invoke(options);
+    });
+}
+```
+
+Five behaviors layered on top of the stock `AddOpenIdConnect`:
+
+### 1. `MapAbpClaimTypes` runs first
+
+`options.ClaimActions.MapAbpClaimTypes()` — see [OAuth](/framework/auth/oauth) — installs renames for `UserName`, `Name`, `SurName`, `Email`, `EmailVerified`, `PhoneNumber`, `PhoneNumberVerified`, and `Role`. Because it runs **before** the user's `configureOptions`, custom `MapJsonKey` calls in the user delegate take precedence by being appended *after*.
+
+### 2. Tenant cookie is forwarded to the token endpoint
+
+```csharp
+private static void SetAbpTenantId(AuthorizationCodeReceivedContext receivedContext)
+{
+    var tenantKey = receivedContext.HttpContext.RequestServices
+        .GetRequiredService<IOptions<AbpAspNetCoreMultiTenancyOptions>>().Value.TenantKey;
+
+    if (receivedContext.Request.Cookies.ContainsKey(tenantKey))
+    {
+        receivedContext.TokenEndpointRequest?.SetParameter(tenantKey, receivedContext.Request.Cookies[tenantKey]);
+    }
+}
+```
+
+When the browser returns from the IdP with an authorization code, the OpenIdConnect handler is about to call the IdP's `/connect/token` endpoint to redeem the code. ABP intercepts here:
+
+1. Read `AbpAspNetCoreMultiTenancyOptions.TenantKey` from DI. The default is `"__tenant"` and matches what `MultiTenancyMiddleware` writes when a user switches tenants.
+2. If the client browser is carrying that cookie, append its value as an extra parameter on the token-endpoint POST body. OpenIddict on the auth-server side reads it via the same `TenantKey` and stamps `tenantid` into the issued tokens.
+
+This is how tenant context survives the authorization-code round-trip even though the IdP itself is conceptually tenant-agnostic.
+
+### 3. `AccessDeniedPath` defaults to `/`
+
+If the IdP returns an `access_denied` error (user clicked "deny" on consent, or the IdP refused), the user is redirected to `/` rather than the stock `/Account/AccessDenied`. Hosts that want a friendlier page override this in `configureOptions`.
+
+### 4. Optional create-or-update of a local user record
+
+`OnTokenValidated` resolves `IOpenIdLocalUserCreationClient` from request services and calls `CreateOrUpdateAsync(context)`. The default implementation is a no-op unless `OpenIdLocalUserCreationClientOptions.IsEnabled` is `true`. Exceptions are logged but **not** rethrown — a transient failure to create a local user does not block sign-in.
+
+### 5. User's configure delegate runs last
+
+`configureOptions?.Invoke(options)` runs at the end, so callers see all the ABP defaults already in place and can override anything (e.g. add custom events, change `AccessDeniedPath`, swap `MapAbpClaimTypes` for a custom rename).
+
+### Three thinner overloads
+
+```csharp
+public static AuthenticationBuilder AddAbpOpenIdConnect(this AuthenticationBuilder builder)
+    => builder.AddAbpOpenIdConnect(OpenIdConnectDefaults.AuthenticationScheme, _ => { });
+
+public static AuthenticationBuilder AddAbpOpenIdConnect(this AuthenticationBuilder builder, Action<OpenIdConnectOptions> configureOptions)
+    => builder.AddAbpOpenIdConnect(OpenIdConnectDefaults.AuthenticationScheme, configureOptions);
+
+public static AuthenticationBuilder AddAbpOpenIdConnect(this AuthenticationBuilder builder, string authenticationScheme, Action<OpenIdConnectOptions> configureOptions)
+    => builder.AddAbpOpenIdConnect(authenticationScheme, OpenIdConnectDefaults.DisplayName, configureOptions);
+```
+
+`OpenIdConnectDefaults.AuthenticationScheme` is `"OpenIdConnect"`; ABP templates pass `"oidc"` to keep query strings short.
+
+## The local-user-creation client
+
+```csharp framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/Volo/Abp/AspNetCore/Authentication/OpenIdConnect/IOpenIdLocalUserCreationClient.cs
+public interface IOpenIdLocalUserCreationClient
+{
+    Task CreateOrUpdateAsync(TokenValidatedContext tokenValidatedContext);
+}
+```
+
+The default implementation:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/Volo/Abp/AspNetCore/Authentication/OpenIdConnect/OpenIdLocalUserCreationClient.cs
+public class OpenIdLocalUserCreationClient : IOpenIdLocalUserCreationClient, ITransientDependency
+{
+    public virtual async Task CreateOrUpdateAsync(TokenValidatedContext context)
+    {
+        if (!Options.IsEnabled)
+        {
+            return;
+        }
+
+        using (var httpClient = HttpClientFactory.CreateClient(Options.HttpClientName))
+        {
+            if (!Options.RemoteServiceName.IsNullOrWhiteSpace())
+            {
+                var configuration = await RemoteServiceConfigurationProvider.GetConfigurationOrDefaultAsync(Options.RemoteServiceName);
+                if (configuration.BaseUrl != null)
+                {
+                    httpClient.BaseAddress = new Uri(configuration.BaseUrl);
+                }
+            }
+
+            httpClient.DefaultRequestHeaders.Add(
+                HeaderNames.Authorization,
+                "Bearer " + context.SecurityToken.RawData
+            );
+
+            var response = await httpClient.PostAsync(
+                Options.Url,
+                new StringContent(string.Empty)
+            );
+
+            response.EnsureSuccessStatusCode();
+        }
+    }
+}
+```
+
+The flow:
+
+1. **Bail if disabled** — `IsEnabled` defaults to `false`. Most hosts never need this; the auth server (`Volo.Abp.OpenIddict` + the `Identity` module) already keeps users in the same database. The client is useful when an MVC host is talking to a *separate* Identity microservice and wants a local mirror.
+2. **Resolve the base URL** — `IRemoteServiceConfigurationProvider.GetConfigurationOrDefaultAsync("AbpIdentity")` reads `RemoteServices:AbpIdentity:BaseUrl` (with a fallback to `RemoteServices:Default:BaseUrl`). Set `RemoteServiceName` to `null` to skip and use an absolute `Url`.
+3. **Forward the access token** — the raw id-token (`context.SecurityToken.RawData`) is sent as a `Bearer` authorization header. The downstream API validates it with its own `JwtBearer` handler before running its identity-profile endpoint.
+4. **POST with an empty body** — the API reads the user's claims from the bearer token itself, so the body is empty.
+5. **`EnsureSuccessStatusCode`** — any non-2xx throws. Because `OnTokenValidated` wraps this in a `try/catch` that logs and swallows, sign-in itself is not blocked.
+
+### Options
+
+```csharp framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/Volo/Abp/AspNetCore/Authentication/OpenIdConnect/OpenIdLocalUserCreationClientOptions.cs
+public class OpenIdLocalUserCreationClientOptions
+{
+    /// <summary>Default value: false</summary>
+    public bool IsEnabled { get; set; }
+
+    /// <summary>Default value: "AbpIdentity".</summary>
+    public string RemoteServiceName { get; set; } = "AbpIdentity";
+
+    /// <summary>URL to make a POST request after the current user successfully authenticated through an OpenIdConnect provider.</summary>
+    public string Url { get; set; } = "/api/identity-profile/create-or-update";
+
+    public string HttpClientName { get; } = Microsoft.Extensions.Options.Options.DefaultName;
+}
+```
+
+To enable it in a host:
+
+```csharp
+Configure<OpenIdLocalUserCreationClientOptions>(options =>
+{
+    options.IsEnabled = true;
+    // RemoteServiceName, Url, HttpClientName defaults are fine for the Identity module
+});
+```
+
+The default URL `/api/identity-profile/create-or-update` matches the endpoint that `Volo.Abp.Identity.AspNetCore` exposes via `IdentityProfileAppService` when configured as a remote-service host.
+
+## The cookie + oidc chained pattern
+
+ABP's MVC and Blazor Server templates pair `AddCookie("Cookies")` with `AddAbpOpenIdConnect("oidc", …)`:
+
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Web.Host/MyProjectNameWebModule.cs
+context.Services.AddAuthentication(options =>
+    {
+        options.DefaultScheme = "Cookies";
+        options.DefaultChallengeScheme = "oidc";
+    })
+    .AddCookie("Cookies", options =>
+    {
+        options.ExpireTimeSpan = TimeSpan.FromDays(365);
+        options.CheckTokenExpiration();
+    })
+    .AddAbpOpenIdConnect("oidc", options =>
+    {
+        options.Authority = configuration["AuthServer:Authority"];
+        options.RequireHttpsMetadata = Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+        options.ResponseType = OpenIdConnectResponseType.CodeIdToken;
+
+        options.ClientId = configuration["AuthServer:ClientId"];
+        options.ClientSecret = configuration["AuthServer:ClientSecret"];
+
+        options.UsePkce = true;
+        options.SaveTokens = true;
+        options.GetClaimsFromUserInfoEndpoint = true;
+
+        options.Scope.Add("roles");
+        options.Scope.Add("email");
+        options.Scope.Add("phone");
+        options.Scope.Add("MyProjectName");
+    });
+```
+
+Anatomy of the pattern:
+
+* **`DefaultScheme = "Cookies"`** — once authenticated, the user's principal lives in an ASP.NET Core auth cookie. Every subsequent request reads the cookie, not the IdP.
+* **`DefaultChallengeScheme = "oidc"`** — when an `[Authorize]` action triggers a challenge on an unauthenticated request, the framework redirects to the IdP via the OIDC handler.
+* **`CheckTokenExpiration()`** — an ABP extension on `CookieAuthenticationOptions` that hooks the cookie's `OnValidatePrincipal` to verify the saved id-token's `exp` claim; expired cookies are rejected and trigger a fresh OIDC challenge.
+* **`ResponseType = CodeIdToken`** — hybrid flow. The handler gets both an authorization code (redeemed at the token endpoint, this is where `SetAbpTenantId` injects the tenant cookie) and an id-token for immediate validation.
+* **`UsePkce = true`** — PKCE for the auth-code half of the flow.
+* **`SaveTokens = true`** — id and access tokens are persisted in the cookie auth properties so backend code can call `HttpContext.GetTokenAsync("access_token")` later for on-behalf-of HTTP calls.
+* **`GetClaimsFromUserInfoEndpoint = true`** — after token validation, the handler calls the IdP's `/connect/userinfo` endpoint and runs every claim action (including ABP's `MultipleClaimAction` for `role`) over the response.
+
+After login, the user has:
+
+1. A `.AspNetCore.Cookies` cookie containing the final, claim-action-processed principal.
+2. An `id_token` and `access_token` saved in the cookie auth properties.
+3. A `__tenant` cookie if multi-tenancy was active.
+
+Outgoing calls to API services use the `access_token` with the [JWT Bearer](/framework/auth/jwt-bearer) handler on the other side.
+
+## Composing with `AddAuthentication()`
+
+The minimum host module wiring:
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreAuthenticationOpenIdConnectModule))]
+public class MyWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        context.Services
+            .AddAuthentication(options =>
+            {
+                options.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                options.DefaultChallengeScheme = "oidc";
+            })
+            .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme)
+            .AddAbpOpenIdConnect("oidc", options =>
+            {
+                options.Authority    = configuration["AuthServer:Authority"];
+                options.ClientId     = configuration["AuthServer:ClientId"];
+                options.ClientSecret = configuration["AuthServer:ClientSecret"];
+                options.ResponseType = OpenIdConnectResponseType.CodeIdToken;
+                options.UsePkce      = true;
+                options.SaveTokens   = true;
+                options.GetClaimsFromUserInfoEndpoint = true;
+
+                options.Scope.Add("roles");
+                options.Scope.Add("email");
+                options.Scope.Add("offline_access"); // refresh tokens
+            });
+
+        // Optional: enable local-user mirror to a separate Identity service
+        Configure<OpenIdLocalUserCreationClientOptions>(o => o.IsEnabled = true);
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var app = context.GetApplicationBuilder();
+        app.UseRouting();
+        app.UseAuthentication();
+        app.UseMultiTenancy();
+        app.UseAuthorization();
+        app.UseConfiguredEndpoints();
+    }
+}
+```
+
+<Note>
+**Multi-tenancy claim mapping.** OIDC providers (including ABP's own OpenIddict module) do not carry `tenantid` over the front-channel. The way the multi-tenant context survives an OIDC round-trip is the `__tenant` cookie, forwarded by `SetAbpTenantId` into the token endpoint request as `AbpAspNetCoreMultiTenancyOptions.TenantKey`. The IdP issues a token whose `tenantid` claim then flows back, and `AbpClaimTypes.TenantId` (default `"tenantid"`) is read by `ICurrentTenant` on subsequent requests. If you customized `TenantKey`, both sides — the MVC host and the OpenIddict auth-server host — must agree on the same key, otherwise the IdP will not see the cookie value and will issue an empty-tenant token.
+</Note>
+
+## Customizing user creation
+
+Override `IOpenIdLocalUserCreationClient` to swap the default HTTP-POST behavior for, say, an in-process call or a different endpoint shape:
+
+```csharp
+public class MyLocalUserCreationClient : IOpenIdLocalUserCreationClient, ITransientDependency
+{
+    public override int Priority => -100; // win over the default
+    public IIdentityUserAppService Users { get; }
+
+    public MyLocalUserCreationClient(IIdentityUserAppService users) => Users = users;
+
+    public async Task CreateOrUpdateAsync(TokenValidatedContext context)
+    {
+        var sub   = context.Principal!.FindFirst("sub")?.Value;
+        var email = context.Principal!.FindFirst(AbpClaimTypes.Email)?.Value;
+        if (sub == null || email == null) return;
+
+        await Users.CreateOrUpdateFromOidcAsync(new(sub, email));
+    }
+}
+```
+
+ABP's DI auto-registration replaces the default `OpenIdLocalUserCreationClient` because both implementations register against the same interface; the `ExposeServices` defaults pick the last-registered. To be explicit, override the registration in `ConfigureServices` with `context.Services.Replace(...)`.
+
+## Disabling the local-user POST entirely
+
+If your host does not need a mirror table, ensure `IsEnabled` stays `false` (the default) and the `OnTokenValidated` handler will short-circuit inside the default client. The handler-level `try/catch` still runs but the client returns immediately, so there is no HTTP overhead.
+
+## Pitfall checklist
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `tenantid` claim is empty after sign-in | The `__tenant` cookie was not set on the browser before challenge, so `SetAbpTenantId` had nothing to forward | Ensure `UseMultiTenancy` is in the pipeline and the user picked a tenant before clicking "Sign in" |
+| Roles arrive as a single JSON string | `GetClaimsFromUserInfoEndpoint = false` and the id-token used a non-standard role serialization | Enable user-info, or call `options.ClaimActions.MapJsonKeyMultiple(AbpClaimTypes.Role, "role")` |
+| `IOpenIdLocalUserCreationClient.CreateOrUpdateAsync` throws but sign-in still succeeds | Intentional — `OnTokenValidated` swallows the exception and logs it | Inspect the `ILogger<AbpAspNetCoreAuthenticationOpenIdConnectModule>` output |
+| `Bearer` POST to `/api/identity-profile/create-or-update` returns 401 | The Identity service rejected the token (issuer mismatch, audience mismatch) | Verify `Audience` on the Identity service matches the scope requested by the OIDC client |
+| Cookie principal contains both `name` (raw) and `unique_name` (mapped) | A custom `MapJsonKey("name", "name")` was added after `MapAbpClaimTypes`, defeating the `DeleteClaim` step | Remove the redundant rename or call `RemoveDuplicate` explicitly |
+| `AccessDeniedPath = "/"` redirects look wrong | ABP's default is `"/"`; the stock OIDC default is `"/Account/AccessDenied"` | Override inside `configureOptions`: `options.AccessDeniedPath = "/Account/AccessDenied";` |
+
+## What this package does **not** do
+
+* **Token issuance** — that is `Volo.Abp.OpenIddict`.
+* **Token validation for APIs** — that is [JWT Bearer](/framework/auth/jwt-bearer).
+* **Claim-rename mechanics** — that is [OAuth](/framework/auth/oauth).
+* **Tenant resolution** — that is `Volo.Abp.AspNetCore.MultiTenancy`'s `MultiTenancyMiddleware`.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="JWT Bearer" icon="ticket" href="/framework/auth/jwt-bearer">
+    The other half of the round-trip: APIs validate the token issued by the auth server.
+  </Card>
+  <Card title="OAuth claim actions" icon="user-check" href="/framework/auth/oauth">
+    What `options.ClaimActions.MapAbpClaimTypes()` actually does.
+  </Card>
+  <Card title="Multi-tenancy" icon="building" href="/framework/cross/multi-tenancy">
+    `AbpAspNetCoreMultiTenancyOptions.TenantKey` — the key forwarded into the token endpoint.
+  </Card>
+  <Card title="OpenIddict module" icon="server" href="/modules/openiddict/overview">
+    The default auth-server side that issues the tokens this handler consumes.
+  </Card>
+</CardGroup>

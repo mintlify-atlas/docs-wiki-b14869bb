@@ -1,0 +1,694 @@
+---
+title: "LocalEventBus — in-process pub/sub with UoW deferral"
+sidebarTitle: "Local EventBus"
+description: "EventBusBase, LocalEventBus, EventHandlerInvoker, ordered handlers and how UnitOfWorkEventPublisher defers PublishAsync to OnCompleted."
+---
+
+`Volo.Abp.EventBus`'s `LocalEventBus` is the **singleton in-process pub/sub** that every ABP application gets out of the box. It does three things that a plain `event` keyword cannot:
+
+1. **Auto-discovers handlers** — any class registered with DI that implements `ILocalEventHandler<TEvent>` is subscribed at `PreConfigureServices` time. No `Subscribe(...)` call required.
+2. **Defers publication to UoW completion** — by default `PublishAsync` is buffered on the current `IUnitOfWork`; if the UoW rolls back, the event is **never delivered**.
+3. **Respects tenant scope, handler ordering and inherited generic arguments** — the bus enters `CurrentTenant.Change(...)` before each handler, sorts handlers by `[LocalEventHandlerOrder]`, and cascades `EntityCreatedEventData<Student>` to `EntityCreatedEventData<Person>` when ETOs implement `IEventDataWithInheritableGenericArgument`.
+
+This page walks the runtime — `EventBusBase`, `LocalEventBus`, `EventHandlerInvoker`, and the `UnitOfWorkEventPublisher` that closes the UoW loop.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/EventBus/AbpEventBusModule.cs` | Wires `LocalEventBus`, `IDistributedEventBus`, and auto-discovers handler types via `services.OnRegistered`. Also schedules `OutboxSenderManager` / `InboxProcessManager` as background workers. |
+| `Volo/Abp/EventBus/EventBusBase.cs` | Abstract base. Implements the public `Subscribe`/`Unsubscribe`/`PublishAsync` overloads, factory routing, tenant scoping, and the `IEventDataWithInheritableGenericArgument` cascade. |
+| `Volo/Abp/EventBus/Local/LocalEventBus.cs` | The concrete singleton. Stores `ConcurrentDictionary<Type, List<IEventHandlerFactory>>`, orders handlers, dispatches via `EventHandlerInvoker`. |
+| `Volo/Abp/EventBus/Local/AbpLocalEventBusOptions.cs` | One field: `Handlers : TypeList<IEventHandler>` — the auto-discovered handler types. |
+| `Volo/Abp/EventBus/Local/LocalEventMessage.cs` | DTO carrying `(MessageId, EventData, EventType)` — produced by `PublishToEventBusAsync`. |
+| `Volo/Abp/EventBus/Local/NullLocalEventBus.cs` | `ILocalEventBus` no-op singleton for stand-alone scenarios where the module isn't wired. |
+| `Volo/Abp/EventBus/EventHandlerInvoker.cs` | Cached executor lookup keyed by `"{handlerType.FullName}-{eventType.FullName}"`. |
+| `Volo/Abp/EventBus/EventHandlerInvokerCacheItem.cs` | Holds the (optional) local + distributed `IEventHandlerMethodExecutor` per pair. |
+| `Volo/Abp/EventBus/EventHandlerMethodExecutor.cs` | Two strongly-typed shims: `LocalEventHandlerMethodExecutor<TEvent>` and `DistributedEventHandlerMethodExecutor<TEvent>`. |
+| `Volo/Abp/EventBus/IocEventHandlerFactory.cs` | Resolves a handler from a fresh `IServiceScope`; disposes the scope on release. |
+| `Volo/Abp/EventBus/SingleInstanceHandlerFactory.cs` | Wraps an externally-supplied instance. |
+| `Volo/Abp/EventBus/TransientEventHandlerFactory.cs` | `new T()` per call (both generic and `Type`-based). |
+| `Volo/Abp/EventBus/EventHandlerDisposeWrapper.cs` | `IDisposable` carrier returned by every factory's `GetHandler()`. |
+| `Volo/Abp/EventBus/EventHandlerFactoryUnregistrar.cs` | The `IDisposable` returned by `Subscribe(...)`. `Dispose()` ⇒ `bus.Unsubscribe(...)`. |
+| `Volo/Abp/EventBus/UnitOfWorkEventPublisher.cs` | `IUnitOfWorkEventPublisher` — flushed by `IUnitOfWork.OnCompleted`. Calls `ILocalEventBus.PublishAsync(..., onUnitOfWorkComplete: false)`. |
+| `Volo/Abp/EventBus/ActionEventHandler.cs` | Adapter from `Func<TEvent, Task>` to `ILocalEventHandler<TEvent>`. |
+
+## Key abstractions
+
+| Symbol | Kind | File |
+| --- | --- | --- |
+| `EventBusBase` | abstract class : `IEventBus` | `EventBusBase.cs` |
+| `LocalEventBus` | sealed-ish class : `EventBusBase`, `ILocalEventBus`, `ISingletonDependency` | `Local/LocalEventBus.cs` |
+| `AbpLocalEventBusOptions` | options POCO | `Local/AbpLocalEventBusOptions.cs` |
+| `LocalEventMessage` | record-like DTO | `Local/LocalEventMessage.cs` |
+| `NullLocalEventBus` | sealed singleton | `Local/NullLocalEventBus.cs` |
+| `EventHandlerInvoker : IEventHandlerInvoker, ISingletonDependency` | class | `EventHandlerInvoker.cs` |
+| `EventHandlerInvokerCacheItem` | POCO | `EventHandlerInvokerCacheItem.cs` |
+| `LocalEventHandlerMethodExecutor<TEvent>` | shim | `EventHandlerMethodExecutor.cs` |
+| `DistributedEventHandlerMethodExecutor<TEvent>` | shim | `EventHandlerMethodExecutor.cs` |
+| `IocEventHandlerFactory` | scoped factory | `IocEventHandlerFactory.cs` |
+| `SingleInstanceHandlerFactory` | instance factory | `SingleInstanceHandlerFactory.cs` |
+| `TransientEventHandlerFactory` / `TransientEventHandlerFactory<T>` | new-instance factory | `TransientEventHandlerFactory.cs` |
+| `EventHandlerDisposeWrapper` | `IEventHandlerDisposeWrapper` | `EventHandlerDisposeWrapper.cs` |
+| `EventHandlerFactoryUnregistrar` | subscription disposable | `EventHandlerFactoryUnregistrar.cs` |
+| `UnitOfWorkEventPublisher` | `IUnitOfWorkEventPublisher, ITransientDependency` (`[Dependency(ReplaceServices = true)]`) | `UnitOfWorkEventPublisher.cs` |
+| `ActionEventHandler<TEvent>` | adapter, `ITransientDependency` | `ActionEventHandler.cs` |
+
+## Module wiring
+
+The local bus is bootstrapped before any service registration runs, in `PreConfigureServices`. The module hooks `services.OnRegistered` so that **every** subsequent registration is inspected; any handler interface found is appended to the appropriate options list:
+
+```csharp title="AbpEventBusModule.cs (excerpt)"
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    AddEventHandlers(context.Services);
+}
+
+private static void AddEventHandlers(IServiceCollection services)
+{
+    var localHandlers = new List<Type>();
+    var distributedHandlers = new List<Type>();
+
+    services.OnRegistered(context =>
+    {
+        if (ReflectionHelper.IsAssignableToGenericType(context.ImplementationType, typeof(ILocalEventHandler<>)))
+        {
+            localHandlers.Add(context.ImplementationType);
+        }
+        else if (ReflectionHelper.IsAssignableToGenericType(context.ImplementationType, typeof(IDistributedEventHandler<>)))
+        {
+            distributedHandlers.Add(context.ImplementationType);
+        }
+    });
+
+    services.Configure<AbpLocalEventBusOptions>(options =>
+    {
+        options.Handlers.AddIfNotContains(localHandlers);
+    });
+
+    services.Configure<AbpDistributedEventBusOptions>(options =>
+    {
+        options.Handlers.AddIfNotContains(distributedHandlers);
+    });
+}
+```
+
+The two lists are flushed into the **same** options instance over the lifetime of the host (the `Configure` callback is registered once and the lists are captured by reference). When `LocalEventBus`'s constructor runs near application startup, `Options.Handlers` already contains every relevant type and `SubscribeHandlers(...)` walks them.
+
+The module also queues two **background workers** in `OnApplicationInitializationAsync` — these only do work when their respective config dictionaries are non-empty, but they're always registered:
+
+```csharp title="AbpEventBusModule.cs (excerpt)"
+public async override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+{
+    await context.AddBackgroundWorkerAsync<OutboxSenderManager>();
+    await context.AddBackgroundWorkerAsync<InboxProcessManager>();
+}
+```
+
+## `AbpLocalEventBusOptions` — the single field
+
+```csharp title="AbpLocalEventBusOptions.cs"
+public class AbpLocalEventBusOptions
+{
+    public ITypeList<IEventHandler> Handlers { get; }
+
+    public AbpLocalEventBusOptions()
+    {
+        Handlers = new TypeList<IEventHandler>();
+    }
+}
+```
+
+| Property | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `Handlers` | `ITypeList<IEventHandler>` | empty | Populated by `AbpEventBusModule.AddEventHandlers`. You can append additional types in `ConfigureServices` if you want a non-DI type to be auto-subscribed via `Activator.CreateInstance`. |
+
+## `EventBusBase` — the shared engine
+
+`EventBusBase` is the abstract base shared by `LocalEventBus` and `DistributedEventBusBase`. It owns the **boilerplate Subscribe overloads** (so each concrete bus only has to implement two `Subscribe(Type, IEventHandlerFactory)` and the four `Unsubscribe(...)` flavours) plus the **publish pipeline**.
+
+```csharp title="EventBusBase.cs (excerpt) — the public Subscribe overloads"
+public virtual IDisposable Subscribe<TEvent>(Func<TEvent, Task> action) where TEvent : class
+    => Subscribe(typeof(TEvent), new ActionEventHandler<TEvent>(action));
+
+public virtual IDisposable Subscribe<TEvent, THandler>()
+    where TEvent : class where THandler : IEventHandler, new()
+    => Subscribe(typeof(TEvent), new TransientEventHandlerFactory<THandler>());
+
+public virtual IDisposable Subscribe(Type eventType, IEventHandler handler)
+    => Subscribe(eventType, new SingleInstanceHandlerFactory(handler));
+
+public virtual IDisposable Subscribe<TEvent>(IEventHandlerFactory factory) where TEvent : class
+    => Subscribe(typeof(TEvent), factory);
+
+public abstract IDisposable Subscribe(Type eventType, IEventHandlerFactory factory);
+```
+
+Notice the funnel: **every** overload turns the input into an `IEventHandlerFactory` and calls the abstract `Subscribe(Type, IEventHandlerFactory)`. This is the **only** override a concrete bus needs to provide for the subscription side.
+
+### `PublishAsync` — the UoW funnel
+
+```csharp title="EventBusBase.cs (excerpt) — publish pipeline"
+public Task PublishAsync<TEvent>(TEvent eventData, bool onUnitOfWorkComplete = true)
+    where TEvent : class
+    => PublishAsync(typeof(TEvent), eventData, onUnitOfWorkComplete);
+
+public virtual async Task PublishAsync(
+    Type eventType,
+    object eventData,
+    bool onUnitOfWorkComplete = true)
+{
+    if (onUnitOfWorkComplete && UnitOfWorkManager.Current != null)
+    {
+        AddToUnitOfWork(
+            UnitOfWorkManager.Current,
+            new UnitOfWorkEventRecord(eventType, eventData, EventOrderGenerator.GetNext())
+        );
+        return;
+    }
+
+    await PublishToEventBusAsync(eventType, eventData);
+}
+
+protected abstract Task PublishToEventBusAsync(Type eventType, object eventData);
+protected abstract void AddToUnitOfWork(IUnitOfWork unitOfWork, UnitOfWorkEventRecord eventRecord);
+```
+
+Two abstract members force each concrete bus to answer **two questions**:
+
+1. "Where do I drop you when the UoW completes?" — `AddToUnitOfWork`. `LocalEventBus` calls `unitOfWork.AddOrReplaceLocalEvent(eventRecord)`; the distributed buses call `AddOrReplaceDistributedEvent`. The UoW stores them keyed by event order so duplicates collapse.
+2. "What happens once we actually publish?" — `PublishToEventBusAsync`. `LocalEventBus` wraps the data in a `LocalEventMessage` and calls `TriggerHandlersAsync`; provider-backed buses serialize and put a message on the wire.
+
+### `TriggerHandlersAsync` — the dispatch loop
+
+```csharp title="EventBusBase.cs (excerpt) — handler dispatch"
+public virtual async Task TriggerHandlersAsync(Type eventType, object eventData)
+{
+    var exceptions = new List<Exception>();
+    await TriggerHandlersAsync(eventType, eventData, exceptions);
+
+    if (exceptions.Any())
+    {
+        ThrowOriginalExceptions(eventType, exceptions);
+    }
+}
+
+protected virtual async Task TriggerHandlersAsync(
+    Type eventType, object eventData,
+    List<Exception> exceptions, InboxConfig inboxConfig = null)
+{
+    await new SynchronizationContextRemover();
+
+    foreach (var handlerFactories in GetHandlerFactories(eventType))
+    {
+        foreach (var handlerFactory in handlerFactories.EventHandlerFactories)
+        {
+            await TriggerHandlerAsync(handlerFactory, handlerFactories.EventType,
+                                      eventData, exceptions, inboxConfig);
+        }
+    }
+
+    // IEventDataWithInheritableGenericArgument cascade
+    if (eventType.GetTypeInfo().IsGenericType &&
+        eventType.GetGenericArguments().Length == 1 &&
+        typeof(IEventDataWithInheritableGenericArgument).IsAssignableFrom(eventType))
+    {
+        var genericArg = eventType.GetGenericArguments()[0];
+        var baseArg = genericArg.GetTypeInfo().BaseType;
+        if (baseArg != null)
+        {
+            var baseEventType = eventType.GetGenericTypeDefinition().MakeGenericType(baseArg);
+            var constructorArgs = ((IEventDataWithInheritableGenericArgument)eventData).GetConstructorArgs();
+            var baseEventData = Activator.CreateInstance(baseEventType, constructorArgs);
+            await PublishToEventBusAsync(baseEventType, baseEventData);
+        }
+    }
+}
+```
+
+A few subtleties:
+
+- The `await new SynchronizationContextRemover()` at the top **strips the ambient sync context** before walking handlers. Otherwise an `async void` handler resuming on a captured `HttpContext`-bound context could deadlock or alter `HttpContext.Current`.
+- Exceptions from individual handlers are **collected**, not rethrown. After the loop, a single exception is rethrown via `ReThrow()` (preserving the stack), or an `AggregateException` if multiple handlers failed.
+- The cascade walks one step up the generic argument's `BaseType` only — `Student → Person`, then stops. It does **not** walk to `Person → object`; it republishes the parent through `PublishToEventBusAsync` which restarts the dispatch loop for the base ETO.
+
+### Per-handler invocation, tenant change and inbox handler-selector
+
+```csharp title="EventBusBase.cs (excerpt) — TriggerHandlerAsync"
+protected virtual async Task TriggerHandlerAsync(
+    IEventHandlerFactory asyncHandlerFactory, Type eventType,
+    object eventData, List<Exception> exceptions, InboxConfig inboxConfig = null)
+{
+    using (var eventHandlerWrapper = asyncHandlerFactory.GetHandler())
+    {
+        try
+        {
+            var handlerType = eventHandlerWrapper.EventHandler.GetType();
+
+            if (inboxConfig?.HandlerSelector != null &&
+                !inboxConfig.HandlerSelector(handlerType))
+            {
+                return;
+            }
+
+            using (CurrentTenant.Change(GetEventDataTenantId(eventData)))
+            {
+                await InvokeEventHandlerAsync(eventHandlerWrapper.EventHandler, eventData, eventType);
+            }
+        }
+        catch (TargetInvocationException ex)
+        {
+            exceptions.Add(ex.InnerException);
+        }
+        catch (Exception ex)
+        {
+            exceptions.Add(ex);
+        }
+    }
+}
+
+protected virtual Guid? GetEventDataTenantId(object eventData)
+{
+    return eventData switch
+    {
+        IMultiTenant multiTenantEventData => multiTenantEventData.TenantId,
+        IEventDataMayHaveTenantId eventDataMayHaveTenantId
+            when eventDataMayHaveTenantId.IsMultiTenant(out var tenantId) => tenantId,
+        _ => CurrentTenant.Id
+    };
+}
+```
+
+`inboxConfig.HandlerSelector` is what lets multiple microservices share the **same** inbox table but only one of them actually run a given handler — see the [Inbox/Outbox page](/framework/eventbus/inbox-outbox).
+
+The `using (CurrentTenant.Change(...))` is the critical multi-tenant guarantee: the publisher's tenant is propagated to the consumer, even when the publish was deferred to UoW completion (and therefore runs **after** the request that originally set `CurrentTenant.Id`).
+
+## `LocalEventBus` — the concrete implementation
+
+`LocalEventBus` plugs `EventBusBase` into a `ConcurrentDictionary<Type, List<IEventHandlerFactory>>` keyed by event type, plus a constructor that calls `SubscribeHandlers(Options.Handlers)` to auto-register everything `AbpEventBusModule` discovered:
+
+```csharp title="Local/LocalEventBus.cs (excerpt)"
+[ExposeServices(typeof(ILocalEventBus), typeof(LocalEventBus))]
+public class LocalEventBus : EventBusBase, ILocalEventBus, ISingletonDependency
+{
+    protected AbpLocalEventBusOptions Options { get; }
+    protected ConcurrentDictionary<Type, List<IEventHandlerFactory>> HandlerFactories { get; }
+
+    public LocalEventBus(
+        IOptions<AbpLocalEventBusOptions> options,
+        IServiceScopeFactory serviceScopeFactory,
+        ICurrentTenant currentTenant,
+        IUnitOfWorkManager unitOfWorkManager,
+        IEventHandlerInvoker eventHandlerInvoker)
+        : base(serviceScopeFactory, currentTenant, unitOfWorkManager, eventHandlerInvoker)
+    {
+        Options = options.Value;
+        Logger = NullLogger<LocalEventBus>.Instance;
+        HandlerFactories = new ConcurrentDictionary<Type, List<IEventHandlerFactory>>();
+        SubscribeHandlers(Options.Handlers);
+    }
+
+    public virtual IDisposable Subscribe<TEvent>(ILocalEventHandler<TEvent> handler) where TEvent : class
+        => Subscribe(typeof(TEvent), handler);
+
+    public override IDisposable Subscribe(Type eventType, IEventHandlerFactory factory)
+    {
+        GetOrCreateHandlerFactories(eventType)
+            .Locking(factories =>
+            {
+                if (!factory.IsInFactories(factories)) factories.Add(factory);
+            });
+
+        return new EventHandlerFactoryUnregistrar(this, eventType, factory);
+    }
+```
+
+`SubscribeHandlers` is inherited from `EventBusBase` — it walks each handler type's interfaces, picks the ones that close over `IEventHandler<TEvent>` shape, and creates one `IocEventHandlerFactory` per event type:
+
+```csharp title="EventBusBase.cs (excerpt) — SubscribeHandlers"
+protected virtual void SubscribeHandlers(ITypeList<IEventHandler> handlers)
+{
+    foreach (var handler in handlers)
+    {
+        var interfaces = handler.GetInterfaces();
+        foreach (var @interface in interfaces)
+        {
+            if (!typeof(IEventHandler).GetTypeInfo().IsAssignableFrom(@interface)) continue;
+
+            var genericArgs = @interface.GetGenericArguments();
+            if (genericArgs.Length == 1)
+            {
+                Subscribe(genericArgs[0], new IocEventHandlerFactory(ServiceScopeFactory, handler));
+            }
+        }
+    }
+}
+```
+
+### Ordered, inheritance-aware handler enumeration
+
+`LocalEventBus.GetHandlerFactories` is the only override that materially differs from the distributed buses' implementations — it **orders** handlers by `[LocalEventHandlerOrder]`:
+
+```csharp title="Local/LocalEventBus.cs (excerpt) — handler enumeration"
+protected override IEnumerable<EventTypeWithEventHandlerFactories> GetHandlerFactories(Type eventType)
+{
+    var handlerFactoryList = new List<Tuple<IEventHandlerFactory, Type, int>>();
+    foreach (var handlerFactory in HandlerFactories.Where(hf => ShouldTriggerEventForHandler(eventType, hf.Key)))
+    {
+        foreach (var factory in handlerFactory.Value)
+        {
+            handlerFactoryList.Add(new Tuple<IEventHandlerFactory, Type, int>(
+                factory,
+                handlerFactory.Key,
+                ReflectionHelper
+                    .GetAttributesOfMemberOrDeclaringType<LocalEventHandlerOrderAttribute>(
+                        factory.GetHandler().EventHandler.GetType())
+                    .FirstOrDefault()?.Order ?? 0));
+        }
+    }
+
+    return handlerFactoryList.OrderBy(x => x.Item3)
+        .Select(x => new EventTypeWithEventHandlerFactories(x.Item2, new List<IEventHandlerFactory> { x.Item1 }))
+        .ToArray();
+}
+
+private static bool ShouldTriggerEventForHandler(Type targetEventType, Type handlerEventType)
+{
+    if (handlerEventType == targetEventType) return true;
+    if (handlerEventType.IsAssignableFrom(targetEventType)) return true;
+    return false;
+}
+```
+
+| Mechanism | Effect |
+| --- | --- |
+| `ShouldTriggerEventForHandler` | A handler for `BaseEvent` also fires on `DerivedEvent`. |
+| `LocalEventHandlerOrderAttribute.Order` | Ascending dispatch order — default `0` for unannotated handlers. |
+| `EventHandlerFactoryUnregistrar` | The `IDisposable` returned by `Subscribe` — calling `Dispose()` invokes `Unsubscribe`. |
+
+<Tip>
+`LocalEventBus` calls `factory.GetHandler()` **once per enumeration** just to read its `Order` attribute, but the actual invocation goes through `TriggerHandlerAsync` which calls `GetHandler()` **again** (and disposes its scope). For `IocEventHandlerFactory` this means two `IServiceScope` allocations per event delivery — cheap, but it's why heavy resource ownership belongs in the scope, not the handler instance.
+</Tip>
+
+## `EventHandlerInvoker` — the cached dispatcher
+
+`IEventHandlerInvoker` is what `EventBusBase.InvokeEventHandlerAsync` calls. The default `EventHandlerInvoker` is a **singleton** with a `ConcurrentDictionary` cache keyed by `"{handlerType.FullName}-{eventType.FullName}"`:
+
+```csharp title="EventHandlerInvoker.cs"
+public class EventHandlerInvoker : IEventHandlerInvoker, ISingletonDependency
+{
+    private readonly ConcurrentDictionary<string, EventHandlerInvokerCacheItem> _cache;
+
+    public EventHandlerInvoker()
+    {
+        _cache = new ConcurrentDictionary<string, EventHandlerInvokerCacheItem>();
+    }
+
+    public async Task InvokeAsync(IEventHandler eventHandler, object eventData, Type eventType)
+    {
+        var cacheItem = _cache.GetOrAdd($"{eventHandler.GetType().FullName}-{eventType.FullName}", _ =>
+        {
+            var item = new EventHandlerInvokerCacheItem();
+
+            if (typeof(ILocalEventHandler<>).MakeGenericType(eventType).IsInstanceOfType(eventHandler))
+            {
+                item.Local = (IEventHandlerMethodExecutor)Activator.CreateInstance(
+                    typeof(LocalEventHandlerMethodExecutor<>).MakeGenericType(eventType));
+            }
+
+            if (typeof(IDistributedEventHandler<>).MakeGenericType(eventType).IsInstanceOfType(eventHandler))
+            {
+                item.Distributed = (IEventHandlerMethodExecutor)Activator.CreateInstance(
+                    typeof(DistributedEventHandlerMethodExecutor<>).MakeGenericType(eventType));
+            }
+
+            return item;
+        });
+
+        if (cacheItem.Local != null) await cacheItem.Local.ExecutorAsync(eventHandler, eventData);
+        if (cacheItem.Distributed != null) await cacheItem.Distributed.ExecutorAsync(eventHandler, eventData);
+
+        if (cacheItem.Local == null && cacheItem.Distributed == null)
+        {
+            throw new AbpException("The object instance is not an event handler. Object type: "
+                                  + eventHandler.GetType().AssemblyQualifiedName);
+        }
+    }
+}
+```
+
+The two executor shims are tiny lambdas that adapt the closed-generic call into a `Func<IEventHandler, object, Task>`:
+
+```csharp title="EventHandlerMethodExecutor.cs"
+public class LocalEventHandlerMethodExecutor<TEvent> : IEventHandlerMethodExecutor
+    where TEvent : class
+{
+    public EventHandlerMethodExecutorAsync ExecutorAsync
+        => (target, parameter) => target.As<ILocalEventHandler<TEvent>>()
+                                        .HandleEventAsync(parameter.As<TEvent>());
+}
+
+public class DistributedEventHandlerMethodExecutor<TEvent> : IEventHandlerMethodExecutor
+    where TEvent : class
+{
+    public EventHandlerMethodExecutorAsync ExecutorAsync
+        => (target, parameter) => target.As<IDistributedEventHandler<TEvent>>()
+                                        .HandleEventAsync(parameter.As<TEvent>());
+}
+```
+
+When a handler implements **both** local and distributed shapes for the same event type, `InvokeAsync` calls **both** sequentially. That's intentional: a single class can serve as the local and distributed entry-point and pick which logic runs based on `IEventDataMayHaveTenantId` or other markers.
+
+## UoW deferral — `UnitOfWorkEventPublisher`
+
+This is where the `onUnitOfWorkComplete: true` default closes the loop. When `PublishAsync` decides to defer, it calls `AddToUnitOfWork`, which calls `IUnitOfWork.AddOrReplaceLocalEvent(...)` / `AddOrReplaceDistributedEvent(...)`. At UoW completion, the UoW invokes `IUnitOfWorkEventPublisher.PublishLocalEventsAsync` / `PublishDistributedEventsAsync`:
+
+```csharp title="UnitOfWorkEventPublisher.cs"
+[Dependency(ReplaceServices = true)]
+public class UnitOfWorkEventPublisher : IUnitOfWorkEventPublisher, ITransientDependency
+{
+    private readonly ILocalEventBus _localEventBus;
+    private readonly IDistributedEventBus _distributedEventBus;
+
+    public UnitOfWorkEventPublisher(
+        ILocalEventBus localEventBus,
+        IDistributedEventBus distributedEventBus)
+    {
+        _localEventBus = localEventBus;
+        _distributedEventBus = distributedEventBus;
+    }
+
+    public async Task PublishLocalEventsAsync(IEnumerable<UnitOfWorkEventRecord> localEvents)
+    {
+        foreach (var localEvent in localEvents)
+        {
+            await _localEventBus.PublishAsync(
+                localEvent.EventType,
+                localEvent.EventData,
+                onUnitOfWorkComplete: false  // important: don't re-defer
+            );
+        }
+    }
+
+    public async Task PublishDistributedEventsAsync(IEnumerable<UnitOfWorkEventRecord> distributedEvents)
+    {
+        foreach (var distributedEvent in distributedEvents)
+        {
+            await _distributedEventBus.PublishAsync(
+                distributedEvent.EventType,
+                distributedEvent.EventData,
+                onUnitOfWorkComplete: false,
+                useOutbox: distributedEvent.UseOutbox
+            );
+        }
+    }
+}
+```
+
+The crucial bit is `onUnitOfWorkComplete: false` — without that, the publisher would loop endlessly by reading `UnitOfWorkManager.Current` (the same UoW that's completing) and re-enqueueing the events. For distributed events, `useOutbox` is preserved from the originally-recorded `UnitOfWorkEventRecord.UseOutbox` so the **per-call decision** survives the deferral.
+
+<Note>
+`[Dependency(ReplaceServices = true)]` means that if you register your own `IUnitOfWorkEventPublisher`, it wins — useful when you want to add per-event logging or metric instrumentation around UoW-flushed events without subclassing the bus.
+</Note>
+
+## End-to-end publish sequence
+
+The diagram below traces a single `PublishAsync` from an application-service method that is wrapped in a UoW.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application code
+    participant Bus as LocalEventBus
+    participant UoW as IUnitOfWork
+    participant Pub as UnitOfWorkEventPublisher
+    participant Inv as EventHandlerInvoker
+    participant Hdl as Handler (ILocalEventHandler&lt;T&gt;)
+
+    App->>Bus: PublishAsync(eventData)
+    Bus->>UoW: Current?
+    alt UoW open
+        Bus->>UoW: AddOrReplaceLocalEvent(record)
+        Note over App,UoW: returns immediately
+        App->>UoW: CompleteAsync()
+        UoW->>Pub: PublishLocalEventsAsync(records)
+        loop each record
+            Pub->>Bus: PublishAsync(type, data, onUoWComplete: false)
+            Bus->>Bus: PublishToEventBusAsync
+            Bus->>Bus: TriggerHandlersAsync
+            Bus->>Bus: GetHandlerFactories(orderedByLocalEventHandlerOrder)
+            loop each factory
+                Bus->>Bus: factory.GetHandler() — new IServiceScope
+                Bus->>Bus: CurrentTenant.Change(...)
+                Bus->>Inv: InvokeAsync(handler, data, eventType)
+                Inv->>Hdl: HandleEventAsync(data)
+            end
+        end
+    else no UoW
+        Bus->>Bus: PublishToEventBusAsync(type, data)
+        Note over Bus,Hdl: same TriggerHandlersAsync loop
+    end
+```
+
+If any handler throws, the loop continues for the remaining handlers and an `AggregateException` (or the single original) is rethrown after the loop. That means **partial side-effects** are possible — handler-level idempotency is your responsibility.
+
+## `LocalEventMessage` and the singleton publish hook
+
+`LocalEventBus.PublishToEventBusAsync` does not call `TriggerHandlersAsync` directly — it wraps the payload in a `LocalEventMessage` and calls a public `PublishAsync(LocalEventMessage)` overload. The wrapper gives subclasses (or test infrastructure) a single seam to intercept:
+
+```csharp title="Local/LocalEventBus.cs (excerpt)"
+protected override async Task PublishToEventBusAsync(Type eventType, object eventData)
+{
+    await PublishAsync(new LocalEventMessage(Guid.NewGuid(), eventData, eventType));
+}
+
+public virtual async Task PublishAsync(LocalEventMessage localEventMessage)
+{
+    await TriggerHandlersAsync(localEventMessage.EventType, localEventMessage.EventData);
+}
+
+protected override void AddToUnitOfWork(IUnitOfWork unitOfWork, UnitOfWorkEventRecord eventRecord)
+{
+    unitOfWork.AddOrReplaceLocalEvent(eventRecord);
+}
+```
+
+```csharp title="Local/LocalEventMessage.cs"
+public class LocalEventMessage
+{
+    public Guid MessageId { get; }
+    public object EventData { get; }
+    public Type EventType { get; }
+
+    public LocalEventMessage(Guid messageId, object eventData, Type eventType) { /* ... */ }
+}
+```
+
+The `MessageId` is generated per publish but has no role in the local pipeline — it exists so that subclasses (e.g. the test-only `OnEventHandleInvoking` / `OnPublishing` hooks `LocalDistributedEventBus` patches in) can correlate observations.
+
+## `NullLocalEventBus`
+
+```csharp title="Local/NullLocalEventBus.cs (excerpt)"
+public sealed class NullLocalEventBus : ILocalEventBus
+{
+    public static NullLocalEventBus Instance { get; } = new NullLocalEventBus();
+    private NullLocalEventBus() {}
+
+    public Task PublishAsync<TEvent>(TEvent eventData, bool onUnitOfWorkComplete = true)
+        where TEvent : class => Task.CompletedTask;
+
+    public Task PublishAsync(Type eventType, object eventData, bool onUnitOfWorkComplete = true)
+        => Task.CompletedTask;
+
+    // ... all Subscribe overloads return NullDisposable.Instance, Unsubscribe is no-op
+}
+```
+
+Use it as a sentinel value when constructing services in unit tests that need an `ILocalEventBus` but should never actually fire events. The framework itself never registers this — it's an opt-in convenience.
+
+## Action handlers and the three factories
+
+Recap of `EventBusBase.Subscribe` from the application's perspective:
+
+| Call shape | Handler factory used | Lifetime |
+| --- | --- | --- |
+| `bus.Subscribe<TEvent>(async e => …)` | `SingleInstanceHandlerFactory` wrapping `ActionEventHandler<TEvent>` | One closure, kept alive until `Unsubscribe`. |
+| `bus.Subscribe<TEvent, THandler>()` | `TransientEventHandlerFactory<THandler>` | `new THandler()` per event delivery. |
+| `bus.Subscribe(type, handlerInstance)` | `SingleInstanceHandlerFactory` | Caller owns lifetime; bus never disposes the instance. |
+| `bus.Subscribe<TEvent>(factory)` | Custom `IEventHandlerFactory` | Whatever the factory says. |
+| Auto-discovery via `[Dependency]` on `ILocalEventHandler<>` | `IocEventHandlerFactory` | Fresh `IServiceScope` per event delivery. |
+
+```csharp title="ActionEventHandler.cs"
+public class ActionEventHandler<TEvent> :
+    ILocalEventHandler<TEvent>,
+    ITransientDependency
+{
+    public Func<TEvent, Task> Action { get; }
+
+    public ActionEventHandler(Func<TEvent, Task> handler) { Action = handler; }
+
+    public async Task HandleEventAsync(TEvent eventData) => await Action(eventData);
+}
+```
+
+`LocalEventBus.Unsubscribe<TEvent>(Func<TEvent, Task> action)` then walks the `SingleInstanceHandlerFactory` entries and unwraps each one's `HandlerInstance as ActionEventHandler<TEvent>` to find the matching delegate identity:
+
+```csharp title="Local/LocalEventBus.cs (excerpt)"
+public override void Unsubscribe<TEvent>(Func<TEvent, Task> action)
+{
+    Check.NotNull(action, nameof(action));
+
+    GetOrCreateHandlerFactories(typeof(TEvent))
+        .Locking(factories =>
+        {
+            factories.RemoveAll(factory =>
+            {
+                if (!(factory is SingleInstanceHandlerFactory singleInstanceFactory)) return false;
+                if (!(singleInstanceFactory.HandlerInstance is ActionEventHandler<TEvent> actionHandler))
+                    return false;
+                return actionHandler.Action == action;
+            });
+        });
+}
+```
+
+The comparison is **reference equality** on the delegate — if you pass a *different* lambda that does the same thing, it will **not** be unsubscribed. Either keep a reference to the `IDisposable` returned by `Subscribe` (and dispose it) or keep a reference to the lambda.
+
+## Gotchas
+
+<Note>
+`PublishAsync(..., onUnitOfWorkComplete: true)` **does nothing** if no UoW is open — it falls straight through to `PublishToEventBusAsync`. The "default true" is therefore safe to leave on for the common case of publishing from inside an app-service method.
+</Note>
+
+<Note>
+`EventBusBase.TriggerHandlerAsync` swallows the original throwing context behind a `using (var eventHandlerWrapper = asyncHandlerFactory.GetHandler())`. That `using` disposes the `IServiceScope` for `IocEventHandlerFactory` **after** the exception is collected, so any `IDisposable` injected into the handler is still released. Don't rely on the handler instance to survive past the `using` block.
+</Note>
+
+<Note>
+The handler-ordering attribute lookup in `LocalEventBus.GetHandlerFactories` calls `factory.GetHandler().EventHandler.GetType()` per enumeration — for `IocEventHandlerFactory` that's an extra scope allocation just to read a custom attribute. If you have very hot local events, register handlers once via `SingleInstanceHandlerFactory` (e.g. `services.AddSingleton<MyHandler>()` + `bus.Subscribe(handlerInstance)`) to avoid the extra scope.
+</Note>
+
+<Note>
+`SubscribeHandlers` only inspects `handler.GetInterfaces()` once at construction time. If your handler dynamically implements an `IEventHandler<>` at runtime via a proxy, it won't be picked up — keep the interface on the concrete type.
+</Note>
+
+<Note>
+The `[Dependency(ReplaceServices = true)]` on `UnitOfWorkEventPublisher` means **only one** `IUnitOfWorkEventPublisher` can be active. Subclassing the default and registering with the same attribute is the supported override path; multiple competing replacements throw at startup.
+</Note>
+
+## Cross-links
+
+<CardGroup cols={2}>
+<Card title="Abstractions" icon="diagram-project" href="/framework/eventbus/abstractions">
+The contracts (`IEventBus`, handlers, factories) that `EventBusBase` implements.
+</Card>
+<Card title="Distributed EventBus" icon="tower-broadcast" href="/framework/eventbus/distributed-eventbus">
+How `DistributedEventBusBase` extends the same pipeline with serialization and inbox/outbox.
+</Card>
+<Card title="Inbox / Outbox" icon="inbox" href="/framework/eventbus/inbox-outbox">
+Where `IUnitOfWorkEventPublisher` hands events off to the outbox table.
+</Card>
+<Card title="UoW" icon="rotate" href="/framework/uow">
+`IUnitOfWork.AddOrReplaceLocalEvent`, `OnCompleted`, and `IUnitOfWorkEventPublisher`.
+</Card>
+</CardGroup>

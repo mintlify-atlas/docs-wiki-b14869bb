@@ -1,0 +1,170 @@
+---
+title: "Unit of work: interceptor, ambient scope, reserved UoW"
+sidebarTitle: "Unit of work"
+description: "Trace how ABP wraps methods in a transactional scope: UnitOfWorkInterceptor, ChildUnitOfWork, AmbientUnitOfWork, and CompleteAsync."
+---
+
+`Volo.Abp.Uow` ties database operations, queued events, and transaction handling into a single ambient scope. The system is built around three primitives — `IUnitOfWorkManager` (begin/reserve), `IAmbientUnitOfWork` (`AsyncLocal` accessor), and `UnitOfWork` (the actual save/commit logic). HTTP requests, application service methods, and explicit `using` blocks all converge into the same `CompleteAsync` path.
+
+## Sequence
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Interceptor as UnitOfWorkInterceptor
+    participant Helper as UnitOfWorkHelper
+    participant Manager as UnitOfWorkManager
+    participant Ambient as AmbientUnitOfWork
+    participant Uow as UnitOfWork
+    participant DbApi as IDatabaseApi
+    participant Publisher as IUnitOfWorkEventPublisher
+
+    Caller->>Interceptor: InterceptAsync(invocation)
+    Interceptor->>Helper: IsUnitOfWorkMethod(method)?
+    Helper-->>Interceptor: (true, UnitOfWorkAttribute?)
+    Interceptor->>Manager: TryBeginReserved("_AbpActionUnitOfWork", options)
+    alt reserved UoW exists (HTTP request)
+        Manager->>Uow: Initialize(options) on existing reserved UoW
+        Interceptor->>Caller: ProceedAsync()
+        Caller-->>Interceptor: result
+        Interceptor->>Uow: SaveChangesAsync()
+    else no reservation
+        Interceptor->>Manager: Begin(options)
+        Manager->>Ambient: GetCurrentByChecking
+        Manager->>Uow: scope.GetRequiredService&lt;IUnitOfWork&gt;()
+        Manager->>Uow: SetOuter(outer); Initialize(options)
+        Manager->>Ambient: SetUnitOfWork(uow)
+        Interceptor->>Caller: ProceedAsync()
+        Caller-->>Interceptor: result
+        Interceptor->>Uow: CompleteAsync()
+    end
+    Uow->>DbApi: SaveChangesAsync() for each active IDatabaseApi
+    Uow->>Publisher: PublishLocalEventsAsync(ordered)
+    Uow->>Publisher: PublishDistributedEventsAsync(ordered)
+    Uow->>DbApi: CommitTransactionsAsync()
+    Uow->>Uow: OnCompletedAsync(); Disposed event restores outer
+```
+
+## Step-by-step walk-through
+
+1. **Interceptor registration.** `UnitOfWorkInterceptorRegistrar.RegisterIfNeeded` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkInterceptorRegistrar.cs`) is wired into `services.OnRegistred` by `AbpUnitOfWorkModule` so every type whose `UnitOfWorkHelper.IsUnitOfWorkType` returns true (e.g. `IUnitOfWorkEnabled` markers, classes/methods decorated with `[UnitOfWork]`) gets the `UnitOfWorkInterceptor` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkInterceptor.cs`).
+
+2. **Method check.** When a candidate method is called, `UnitOfWorkInterceptor.InterceptAsync` first calls `UnitOfWorkHelper.IsUnitOfWorkMethod(invocation.Method, out var attr)`:
+   ```csharp
+   if (!UnitOfWorkHelper.IsUnitOfWorkMethod(invocation.Method, out var unitOfWorkAttribute))
+   {
+       await invocation.ProceedAsync();
+       return;
+   }
+   ```
+   `UnitOfWorkHelper` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkHelper.cs`) walks method → declaring type → `IUnitOfWorkEnabled` to find an attribute and honors `IsDisabled = true`.
+
+3. **Compute options.** `CreateOptions` instantiates `AbpUnitOfWorkOptions`, applies any explicit `[UnitOfWork(...)]` values, and — when `IsTransactional` is unset — falls back to `AbpUnitOfWorkDefaultOptions.CalculateIsTransactional` using `IUnitOfWorkTransactionBehaviourProvider.IsTransactional` (or the method name convention: `Get*` is read-only).
+
+4. **Try reserved.** `unitOfWorkManager.TryBeginReserved(UnitOfWork.UnitOfWorkReservationName, options)` looks for a UoW already reserved by `AbpUnitOfWorkMiddleware` (HTTP) or `BackgroundJobExecuter` (jobs) and re-initializes it with the method's options:
+   ```csharp
+   var uow = _ambientUnitOfWork.UnitOfWork;
+   while (uow != null && !uow.IsReservedFor(reservationName))
+       uow = uow.Outer;
+   if (uow == null) return false;
+   uow.Initialize(options);
+   ```
+   If a reservation was found, the interceptor calls `ProceedAsync` and then `unitOfWorkManager.Current.SaveChangesAsync()`. The outermost owner (middleware / filter) will call `CompleteAsync` later.
+
+5. **Begin a new UoW.** Otherwise `UnitOfWorkManager.Begin` creates one. If `Current` already exists (and `requiresNew` is false), it returns a `ChildUnitOfWork(parent)` — a wrapper that delegates everything to the parent so nested `using` blocks don't double-commit (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/ChildUnitOfWork.cs`).
+
+6. **Scope & ambient.** `CreateNewUnitOfWork` opens an `IServiceScope`, resolves `IUnitOfWork` (default impl `UnitOfWork` from `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWork.cs`), calls `SetOuter(outerUow)`, and pushes it into the `AsyncLocal` accessor via `AmbientUnitOfWork.SetUnitOfWork(unitOfWork)` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/AmbientUnitOfWork.cs`):
+   ```csharp
+   private readonly AsyncLocal<IUnitOfWork?> _currentUow;
+   public IUnitOfWork? GetCurrentByChecking()
+   {
+       var uow = UnitOfWork;
+       while (uow != null && (uow.IsReserved || uow.IsDisposed || uow.IsCompleted))
+           uow = uow.Outer;
+       return uow;
+   }
+   ```
+   `Disposed` events restore the previous UoW and dispose the scope.
+
+7. **Initialize.** `UnitOfWork.Initialize` records the cloned, normalized options (`_defaultOptions.Normalize(options.Clone())`) and flips `IsReserved` to false.
+
+8. **Method body executes.** Inside the call, repositories and DbContexts attach `IDatabaseApi` objects to the UoW via `unitOfWork.GetOrAddDatabaseApi(key, factory)`. Domain events queued with `IUnitOfWork.AddOrReplaceLocalEvent` / `AddOrReplaceDistributedEvent` are timestamped through `EventOrderGenerator.GetNext()` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/EventOrderGenerator.cs`).
+
+9. **Save changes.** When the interceptor calls `uow.CompleteAsync()` (`UnitOfWork.CompleteAsync`):
+   ```csharp
+   _isCompleting = true;
+   await SaveChangesAsync(cancellationToken);
+   while (LocalEvents.Any() || DistributedEvents.Any())
+   {
+       if (LocalEvents.Any()) {
+           var ordered = LocalEvents.OrderBy(e => e.EventOrder).ToArray();
+           LocalEvents.Clear();
+           await UnitOfWorkEventPublisher.PublishLocalEventsAsync(ordered);
+       }
+       if (DistributedEvents.Any()) {
+           var ordered = DistributedEvents.OrderBy(e => e.EventOrder).ToArray();
+           DistributedEvents.Clear();
+           await UnitOfWorkEventPublisher.PublishDistributedEventsAsync(ordered);
+       }
+       await SaveChangesAsync(cancellationToken);
+   }
+   await CommitTransactionsAsync(cancellationToken);
+   IsCompleted = true;
+   await OnCompletedAsync();
+   ```
+   The drain-then-save loop guarantees that handler-triggered changes flush before commit.
+
+10. **Database hand-off.** `SaveChangesAsync` walks every `IDatabaseApi` in `_databaseApis` and forwards to those implementing `ISupportsSavingChanges`. EF Core (`Volo.Abp.EntityFrameworkCore.EfCoreDatabaseApi`), MongoDB (`Volo.Abp.MongoDB.MongoDbDatabaseApi`), and Dapper each plug in here.
+
+11. **Transactions.** `CommitTransactionsAsync` iterates active `ITransactionApi` entries and calls `CommitAsync`. Each api was registered when EF or MongoDB began the ambient transaction. Rollback path: `UnitOfWork.RollbackAsync` walks the same map and calls `RollbackAsync` on every `ISupportsRollback` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/ISupportsRollback.cs`).
+
+12. **Completion handlers.** `OnCompletedAsync` runs every callback added by `uow.OnCompleted(Func<Task>)`. Repositories use this to clear caches after a successful commit.
+
+13. **Disposal.** `UnitOfWork.Dispose` calls `DisposeTransactions`, fires `OnFailed` when `_exception != null` or `IsCompleted == false`, then `OnDisposed`. The disposed event is what `UnitOfWorkManager.CreateNewUnitOfWork` listens on to restore the outer UoW and dispose the service scope.
+
+## Reservation flavours
+
+| Source | Reservation point | When `CompleteAsync` runs |
+| --- | --- | --- |
+| ASP.NET Core | `AbpUnitOfWorkMiddleware.InvokeAsync` reserves under `UnitOfWork.UnitOfWorkReservationName`. `AbpUowActionFilter.OnActionExecutionAsync` calls `TryBeginReserved` with method-derived options. | Middleware calls `CompleteAsync` after the filter pipeline returns. |
+| Application service method | `UnitOfWorkInterceptor.InterceptAsync` finds the reservation, initializes it, calls `SaveChangesAsync`. | Outer caller (middleware) commits. |
+| Background job | `BackgroundJobExecuter.ExecuteAsync` does not reserve — the interceptor creates a fresh UoW via `Begin(options)`. | Interceptor commits inside `using (var uow = unitOfWorkManager.Begin(options))`. |
+
+## Hooks and extension points
+
+| Hook | File | Purpose |
+| --- | --- | --- |
+| `[UnitOfWork]` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkAttribute.cs` | Toggle transactional/isolation/timeout per method/class. |
+| `IUnitOfWorkEnabled` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWorkEnabled.cs` | Marker that opts a non-attributed class into the convention. |
+| `IUnitOfWorkTransactionBehaviourProvider` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWorkTransactionBehaviourProvider.cs` | Override the "is this method transactional?" decision. The ASP.NET Core provider in `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/AspNetCoreUnitOfWorkTransactionBehaviourProvider.cs` keys off HTTP method. |
+| `IUnitOfWorkEventPublisher` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWorkEventPublisher.cs` | Swap the local/distributed publisher (used by `UnitOfWorkEventPublisher` in `Volo.Abp.EventBus`). |
+| `IDatabaseApi` / `ISupportsSavingChanges` / `ISupportsRollback` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IDatabaseApi.cs`, `ISupportsSavingChanges.cs`, `ISupportsRollback.cs` | Attach a custom data store to the UoW lifecycle. |
+| `ITransactionApi` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/ITransactionApi.cs` | Add custom transaction handling. |
+| `IUnitOfWork.OnCompleted(Func<Task>)` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IUnitOfWork.cs` | Run post-commit callbacks. |
+
+## Related options classes
+
+| Options | File |
+| --- | --- |
+| `AbpUnitOfWorkDefaultOptions` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/AbpUnitOfWorkDefaultOptions.cs` |
+| `AbpUnitOfWorkOptions` | `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/AbpUnitOfWorkOptions.cs` |
+| `AbpAspNetCoreUnitOfWorkOptions` | `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/AbpAspNetCoreUnitOfWorkOptions.cs` |
+| `AspNetCoreUnitOfWorkTransactionBehaviourProviderOptions` | `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/AspNetCoreUnitOfWorkTransactionBehaviourProviderOptions.cs` |
+
+## Gotchas
+
+- **`ChildUnitOfWork` doesn't commit.** Nested `using (var uow = unitOfWorkManager.Begin(options))` returns a child wrapper — its `CompleteAsync` is a no-op. Only the outermost owner triggers commit.
+- **`IsReserved` UoW is skipped by `Current`.** `AmbientUnitOfWork.GetCurrentByChecking` walks past reserved/disposed/completed entries. Until `Initialize` runs, `UnitOfWorkManager.Current` returns `null` even though a reservation exists.
+- **`AlwaysDisableTransactionsUnitOfWorkManager`.** Tests can swap to `AlwaysDisableTransactionsUnitOfWorkManager` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/AlwaysDisableTransactionsUnitOfWorkManager.cs`) to suppress transactions. Don't ship this in production code paths.
+- **`OnCompleted` runs only on success.** Callbacks added via `IUnitOfWork.OnCompleted` are invoked from `OnCompletedAsync` *after* `IsCompleted = true`. On rollback or failure they never fire.
+- **Event publishing order.** Local events are published before distributed events. Each batch is sorted by `EventOrderGenerator.GetNext()` to match enqueue order; cross-batch order is preserved by the outer drain loop.
+- **Get* convention vs. ASP.NET Core HTTP method.** The MVC filter (`AbpUowActionFilter`) ignores `Get`-prefixed convention and uses `HttpContext.Request.Method` — only the interceptor falls back to the name convention.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Event publication" icon="paper-plane" href="/flows/event-publication" />
+  <Card title="Auditing flow" icon="clipboard-list" href="/flows/auditing-flow" />
+  <Card title="HTTP request lifecycle" icon="route" href="/flows/http-request-lifecycle" />
+  <Card title="Background job execution" icon="gears" href="/flows/background-job-execution" />
+</CardGroup>

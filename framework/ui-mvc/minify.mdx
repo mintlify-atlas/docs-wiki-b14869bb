@@ -1,0 +1,312 @@
+---
+title: "Volo.Abp.Minify: NUglify wrappers for JS, CSS and HTML"
+sidebarTitle: "Volo.Abp.Minify"
+description: "Reference of IMinifier, IJavascriptMinifier, ICssMinifier, IHtmlMinifier and the NUglify-based default implementations that the MVC bundling pipeline uses to compress emitted bundles."
+---
+
+`Volo.Abp.Minify` is a tiny abstraction package that ABP uses to keep the minification dependency at arm's length. It defines three independent minifier contracts (one per asset family) and ships **NUglify**-backed default implementations — but any consumer can swap in a different engine without re-baking the bundling pipeline.
+
+The whole package is six concrete classes plus four interfaces. Despite its size, it is the bottom of a deep stack: the [`Mvc.UI.Bundling`](/framework/ui-mvc/mvc-ui-bundling) `BundlerBase` calls it on every contributor file that lacks a sibling `.min.js` / `.prod.css`, the LeptonX theme uses the HTML minifier to compress pre-rendered partials, and the CMS-kit page renderer uses it to minify rich-text snippets at save time.
+
+## Package layout
+
+```text framework/src/Volo.Abp.Minify/
+Volo/Abp/Minify/
+  AbpMinifyModule.cs
+  IMinifier.cs
+  Html/
+    IHtmlMinifier.cs
+  Scripts/
+    IJavascriptMinifier.cs
+  Styles/
+    ICssMinifier.cs
+  NUglify/
+    NUglifyMinifierBase.cs
+    NUglifyJavascriptMinifier.cs
+    NUglifyCssMinifier.cs
+    NUglifyHtmlMinifier.cs
+    NUglifyException.cs
+```
+
+## Module
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/AbpMinifyModule.cs
+public class AbpMinifyModule : AbpModule { }
+```
+
+Intentionally empty. The default implementations are auto-registered via `ITransientDependency` on `NUglifyMinifierBase` (every NUglify class derives from it).
+
+## The base contract
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/IMinifier.cs
+public interface IMinifier
+{
+    string Minify(
+        string source,
+        string? fileName = null,
+        string? originalFileName = null);
+}
+```
+
+Three observations:
+
+| Parameter | Purpose |
+| --- | --- |
+| `source` | The raw asset content as a string. |
+| `fileName` | Hint passed to the minifier for error reporting and (for CSS/JS) for sourcemap generation. |
+| `originalFileName` | The on-disk path used by `BundleManager` so error logs mention "Original file: …" — handy when the bundler is reading from the virtual file system. |
+
+The asset-specific contracts are empty marker interfaces:
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/Scripts/IJavascriptMinifier.cs
+public interface IJavascriptMinifier : IMinifier { }
+```
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/Styles/ICssMinifier.cs
+public interface ICssMinifier : IMinifier { }
+```
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/Html/IHtmlMinifier.cs
+public interface IHtmlMinifier : IMinifier { }
+```
+
+Marker interfaces are how the bundling pipeline can request "the JS minifier" via constructor injection without depending on a concrete type:
+
+```csharp
+public class ScriptBundler : BundlerBase, IScriptBundler
+{
+    public ScriptBundler(
+        IWebHostEnvironment hostEnvironment,
+        IJavascriptMinifier minifier,            // ← only this contract, not NUglifyJavascriptMinifier
+        IOptions<AbpBundlingOptions> bundlingOptions) { … }
+}
+```
+
+## NUglify base class
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyMinifierBase.cs
+public abstract class NUglifyMinifierBase : IMinifier, ITransientDependency
+{
+    public string Minify(
+        string source,
+        string? fileName = null,
+        string? originalFileName = null)
+    {
+        try
+        {
+            var result = UglifySource(source, fileName);
+            CheckErrors(result, originalFileName);
+            return result.Code;
+        }
+        catch (Exception e)
+        {
+            var errorMessage = "There is an error in uglifying the given source code!";
+            if (originalFileName != null)
+                errorMessage += " Original file: " + originalFileName;
+
+            throw new NUglifyException(
+                $"{errorMessage}{Environment.NewLine}{e.Message}", e);
+        }
+    }
+
+    protected abstract UglifyResult UglifySource(string source, string? fileName);
+}
+```
+
+The base is a tiny template-method wrapper around NUglify's `UglifyResult`:
+
+1. Delegate to the asset-specific `UglifySource` (each concrete class targets `Uglify.Js` / `Uglify.Css` / `Uglify.Html`).
+2. **Check for errors** — NUglify reports parse errors via `result.HasErrors` rather than throwing.
+3. **Wrap exceptions** with the original file context so the bundling pipeline can correlate failures.
+
+The error check:
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyMinifierBase.cs
+private static void CheckErrors(UglifyResult result, string? originalFileName)
+{
+    if (result.HasErrors)
+    {
+        var errorMessage = "There are some errors on uglifying the given source code!";
+        if (originalFileName != null)
+            errorMessage += " Original file: " + originalFileName;
+
+        throw new NUglifyException(
+            $"{errorMessage}{Environment.NewLine}{result.Errors.Select(err => err.ToString()).JoinAsString(Environment.NewLine)}",
+            result.Errors);
+    }
+}
+```
+
+Every error is concatenated into the message — so a single log line tells you which file failed and why.
+
+## Concrete implementations
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyJavascriptMinifier.cs
+public class NUglifyJavascriptMinifier : NUglifyMinifierBase, IJavascriptMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Js(source, fileName);
+}
+```
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyCssMinifier.cs
+public class NUglifyCssMinifier : NUglifyMinifierBase, ICssMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Css(source, fileName);
+}
+```
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyHtmlMinifier.cs
+public class NUglifyHtmlMinifier : NUglifyMinifierBase, IHtmlMinifier
+{
+    protected override UglifyResult UglifySource(string source, string? fileName)
+        => Uglify.Html(source, sourceFileName: fileName);
+}
+```
+
+Each one is three lines. The differences are exclusively in the NUglify entry-point called: `Uglify.Js`, `Uglify.Css`, or `Uglify.Html`. Because they share `NUglifyMinifierBase`, the error semantics are identical.
+
+## Exception type
+
+```csharp framework/src/Volo.Abp.Minify/Volo/Abp/Minify/NUglify/NUglifyException.cs
+public class NUglifyException : AbpException
+{
+    public List<UglifyError>? Errors { get; set; }
+
+    public NUglifyException(string message, List<UglifyError> errors)
+        : base(message) { Errors = errors; }
+
+    public NUglifyException(string message, Exception innerException)
+        : base(message, innerException) { }
+
+    /// <summary>Constructor for serializing.</summary>
+    public NUglifyException(SerializationInfo serializationInfo, StreamingContext context)
+        : base(serializationInfo, context) { }
+}
+```
+
+`NUglifyException` extends `AbpException` so the standard exception-handling pipeline (logging, exception-notifier, conversion to error-info) handles it transparently. The `Errors` collection carries every `UglifyError` for downstream tools (CI, log aggregators) to surface.
+
+## How the bundling pipeline calls it
+
+The `BundlerBase` in [`mvc-ui-bundling`](/framework/ui-mvc/mvc-ui-bundling) injects the right marker interface based on the asset family:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/Volo/Abp/AspNetCore/Mvc/UI/Bundling/BundlerBase.cs
+private string GetAndMinifyFileContent(IBundlerContext context, string fileName)
+{
+    var fileContent = GetFileInfo(context, fileName).ReadAsString();
+    try
+    {
+        fileContent = Minifier.Minify(
+            fileContent,
+            context.BundleRelativePath,     // fileName ← used by NUglify for sourcemap / errors
+            fileName                         // originalFileName ← shown in error logs
+        );
+        return fileContent;
+    }
+    catch (Exception ex)
+    {
+        Logger.LogWarning(
+            $"Unable to minify the file: {fileName}. Return file content without minification.", ex);
+    }
+    return fileContent;
+}
+```
+
+Note the **defensive fallback**: if `NUglifyException` propagates out, the bundler logs a warning and returns the un-minified file rather than failing the whole page. So a single malformed third-party script can't bring down production rendering.
+
+## Skipping minification
+
+There are three escape hatches for files you don't want minified — all owned by [`AbpBundlingOptions`](/framework/ui-mvc/mvc-ui-bundling-abstractions):
+
+| Escape | When it kicks in |
+| --- | --- |
+| `BundlingMode.None` / `BundlingMode.Bundle` | Whole-app: minification never runs. |
+| `AbpBundlingOptions.MinificationIgnoredFiles` | Per-file: file is appended raw even when minification is on. |
+| Sibling `*.min.{ext}` or `*.prod.{ext}` | Per-file: bundler uses the pre-minified file instead of re-minifying. |
+
+## Replacing the engine
+
+To swap NUglify for a different minifier (e.g. dotless, esbuild-via-`Process`), implement the three marker interfaces and let conventional registration override the NUglify defaults:
+
+```csharp
+public class EsbuildJavascriptMinifier : IJavascriptMinifier, ITransientDependency
+{
+    public string Minify(string source, string? fileName = null, string? originalFileName = null)
+    {
+        // Drive esbuild over stdio, return the result …
+    }
+}
+```
+
+…with `[Dependency(ReplaceServices = true, TryRegister = false)]` if you need to force the registration order.
+
+## Direct usage outside the bundler
+
+While `BundleManager` is the primary consumer, anything that needs to compress strings at runtime can inject the appropriate marker interface directly. A few real-world patterns:
+
+### Compressing a CMS page draft
+
+```csharp
+public class PageContentMinifier : ITransientDependency
+{
+    private readonly IHtmlMinifier _htmlMinifier;
+
+    public PageContentMinifier(IHtmlMinifier htmlMinifier) => _htmlMinifier = htmlMinifier;
+
+    public string Compress(string rawHtml, Guid pageId)
+        => _htmlMinifier.Minify(rawHtml, $"page-{pageId}.html");
+}
+```
+
+The `fileName` argument here doesn't correspond to a real file — it's purely a label that NUglify includes when reporting errors. Using a stable pseudo-name (`page-{id}.html`) makes log triage easy.
+
+### Pre-rendering an embedded chart script
+
+```csharp
+var rendered = _javascriptMinifier.Minify(
+    "const data = " + JsonSerializer.Serialize(values) + "; render(data);",
+    fileName: "chart.js"
+);
+return HtmlContent($"<script>{rendered}</script>");
+```
+
+Because the implementation is `ITransientDependency`, calling `Minify` is cheap (no factory, no caching) — fine to do once per page.
+
+### Validating CSS user input
+
+```csharp
+public class CssLinter
+{
+    private readonly ICssMinifier _minifier;
+
+    public List<UglifyError> Lint(string css)
+    {
+        try
+        {
+            _minifier.Minify(css);
+            return new List<UglifyError>();
+        }
+        catch (NUglifyException ex) when (ex.Errors != null)
+        {
+            return ex.Errors;
+        }
+    }
+}
+```
+
+Because `NUglifyException.Errors` carries the structured list of issues, an admin form can render them inline.
+
+## Performance notes
+
+NUglify is a pure-managed parser/serializer — no native dependency, no temp files. Memory usage is proportional to the input size plus a small NUglify scratch buffer. The Identity solution template's measured minification cost for the full `Global.js` bundle (≈700 KB raw) is around 80 ms on a 2020-era laptop; on first request only, after which `BundleCache` keeps the result. CSS bundles are noticeably faster because the grammar is simpler.
+
+There is no concurrency limit on the minifier itself, but `BundleCache` serializes bundle production by relative path, so two parallel requests asking for the same uncached bundle don't double-minify.
+
+## Cross-references
+
+- The bundling runtime that calls these minifiers lives in [`mvc-ui-bundling`](/framework/ui-mvc/mvc-ui-bundling) (`BundlerBase`, `ScriptBundler`, `StyleBundler`).
+- The pre-minified sibling detection rules and `MinificationIgnoredFiles` are part of [`mvc-ui-bundling-abstractions`](/framework/ui-mvc/mvc-ui-bundling-abstractions).
+- The framework `AbpException` base type and the exception-notifier pipeline are documented in [`Volo.Abp.ExceptionHandling`](/framework/core/exception-handling).
+- For HTML minification you can also drive `IHtmlMinifier` directly from a CMS-kit page renderer; see the CMS-kit pages for usage patterns.

@@ -1,0 +1,331 @@
+---
+title: "Volo.Abp.AspNetCore.Authentication.JwtBearer module"
+sidebarTitle: "JWT Bearer"
+description: "How ABP's JwtBearer integration plugs into AddAuthentication, what UseJwtTokenMiddleware does, and how Authority/Audience/AbpClaimTypes wire together."
+---
+
+`Volo.Abp.AspNetCore.Authentication.JwtBearer` is one of the smallest packages in the framework — two `.cs` files — but it is the seam where ASP.NET Core's stock `JwtBearer` handler meets ABP's claim-type conventions, the `AbpSecurityModule`, and the optional `UseJwtTokenMiddleware`. The module itself does no service registration beyond declaring its dependency on `AbpSecurityModule`; all the heavy lifting happens in the host project's `ConfigureAuthentication` call, in `Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerOptions`, and in the small middleware extension that ships in this package.
+
+This page walks the two files, shows the template-generated wiring against `Authority` / `Audience` / `RequireHttpsMetadata`, explains why ABP often relies on `AbpClaimTypes` mapping from sibling OAuth/OIDC packages, and points out the multi-tenancy claim that flows through bearer tokens.
+
+<CardGroup cols={2}>
+  <Card title="Security primitives" icon="user-shield" href="/framework/cross/security">
+    `AbpClaimTypes`, `ICurrentUser`, `ICurrentPrincipalAccessor` — what the JWT pipeline ultimately feeds.
+  </Card>
+  <Card title="OAuth claim mapping" icon="key" href="/framework/auth/oauth">
+    `MapAbpClaimTypes` lives in the sibling OAuth package; bearer flows that resolve user-info from an OAuth provider use it.
+  </Card>
+</CardGroup>
+
+## Package layout
+
+Source: `framework/src/Volo.Abp.AspNetCore.Authentication.JwtBearer/`.
+
+| Path | Role |
+| --- | --- |
+| `Volo/Abp/AspNetCore/Authentication/JwtBearer/AbpAspNetCoreAuthenticationJwtBearerModule.cs` | The module class. `[DependsOn(typeof(AbpSecurityModule))]` only. No `ConfigureServices` override. |
+| `Microsoft/AspNetCore/Builder/ApplicationBuilderAbpJwtTokenMiddlewareExtension.cs` | `UseJwtTokenMiddleware(this IApplicationBuilder, string schema = "Bearer")` — the request-pipeline shim that promotes a successful `AuthenticateAsync` result into `HttpContext.User`. |
+| `Volo.Abp.AspNetCore.Authentication.JwtBearer.csproj` | Targets `net7.0`. References `Microsoft.AspNetCore.Authentication.JwtBearer` and `Volo.Abp.Security`. |
+
+The package deliberately does **not** wrap `AddJwtBearer` with an `AddAbpJwtBearer`. Hosts call the stock `Microsoft.AspNetCore.Authentication.JwtBearerExtensions.AddJwtBearer` directly. The ABP-specific behavior is layered on through (1) module composition, (2) middleware ordering, and (3) the shared `AbpClaimTypes` static used elsewhere in the request pipeline.
+
+## The module class
+
+```csharp framework/src/Volo.Abp.AspNetCore.Authentication.JwtBearer/Volo/Abp/AspNetCore/Authentication/JwtBearer/AbpAspNetCoreAuthenticationJwtBearerModule.cs
+using Volo.Abp.Modularity;
+using Volo.Abp.Security;
+
+namespace Volo.Abp.AspNetCore.Authentication.JwtBearer;
+
+[DependsOn(typeof(AbpSecurityModule))]
+public class AbpAspNetCoreAuthenticationJwtBearerModule : AbpModule
+{
+
+}
+```
+
+This is the entire class. There is no `ConfigureServices`, no `OnApplicationInitialization`. The depend-on bring is enough for two reasons:
+
+1. **`AbpSecurityModule`** registers `AbpClaimTypes`-aware contributors (`IAbpClaimsPrincipalContributor`) and the `IStringEncryptionService` plumbing. Whatever claim names are read out of the bearer token will be projected through `ICurrentUser` because both this module and `ICurrentUser` agree on `AbpClaimTypes.UserId`, `AbpClaimTypes.TenantId`, etc.
+2. **Transitive bring-in** — referencing this package makes `ApplicationBuilderAbpJwtTokenMiddlewareExtension` discoverable. Hosts that only need the middleware shim still get the security module loaded by ABP's loader, which means `IAbpClaimsPrincipalFactory` runs the same way regardless of the auth handler.
+
+If you need extra behavior (e.g. add a custom `OnTokenValidated` event), do it in your host module by calling `Configure<JwtBearerOptions>(...)` after `AddJwtBearer`, or set the event directly inside the `AddJwtBearer` lambda.
+
+## `UseJwtTokenMiddleware` — what it actually does
+
+```csharp framework/src/Volo.Abp.AspNetCore.Authentication.JwtBearer/Microsoft/AspNetCore/Builder/ApplicationBuilderAbpJwtTokenMiddlewareExtension.cs
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+
+namespace Microsoft.AspNetCore.Builder;
+
+public static class ApplicationBuilderAbpJwtTokenMiddlewareExtension
+{
+    public static IApplicationBuilder UseJwtTokenMiddleware(this IApplicationBuilder app, string schema = JwtBearerDefaults.AuthenticationScheme)
+    {
+        return app.Use(async (ctx, next) =>
+        {
+            if (ctx.User.Identity?.IsAuthenticated != true)
+            {
+                var result = await ctx.AuthenticateAsync(schema);
+                if (result.Succeeded && result.Principal != null)
+                {
+                    ctx.User = result.Principal;
+                }
+            }
+
+            await next();
+        });
+    }
+}
+```
+
+The middleware solves one specific ordering problem: when a host has multiple authentication schemes (a cookie scheme for web pages plus a bearer scheme for `/api`), `UseAuthentication` only runs the *default* scheme. Anything that needs the JWT principal before `UseAuthorization` (for example a request-localization or tenant-resolver middleware that reads `AbpClaimTypes.TenantId` from the principal) will see an unauthenticated user.
+
+`UseJwtTokenMiddleware` walks the bearer scheme explicitly. It:
+
+* No-ops if `ctx.User.Identity?.IsAuthenticated == true` — never overrides a cookie principal.
+* Calls `ctx.AuthenticateAsync(schema)` — by default `"Bearer"` (`JwtBearerDefaults.AuthenticationScheme`), but the overload accepts any scheme name.
+* On success, assigns `ctx.User = result.Principal`, which makes subsequent middleware see the bearer principal even though the default scheme was something else.
+
+The `schema` parameter is a string, so multi-bearer hosts can call it more than once with different scheme names. Placement matters: it must run **after** `UseAuthentication` but **before** any middleware that reads `HttpContext.User` (tenant resolution, localization, audit logging).
+
+```csharp
+app.UseAuthentication();
+app.UseJwtTokenMiddleware();      // promote bearer principal if cookie failed
+app.UseMultiTenancy();            // reads AbpClaimTypes.TenantId from ctx.User
+app.UseAuthorization();
+```
+
+<Note>
+Whether you need `UseJwtTokenMiddleware` depends on your auth topology. A pure-API host whose default scheme is already `JwtBearerDefaults.AuthenticationScheme` does **not** need it — `UseAuthentication` will do the same work. Tiered hosts (cookie default + bearer side scheme, e.g. an MVC UI that also serves JSON APIs) do need it, and the ABP solution templates omit it from the pure-API `HttpApi.Host` template precisely for that reason.
+</Note>
+
+## Template wiring — the canonical `ConfigureAuthentication`
+
+ABP's `app/aspnet-core` template configures JWT bearer in `MyProjectNameHttpApiHostModule.cs`:
+
+```csharp templates/app/aspnet-core/src/MyCompanyName.MyProjectName.HttpApi.Host/MyProjectNameHttpApiHostModule.cs
+private void ConfigureAuthentication(ServiceConfigurationContext context, IConfiguration configuration)
+{
+    context.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.Authority = configuration["AuthServer:Authority"];
+            options.RequireHttpsMetadata = Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+            options.Audience = "MyProjectName";
+        });
+}
+```
+
+Three options are set, each pulled out of `appsettings.json`:
+
+* **`Authority`** — the OpenIddict/IdentityServer URL. The handler will append `/.well-known/openid-configuration` and `/.well-known/jwks` to fetch metadata and signing keys. `Authority` is also used to validate the `iss` claim of incoming tokens by default.
+* **`RequireHttpsMetadata`** — read as a `bool`. The template stores it as a string in configuration so that local dev (`"false"`) and production (`"true"`) can flip it without recompiling. Set to `true` for any non-loopback authority.
+* **`Audience`** — sets `TokenValidationParameters.ValidAudience`. The matching `aud` value is configured on the OpenIddict scope and on the resource API definition.
+
+The companion `appsettings.json` block looks like:
+
+```json templates/app/aspnet-core/src/MyCompanyName.MyProjectName.HttpApi.Host/appsettings.json
+"AuthServer": {
+  "Authority": "https://localhost:44345",
+  "RequireHttpsMetadata": "false",
+  "SwaggerClientId": "MyProjectName_Swagger"
+}
+```
+
+Nothing else is required for the JwtBearer pipeline to work — `AddJwtBearer` registers all the option processors, the `JwtBearerHandler`, and the metadata refresh background work itself. ABP layers on top by virtue of the same host module composition graph.
+
+## How `AbpClaimTypes` flows through a bearer principal
+
+The JwtBearer handler reads incoming JWTs and produces a `ClaimsPrincipal`. The claim *types* it emits depend on `Microsoft.IdentityModel.Tokens.TokenValidationParameters.NameClaimType` / `RoleClaimType` and the inbound JSON keys.
+
+ABP's `AbpClaimTypes` static (in `Volo.Abp.Security`) defines the names the rest of the framework reads:
+
+```csharp framework/src/Volo.Abp.Security/Volo/Abp/Security/Claims/AbpClaimTypes.cs
+public static class AbpClaimTypes
+{
+    /// <summary>Default: <see cref="ClaimTypes.NameIdentifier"/></summary>
+    public static string UserId { get; set; } = ClaimTypes.NameIdentifier;
+
+    /// <summary>Default: <see cref="ClaimTypes.Role"/></summary>
+    public static string Role { get; set; } = ClaimTypes.Role;
+
+    /// <summary>Default: "tenantid".</summary>
+    public static string TenantId { get; set; } = "tenantid";
+
+    /// <summary>Default: "client_id".</summary>
+    public static string ClientId { get; set; } = "client_id";
+
+    // EmailVerified, PhoneNumber, EditionId, Impersonator*, ...
+}
+```
+
+These are **mutable statics**. If your IdP emits `"sub"` instead of `ClaimTypes.NameIdentifier`, you have two options:
+
+1. **Rewrite the inbound claim** — `JwtBearerOptions.TokenValidationParameters.NameClaimType = "sub";` plus `MapInboundClaims = false` to disable the legacy mapping that turns `"sub"` into a SOAP URI.
+2. **Reassign `AbpClaimTypes.UserId`** in your host module's `ConfigureServices` (rare; affects the whole process).
+
+The sibling `Volo.Abp.AspNetCore.Authentication.OAuth` package provides `ClaimActionCollection.MapAbpClaimTypes()` which performs option (1) for the common OIDC claim set. Pure JWT bearer hosts do not register claim actions (only OAuth/OIDC handlers do), so the recommended approach is to disable Microsoft's legacy claim mapping:
+
+```csharp
+.AddJwtBearer(options =>
+{
+    options.Authority = configuration["AuthServer:Authority"];
+    options.Audience = "MyProjectName";
+    options.MapInboundClaims = false;   // keep "sub", "role", "email" as-is
+    options.TokenValidationParameters.NameClaimType = "preferred_username";
+    options.TokenValidationParameters.RoleClaimType = AbpClaimTypes.Role;
+})
+```
+
+## The multi-tenancy claim
+
+`AbpClaimTypes.TenantId` defaults to the literal string `"tenantid"`. The token issued by an ABP-aware authorization server (OpenIddict module with `AbpOpenIddictClaimsPrincipalHandler`) embeds the user's tenant as:
+
+```json
+{
+  "sub": "5e2c9a8b-...",
+  "tenantid": "29d1b8c0-...",
+  "role": ["admin", "buyer"],
+  "client_id": "MyProjectName_App",
+  "iss": "https://localhost:44345",
+  "aud": "MyProjectName",
+  "exp": 1719158400
+}
+```
+
+Once the JwtBearerHandler validates and projects this into a `ClaimsPrincipal`, `Volo.Abp.AspNetCore.MultiTenancy.HttpContextCurrentTenantAccessor` reads `AbpClaimTypes.TenantId` to populate `ICurrentTenant`. Permission checks, repository filters (`IMultiTenant.TenantId`), and outgoing requests all flow from that single claim.
+
+<Note>
+**Multi-tenancy claim mapping.** If the bearer token uses a different key (`tenant_id`, `tid`, …), do not patch the principal in middleware. Instead set `AbpClaimTypes.TenantId = "tid";` once at startup so that every downstream consumer — `ICurrentTenant`, the auditing module, `IDataFilter<IMultiTenant>` — reads the same key. The static is intentionally writable for this reason.
+</Note>
+
+## Composing with `AddAuthentication()`
+
+The package does not contribute service descriptors of its own to the auth builder. The wiring is the host's responsibility:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    var configuration = context.Services.GetConfiguration();
+
+    context.Services
+        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.Authority           = configuration["AuthServer:Authority"];
+            options.Audience            = "MyProjectName";
+            options.RequireHttpsMetadata = bool.Parse(configuration["AuthServer:RequireHttpsMetadata"]!);
+
+            options.MapInboundClaims = false;
+            options.TokenValidationParameters.NameClaimType = "preferred_username";
+            options.TokenValidationParameters.RoleClaimType = AbpClaimTypes.Role;
+        });
+}
+```
+
+Two ABP-specific touches:
+
+* The host module must `[DependsOn(typeof(AbpAspNetCoreAuthenticationJwtBearerModule))]`. Without it, `UseJwtTokenMiddleware` is unavailable and `AbpSecurityModule` may not be loaded transitively (depending on the rest of the graph).
+* Multi-scheme hosts add `.AddAbpOpenIdConnect("oidc", ...)` *after* `AddJwtBearer`. See [`oidc`](/framework/auth/openid-connect).
+
+## Pipeline ordering
+
+The full request pipeline for a bearer-only host is:
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+
+    app.UseAbpRequestLocalization();
+    app.UseStaticFiles();
+    app.UseRouting();
+    app.UseCors();
+    app.UseAuthentication();
+
+    if (MultiTenancyConsts.IsEnabled)
+    {
+        app.UseMultiTenancy();
+    }
+
+    app.UseAuthorization();
+    app.UseSwagger();
+    app.UseAbpSwaggerUI(/* ... */);
+    app.UseAuditing();
+    app.UseAbpSerilogEnrichers();
+    app.UseConfiguredEndpoints();
+}
+```
+
+For a tiered host with both cookie and bearer schemes:
+
+```csharp
+app.UseAuthentication();
+app.UseJwtTokenMiddleware();    // promote bearer for API calls under cookie default
+app.UseMultiTenancy();
+app.UseAuthorization();
+```
+
+The shim never overwrites an authenticated cookie principal, so MVC pages still see the cookie identity while `/api` controllers see the bearer identity in the same host.
+
+## Multi-scheme: two bearers in one process
+
+For hosts that accept both an internal JWT and an external Auth0 JWT, register a named scheme and call the middleware twice:
+
+```csharp
+context.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options => { /* internal authority */ })
+    .AddJwtBearer("External", options =>
+    {
+        options.Authority = "https://my-tenant.auth0.com/";
+        options.Audience  = "https://api.myproject.com";
+        options.MapInboundClaims = false;
+    });
+
+// In OnApplicationInitialization:
+app.UseAuthentication();
+app.UseJwtTokenMiddleware();          // default "Bearer"
+app.UseJwtTokenMiddleware("External"); // also try Auth0
+```
+
+Both schemes feed the same `HttpContext.User`. Authorization policies select which scheme is allowed per endpoint with `[Authorize(AuthenticationSchemes = "Bearer,External")]`.
+
+## What this package does not do
+
+It is worth being explicit about non-responsibilities:
+
+* No token issuance — that is the `Volo.Abp.OpenIddict` module's job.
+* No claims transformation — that is `AbpClaimsPrincipalFactory` (`Volo.Abp.Security`) running at sign-in.
+* No tenant resolution — that is `Volo.Abp.AspNetCore.MultiTenancy`'s `MultiTenancyMiddleware`.
+* No role/permission check — that is `Volo.Abp.Authorization`'s `PermissionChecker`.
+
+Treat this package as a thin glue layer: it makes sure the ASP.NET Core bearer pipeline cooperates with the rest of ABP's request-time machinery, and it ships one middleware so multi-scheme hosts can promote bearer principals correctly.
+
+## Common pitfalls
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `ICurrentUser.Id` is null even though the token validates | Microsoft's legacy claim mapping renamed `"sub"` to a SOAP URI that does not match `AbpClaimTypes.UserId` | `options.MapInboundClaims = false;` and either set `NameClaimType` or remap with the OAuth package's `MapAbpClaimTypes` |
+| `ICurrentTenant.Id` is null for bearer requests | The token does not carry a `tenantid` claim | Add the claim at the auth server, or set `AbpClaimTypes.TenantId` to whatever key the IdP emits |
+| Roles array is collapsed to a single string | The JWT serializer joined the array because `RoleClaimType` is the SOAP URI | Set `TokenValidationParameters.RoleClaimType = AbpClaimTypes.Role` and disable legacy mapping |
+| `UseJwtTokenMiddleware` does nothing | Called before `UseAuthentication`, so `AuthenticateAsync` has no handler registered yet | Move the call to after `UseAuthentication` and before consumers of `HttpContext.User` |
+| Cookie principal is replaced by an anonymous bearer attempt | Custom middleware ran `AuthenticateAsync` and assigned the result unconditionally | Use `UseJwtTokenMiddleware`, which guards on `IsAuthenticated != true` |
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="OAuth claim mapping" icon="user-check" href="/framework/auth/oauth">
+    `MapAbpClaimTypes` for `ClaimActionCollection`. Used by the OIDC handler; reusable in custom OAuth flows.
+  </Card>
+  <Card title="Multi-tenancy" icon="building" href="/framework/cross/multi-tenancy">
+    How `AbpClaimTypes.TenantId` is read by `ICurrentTenant` once the bearer principal is in place.
+  </Card>
+  <Card title="Security primitives" icon="user-shield" href="/framework/cross/security">
+    `ICurrentUser`, `AbpClaimTypes`, `IAbpClaimsPrincipalContributor` — the consumers of whatever the JWT pipeline produces.
+  </Card>
+  <Card title="OpenIddict module" icon="server" href="/modules/openiddict/overview">
+    The default ABP-supplied authorization server that issues the bearer tokens this module validates.
+  </Card>
+</CardGroup>

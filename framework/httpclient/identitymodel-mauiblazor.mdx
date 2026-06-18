@@ -1,0 +1,317 @@
+---
+title: "Volo.Abp.Http.Client.IdentityModel.MauiBlazor: token forwarding from platform secure storage"
+sidebarTitle: "IdentityModel.MauiBlazor"
+description: "How the MAUI Blazor module wires a custom IAbpAccessTokenProvider — typically backed by SecureStorage — into the ABP proxy pipeline and remaps JWT claim names so AbpClaimTypes lookups succeed."
+---
+
+`Volo.Abp.Http.Client.IdentityModel.MauiBlazor` is the .NET MAUI
+Blazor (Blazor Hybrid) counterpart of
+[`identitymodel-web`](/framework/httpclient/identitymodel-web) and
+[`identitymodel-webassembly`](/framework/httpclient/identitymodel-webassembly).
+It is the smallest of the three host packages because MAUI does not
+ship a built‑in `IAccessTokenProvider` — the authentication flow and
+token storage are entirely the application's responsibility,
+typically built on `Microsoft.Maui.Storage.SecureStorage` (Keychain on
+iOS/macOS, Keystore on Android, DPAPI on Windows). The package
+therefore registers a **placeholder** access‑token provider that
+applications are expected to override, plus the same authenticator
+shape used by the other two host packages.
+
+What the package does:
+
+- Registers `MauiBlazorAbpAccessTokenProvider` as the
+  `IAbpAccessTokenProvider` — a no‑op that returns `null`. **Replace
+  it in your MAUI app** to read from secure storage.
+- Registers `MauiBlazorIdentityModelRemoteServiceHttpClientAuthenticator`
+  as the `IRemoteServiceHttpClientAuthenticator`, which forwards the
+  token (whatever the application supplies) and falls back to OIDC
+  `client_credentials` only when the application returns `null` and
+  the remote service has not opted out.
+- Remaps `AbpClaimTypes` to JWT claim names (`sub`, `role`, etc.) so
+  identity reads on the in‑process `ClaimsPrincipal` succeed.
+
+## Package layout
+
+```
+framework/src/Volo.Abp.Http.Client.IdentityModel.MauiBlazor/Volo/Abp/Http/Client/IdentityModel/MauiBlazor/
+├── AbpHttpClientIdentityModelMauiBlazorModule.cs
+├── MauiBlazorAbpAccessTokenProvider.cs
+└── MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator.cs
+```
+
+Note: the authenticator file name is
+`MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator.cs` (the
+typo with the extra **I** is in the source tree). The class itself is
+named `MauiBlazorIdentityModelRemoteServiceHttpClientAuthenticator`.
+
+## The module
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.MauiBlazor/Volo/Abp/Http/Client/IdentityModel/MauiBlazor/AbpHttpClientIdentityModelMauiBlazorModule.cs
+[DependsOn(
+    typeof(AbpHttpClientIdentityModelModule),
+    typeof(AbpAspNetCoreComponentsMauiBlazorModule)
+)]
+public class AbpHttpClientIdentityModelMauiBlazorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        AbpClaimTypes.UserName = JwtClaimTypes.PreferredUserName;
+        AbpClaimTypes.Name = JwtClaimTypes.GivenName;
+        AbpClaimTypes.SurName = JwtClaimTypes.FamilyName;
+        AbpClaimTypes.UserId = JwtClaimTypes.Subject;
+        AbpClaimTypes.Role = JwtClaimTypes.Role;
+        AbpClaimTypes.Email = JwtClaimTypes.Email;
+    }
+}
+```
+
+Identical claim remap to the WebAssembly module — see
+[identitymodel-webassembly#why-remap-abpclaimtypes](/framework/httpclient/identitymodel-webassembly#why-remap-abpclaimtypes)
+for the rationale. The reasoning is the same: ABP's identity stack
+reads claims by the canonical names in `AbpClaimTypes`, and a JWT
+shipped from an OIDC authority uses the short names listed below.
+
+| `AbpClaimTypes` slot | New value |
+| --- | --- |
+| `UserId` | `"sub"` (`JwtClaimTypes.Subject`) |
+| `UserName` | `"preferred_username"` |
+| `Name` | `"given_name"` |
+| `SurName` | `"family_name"` |
+| `Role` | `"role"` |
+| `Email` | `"email"` |
+
+## The default access‑token provider — a placeholder
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.MauiBlazor/Volo/Abp/Http/Client/IdentityModel/MauiBlazor/MauiBlazorAbpAccessTokenProvider.cs
+[Dependency(ReplaceServices = true)]
+public class MauiBlazorAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    public virtual Task<string> GetTokenAsync()
+    {
+        return Task.FromResult(null as string);
+    }
+}
+```
+
+The class exists primarily for the `[Dependency(ReplaceServices = true)]`
+slot to be taken — preventing `NullAbpAccessTokenProvider` from
+winning the registration race. The expectation is that the MAUI app
+provides a real implementation in its application startup module:
+
+```csharp
+public class MyMauiBlazorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.Replace(ServiceDescriptor.Transient<IAbpAccessTokenProvider, SecureStorageAccessTokenProvider>());
+    }
+}
+
+public class SecureStorageAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    public async Task<string> GetTokenAsync()
+    {
+        return await SecureStorage.Default.GetAsync("access_token");
+    }
+}
+```
+
+The `virtual` modifier on `GetTokenAsync` is the other intended
+override path — derive from `MauiBlazorAbpAccessTokenProvider` and
+keep the conventional registration; ABP's "last replacement wins"
+rule ensures the subclass takes effect.
+
+## The authenticator
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.MauiBlazor/Volo/Abp/Http/Client/IdentityModel/MauiBlazor/MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator.cs
+[Dependency(ReplaceServices = true)]
+public class MauiBlazorIdentityModelRemoteServiceHttpClientAuthenticator : IdentityModelRemoteServiceHttpClientAuthenticator
+{
+    protected IAbpAccessTokenProvider AccessTokenProvider { get; }
+
+    public MauiBlazorIdentityModelRemoteServiceHttpClientAuthenticator(
+        IIdentityModelAuthenticationService identityModelAuthenticationService,
+        IAbpAccessTokenProvider abpAccessTokenProvider)
+        : base(identityModelAuthenticationService)
+    {
+        AccessTokenProvider = abpAccessTokenProvider;
+    }
+
+    public async override Task Authenticate(RemoteServiceHttpClientAuthenticateContext context)
+    {
+        if (context.RemoteService.GetUseCurrentAccessToken() != false)
+        {
+            var accessToken = await AccessTokenProvider.GetTokenAsync();
+            if (accessToken != null)
+            {
+                context.Request.SetBearerToken(accessToken);
+                return;
+            }
+        }
+
+        await base.Authenticate(context);
+    }
+}
+```
+
+Behaviour summary — identical in shape to the Web and WebAssembly
+authenticators:
+
+| Condition | Action |
+| --- | --- |
+| `RemoteService["UseCurrentAccessToken"] == "false"` | Skip the user token, go straight to client‑credentials. |
+| `IAbpAccessTokenProvider.GetTokenAsync()` returned non‑null | `requestMessage.SetBearerToken(token)` per request, return. |
+| Otherwise | Delegate to `IdentityModelRemoteServiceHttpClientAuthenticator` — a client‑credentials token negotiated against `AbpIdentityClientOptions`. |
+
+The per‑request `SetBearerToken` is intentional: on a multi‑profile
+MAUI app two profiles might be active in the same process during a
+sign‑out/sign‑in transition. Writing the token on the request keeps
+it isolated to the call.
+
+## Recommended application‑side wiring
+
+A typical MAUI Blazor host implements three concerns next to this
+package:
+
+1. **An OAuth client.** Either a hand‑rolled
+   `IdentityModel.OidcClient` consumer or the platform's native
+   sign‑in pages (e.g. `WebAuthenticator` on Android/iOS). The
+   resulting access token and refresh token are persisted in
+   `SecureStorage`.
+2. **A token refresher.** Before each call (or on a timer), the app
+   inspects the cached expiry and silently refreshes when necessary.
+   The token written back into secure storage is the one
+   `IAbpAccessTokenProvider.GetTokenAsync()` later reads.
+3. **A `ClaimsPrincipal` builder.** Decode the JWT and build a
+   `ClaimsPrincipal` so ABP's `CurrentUser` and
+   `[Authorize(Roles = "...")]` work. Because of the
+   `AbpClaimTypes` remap from this module's `ConfigureServices`,
+   reading `sub` / `role` from the JWT is enough.
+
+A minimal sketch:
+
+```csharp
+public class MauiTokenStore
+{
+    private const string Key = "access_token";
+
+    public Task SaveAsync(string token) => SecureStorage.Default.SetAsync(Key, token);
+    public Task<string?> ReadAsync() => SecureStorage.Default.GetAsync(Key);
+    public bool Remove() => SecureStorage.Default.Remove(Key);
+}
+
+public class TokenStoreAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    private readonly MauiTokenStore _store;
+    public TokenStoreAccessTokenProvider(MauiTokenStore store) => _store = store;
+
+    public Task<string> GetTokenAsync() => _store.ReadAsync()!;
+}
+```
+
+Then either replace `IAbpAccessTokenProvider` with
+`TokenStoreAccessTokenProvider` from your app module
+(`ConfigureServices(...).Services.Replace(...)`) or — more idiomatic —
+add `[Dependency(ReplaceServices = true)]` and let conventional
+registration win.
+
+## End‑to‑end flow
+
+```
+[App start]
+   ↓
+SecureStorage holds previous tokens (or empty)
+   ↓
+User taps "Login"
+   ↓
+WebAuthenticator (or OidcClient) completes auth-code with PKCE
+   ↓
+Tokens persisted into SecureStorage by app code
+   ↓
+User navigates inside a Razor component that injects an IRemoteService proxy
+   ↓
+Component calls _proxy.GetSomeData()
+   ↓
+ClientProxyBase<T>.RequestAsync builds the HttpRequestMessage
+   ↓
+ClientAuthenticator.Authenticate(context)
+   ↓
+MauiBlazorIdentityModelRemoteServiceHttpClientAuthenticator
+   if UseCurrentAccessToken != false:
+       token = IAbpAccessTokenProvider.GetTokenAsync()  (app-replaced)
+       if token != null
+           requestMessage.SetBearerToken(token)
+           return
+   fall through to IdentityModelRemoteServiceHttpClientAuthenticator
+       → IIdentityModelAuthenticationService.TryAuthenticateAsync(...)
+         client.DefaultRequestHeaders.Authorization = "Bearer <token>"
+```
+
+## Why not provide a token storage implementation?
+
+`Volo.Abp.Http.Client.IdentityModel.MauiBlazor` does **not** depend on
+`Microsoft.Maui.Storage` because that dependency drags every
+MAUI‑targeting workload (Android, iOS, MacCatalyst, Windows) into the
+module. Different teams ship MAUI apps with different sets of target
+frameworks, and the storage backends are platform‑specific — Windows
+DPAPI, Android Keystore, iOS Keychain, macOS Keychain, sandboxed
+LocalApplicationData fall‑backs.
+
+A neutral placeholder keeps the package one‑target‑agnostic and
+lets the app pick the storage primitive it prefers:
+
+- `SecureStorage.Default` — the default Microsoft.Maui choice.
+- A custom `IDataProtector`-based store for desktop scenarios.
+- A `IBlazorWebViewLifecycleHandler` that posts the token into the
+  WebView so JavaScript can stash it in IndexedDB. (Not generally
+  recommended, but sometimes necessary.)
+
+## Caveats
+
+- **Out of the box the package authenticates with `null`.** Until the
+  app installs a real `IAbpAccessTokenProvider`, every proxy call
+  falls through to client credentials — and a MAUI client almost
+  certainly cannot keep an OAuth client secret. The first symptom is
+  `AbpRemoteCallException` with the OIDC error
+  `invalid_client`.
+- **Claim remap is global static state.** Once the module is
+  registered, `AbpClaimTypes` is mutated process‑wide. Avoid loading
+  this module side‑by‑side with hosts that expect the legacy
+  ws‑federation claim URLs.
+- **Refresh tokens are not modelled here.** The base class
+  `IIdentityModelAuthenticationService` caches the *access token* in
+  `IDistributedCache`. Refresh‑token rotation, expiry awareness,
+  retries, and re‑authentication remain application concerns. ABP's
+  generated MAUI Blazor templates ship a sample
+  `OpenIdConnect`/`SecureStorage` pair you can copy.
+
+## How DI resolution picks up your override
+
+ABP runs each `[Dependency(ReplaceServices = true)]` replacement
+during conventional registration. When two replacements compete
+(this package's placeholder and your real provider), the **last
+registered wins** because each successive `Services.Replace` rewrites
+the descriptor. ABP loads dependency modules before the consumer
+module, so a module dependency chain like
+
+```
+MyApp → MyMauiBlazorModule → AbpHttpClientIdentityModelMauiBlazorModule
+```
+
+guarantees that `MyMauiBlazorModule`'s registration replaces the
+placeholder. If you instead host the override in a separate library
+without making it a module dependency, registration order is
+undefined and you may end up running with the placeholder.
+
+## Related pages
+
+- [identitymodel](/framework/httpclient/identitymodel) — the
+  `IdentityModelRemoteServiceHttpClientAuthenticator` base class and
+  the `TryAuthenticateAsync` fallback.
+- [identitymodel-web](/framework/httpclient/identitymodel-web) — the
+  ASP.NET Core counterpart that reads the token from the OIDC cookie.
+- [identitymodel-webassembly](/framework/httpclient/identitymodel-webassembly) —
+  the Blazor WebAssembly counterpart that uses
+  `Microsoft.AspNetCore.Components.WebAssembly.Authentication.IAccessTokenProvider`.
+- [http-client](/framework/httpclient/http-client) — the proxy
+  pipeline that ends up calling this authenticator.

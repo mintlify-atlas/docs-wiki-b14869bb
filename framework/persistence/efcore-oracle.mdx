@@ -1,0 +1,322 @@
+---
+title: "Volo.Abp.EntityFrameworkCore.Oracle and .Oracle.Devart — Oracle provider packages"
+description: "Two Oracle EF Core providers ship with ABP v7.4.0: the official Oracle.EntityFrameworkCore (Oracle.ManagedDataAccess) and the third-party Devart.Data.Oracle.EFCore. Covers AbpDbContextOptionsOracleExtensions.UseOracle for both, AbpOracleModelBuilderExtensions, sequential-GUID defaults, and the connection-string checkers."
+---
+
+ABP v7.4.0 ships **two** Oracle provider packages because the EF Core ecosystem itself has two reasonable Oracle providers and they have different licensing and feature characteristics:
+
+* **`Volo.Abp.EntityFrameworkCore.Oracle`** wraps `Oracle.EntityFrameworkCore` (Oracle Corporation's official provider, built on `Oracle.ManagedDataAccess.Core`). Free, MIT-licensed, ships from Oracle.
+* **`Volo.Abp.EntityFrameworkCore.Oracle.Devart`** wraps `Devart.Data.Oracle.EFCore` (Devart's commercial provider, sold with a licence). Better SQL generation, more LINQ translations, faster bulk operations.
+
+Both packages expose `UseOracle(...)` on `AbpDbContextOptions` so module code reads identically; the namespace and DI dependency tree determine which provider is actually loaded. Do **not** reference both packages in the same project — they have conflicting types (different `OracleConnection` classes, different `OracleDbContextOptionsBuilder`).
+
+## File inventory — `Volo.Abp.EntityFrameworkCore.Oracle`
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/EntityFrameworkCore/Oracle/AbpEntityFrameworkCoreOracleModule.cs` | Module that `DependsOn(typeof(AbpEntityFrameworkCoreModule))`. Sets `AbpSequentialGuidGeneratorOptions.DefaultSequentialGuidType = SequentialGuidType.SequentialAsBinary`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsOracleExtensions.cs` | `UseOracle(...)` and `UseOracle<TDbContext>(...)` on `AbpDbContextOptions`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextConfigurationContextOracleExtensions.cs` | Inner `UseOracle(...)` that calls `optionsBuilder.UseOracle(...)` from `Oracle.EntityFrameworkCore.Infrastructure`. |
+| `Volo/Abp/EntityFrameworkCore/ConnectionStrings/OracleConnectionStringChecker.cs` | `[Dependency(ReplaceServices = true)]` checker using `Oracle.ManagedDataAccess.Client.OracleConnection`. |
+| `Volo.Abp.EntityFrameworkCore.Oracle.csproj` | Targets `net7.0`; references `Oracle.EntityFrameworkCore` **7.21.8** and the shared `Microsoft.EntityFrameworkCore.Relational` version. |
+
+## File inventory — `Volo.Abp.EntityFrameworkCore.Oracle.Devart`
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/EntityFrameworkCore/Oracle/Devart/AbpEntityFrameworkCoreOracleDevartModule.cs` | Module that `DependsOn(typeof(AbpEntityFrameworkCoreModule))`. Sets the same `SequentialAsBinary` default. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsOracleDevartExtensions.cs` | `UseOracle(...)` and `UseOracle<TDbContext>(...)` on `AbpDbContextOptions`; signature accepts an extra `useExistingConnectionIfAvailable` flag. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextConfigurationContextOracleDevartExtensions.cs` | Inner `UseOracle(...)` calling `optionsBuilder.UseOracle(...)` from `Devart.Data.Oracle.Entity`. |
+| `Volo/Abp/EntityFrameworkCore/ConnectionStrings/OracleDevartConnectionStringChecker.cs` | `[Dependency(ReplaceServices = true)]` checker using `Devart.Data.Oracle.OracleConnection`. |
+| `Microsoft/EntityFrameworkCore/AbpOracleModelBuilderExtensions.cs` | `modelBuilder.UseOracle()` tags the model with `EfCoreDatabaseProvider.Oracle`. |
+| `Volo.Abp.EntityFrameworkCore.Oracle.Devart.csproj` | Targets `net7.0`; references `Devart.Data.Oracle.EFCore` **10.1.134.7**. |
+
+(Note: the non-Devart package has no `Microsoft/EntityFrameworkCore/AbpOracleModelBuilderExtensions.cs` of its own; the Devart package ships the only `AbpOracleModelBuilderExtensions` helper in the framework.)
+
+## The modules
+
+Both modules share an identical body apart from namespace and package references:
+
+```csharp
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreOracleModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsBinary;
+            }
+        });
+    }
+}
+```
+
+Oracle stores `RAW(16)` in the byte order written by `Guid.ToByteArray()` (little-endian for the first three fields, big-endian for the rest). `SequentialAsBinary` is the strategy that keeps the **byte-order** monotonic so clustered indexes on `RAW(16)` columns receive append-only inserts. If you map `Guid` to `NCHAR(36)` instead (Devart supports both), prefer `SequentialAsString`.
+
+## `AbpDbContextOptions.UseOracle` — official provider
+
+```csharp
+public static class AbpDbContextOptionsOracleExtensions
+{
+    public static void UseOracle(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<OracleDbContextOptionsBuilder> oracleOptionsAction = null)
+        => options.Configure(context => context.UseOracle(oracleOptionsAction));
+
+    public static void UseOracle<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<OracleDbContextOptionsBuilder> oracleOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+        => options.Configure<TDbContext>(context => context.UseOracle(oracleOptionsAction));
+}
+```
+
+`OracleDbContextOptionsBuilder` here is `Oracle.EntityFrameworkCore.Infrastructure.OracleDbContextOptionsBuilder`. Use it for:
+
+```csharp
+options.UseOracle(oracle =>
+{
+    oracle.MigrationsAssembly("MyApp.EntityFrameworkCore");
+    oracle.UseOracleSQLCompatibility("11");        // legacy 11g grammar
+    oracle.CommandTimeout(60);
+});
+```
+
+## `AbpDbContextOptions.UseOracle` — Devart provider
+
+```csharp
+public static class AbpDbContextOptionsOracleDevartExtensions
+{
+    public static void UseOracle(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<OracleDbContextOptionsBuilder> oracleOptionsAction = null,
+        bool useExistingConnectionIfAvailable = false)
+        => options.Configure(context => context.UseOracle(oracleOptionsAction, useExistingConnectionIfAvailable));
+
+    public static void UseOracle<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<OracleDbContextOptionsBuilder> oracleOptionsAction = null,
+        bool useExistingConnectionIfAvailable = false)
+        where TDbContext : AbpDbContext<TDbContext>
+        => options.Configure<TDbContext>(context => context.UseOracle(oracleOptionsAction, useExistingConnectionIfAvailable));
+}
+```
+
+The Devart overload introduces an extra `useExistingConnectionIfAvailable` flag. Devart's `OracleConnection` is incompatible with `Oracle.ManagedDataAccess.Client.OracleConnection`, so if integration-test infrastructure pre-creates a `DbConnection` of the wrong type the framework would crash. Setting `useExistingConnectionIfAvailable: true` opts in to reusing `AbpDbContextConfigurationContext.ExistingConnection`; the default `false` ignores it and always creates a new Devart connection from `ConnectionString`.
+
+The inner extensions for Devart show the corresponding branch:
+
+```csharp
+public static DbContextOptionsBuilder UseOracle(
+    [NotNull] this AbpDbContextConfigurationContext context,
+    [CanBeNull] Action<OracleDbContextOptionsBuilder> oracleOptionsAction = null,
+    bool useExistingConnectionIfAvailable = false)
+{
+    if (useExistingConnectionIfAvailable && context.ExistingConnection != null)
+    {
+        return context.DbContextOptions.UseOracle(context.ExistingConnection, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            oracleOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+    else
+    {
+        return context.DbContextOptions.UseOracle(context.ConnectionString, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            oracleOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+}
+```
+
+## `AbpDbContextConfigurationContext.UseOracle` — official provider
+
+```csharp
+public static DbContextOptionsBuilder UseOracle(
+    [NotNull] this AbpDbContextConfigurationContext context,
+    [CanBeNull] Action<OracleDbContextOptionsBuilder> oracleOptionsAction = null)
+{
+    if (context.ExistingConnection != null)
+    {
+        return context.DbContextOptions.UseOracle(context.ExistingConnection, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            oracleOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+    else
+    {
+        return context.DbContextOptions.UseOracle(context.ConnectionString, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            oracleOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+}
+```
+
+This matches the SQL Server / PostgreSQL pattern: `ExistingConnection` is honoured by default and `QuerySplittingBehavior.SplitQuery` is forced before the user callback runs.
+
+## Model-builder marker
+
+The Devart package ships `AbpOracleModelBuilderExtensions`:
+
+```csharp
+public static class AbpOracleModelBuilderExtensions
+{
+    public static void UseOracle(this ModelBuilder modelBuilder)
+    {
+        modelBuilder.SetDatabaseProvider(EfCoreDatabaseProvider.Oracle);
+    }
+}
+```
+
+`AbpDbContext.OnModelCreating` already auto-detects both providers from `Database.ProviderName`:
+
+```csharp
+case "Oracle.EntityFrameworkCore":
+case "Devart.Data.Oracle.Entity.EFCore":
+    return EfCoreDatabaseProvider.Oracle;
+```
+
+So calling `modelBuilder.UseOracle()` manually is only needed in design-time scenarios.
+
+## Connection-string checkers
+
+### Official provider
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class OracleConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        var connString = new OracleConnectionStringBuilder(connectionString) { ConnectionTimeout = 1 };
+
+        try
+        {
+            await using var conn = new OracleConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+This uses `Oracle.ManagedDataAccess.Client`. Unlike SQL Server/PostgreSQL/MySQL, Oracle has no admin-database probe step — successful authentication implies the schema exists.
+
+### Devart provider
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class OracleDevartConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        var connString = new OracleConnectionStringBuilder(connectionString) { ConnectionTimeout = 1 };
+
+        try
+        {
+            await using var conn = new OracleConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+The structure is identical; only the `OracleConnection` type differs (`Devart.Data.Oracle.OracleConnection` vs `Oracle.ManagedDataAccess.Client.OracleConnection`). Each provider package registers its own checker with `[Dependency(ReplaceServices = true)]`, so referencing the Devart package replaces the official one even if both are transitively present.
+
+## Version constraints
+
+| Package | Targets | Provider package version |
+| --- | --- | --- |
+| `Volo.Abp.EntityFrameworkCore.Oracle` | `net7.0` | `Oracle.EntityFrameworkCore` 7.21.8 |
+| `Volo.Abp.EntityFrameworkCore.Oracle.Devart` | `net7.0` | `Devart.Data.Oracle.EFCore` 10.1.134.7 |
+
+Oracle's own provider uses the version scheme `<major>.<oracle-data-provider-version>.<patch>` — `7.21.8` corresponds to EF Core 7.x + Oracle Data Provider 21.8. Devart releases monthly; the `10.1.134.7` build is the v7.4.0 baseline.
+
+## Registration pattern
+
+Pick one of the two packages:
+
+```csharp
+// Option A: official provider
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCoreOracleModule))]
+public class MyApplicationEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseOracle(oracle =>
+            {
+                oracle.MigrationsAssembly(typeof(MyApplicationEntityFrameworkCoreModule).Assembly.FullName);
+            });
+        });
+    }
+}
+```
+
+```csharp
+// Option B: Devart provider
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCoreOracleDevartModule))]
+public class MyApplicationEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseOracle(devart =>
+            {
+                devart.MigrationsAssembly(typeof(MyApplicationEntityFrameworkCoreModule).Assembly.FullName);
+            },
+            useExistingConnectionIfAvailable: false);
+        });
+    }
+}
+```
+
+## Differences and gotchas
+
+* **Pick one provider.** Both packages expose the same `UseOracle` extension method name but in different namespaces (`Volo.Abp.EntityFrameworkCore`). Referencing both produces ambiguous-overload errors and conflicting `OracleConnection` types.
+* **Object name length is 30 (12c) or 128 (12.2+).** Oracle 11g/12c R1 limit identifiers to 30 characters; later versions allow 128. EF migrations against legacy Oracle databases may produce truncation errors — set explicit `[Table("…")]`/`[Column("…")]` for any ABP entity whose default name exceeds 30 chars (rare with default templates).
+* **Case sensitivity.** Oracle stores identifiers in **uppercase** by default unless quoted. EF Core uses quoted identifiers, so `OrderDate` stays mixed case. If you query Oracle via SQL*Plus and the table appears to be missing, remember to quote: `SELECT * FROM "Orders"`.
+* **`NUMBER(p, s)` and decimals.** Oracle's `NUMBER` is variable precision. EF Core defaults `decimal` to `NUMBER(18, 2)` via the official provider. The Devart provider exposes more knobs — set explicit `HasPrecision(p, s)` to avoid silent truncation.
+* **`DATE` includes time-of-day.** Oracle's `DATE` is essentially `TIMESTAMP(0)`. `DateTime` properties map cleanly, but `DateTimeOffset` requires `TIMESTAMP WITH TIME ZONE`. ABP's `AbpDateTimeValueConverter` ensures UTC values are written.
+* **Sequence-backed `Id` columns.** Oracle 11g lacked `IDENTITY` columns; 12c added them. EF Core 7's Oracle provider uses `IDENTITY` by default. For pre-12c targets, declare a sequence and bind it via `HasSequence`. ABP's `Guid` IDs sidestep the issue entirely.
+* **`SplitQuery` is forced.** Oracle handles split queries well; override to `SingleQuery` only if you've measured a regression.
+* **Bulk operations.** Devart's provider ships native bulk extensions. The official Oracle provider does not. Combine either with a `Volo.Abp.Domain.Repositories.EntityFrameworkCore.IEfCoreBulkOperationProvider` implementation if you need `InsertManyAsync` to translate to `INSERT ALL` or `FORALL` blocks.
+* **Devart license.** The Devart package requires a runtime licence; CI environments without it produce trial-mode warnings. The official provider has no such restriction.
+* **Devart `ExistingConnection`.** Because the Devart connection type is incompatible with the official `OracleConnection`, the `useExistingConnectionIfAvailable` flag defaults to `false`. Only set it `true` when you are certain the test harness has provided a Devart connection.
+* **`UseOracleSQLCompatibility` for legacy targets.** Oracle.EntityFrameworkCore lets you target `"11"` for Oracle 11g grammar. Use this when migrating an existing 11g-only deployment; defaults assume 12c+.
+* **Schema vs database.** Oracle's "database" concept maps to a single instance; isolation happens via schemas (users). The connection-string checker only validates schema connectivity, not whether the schema owns the tables EF expects.

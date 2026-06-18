@@ -1,0 +1,408 @@
+---
+title: "Background Jobs · Hangfire adapter"
+sidebarTitle: "Jobs · Hangfire"
+description: "HangfireBackgroundJobManager, HangfireJobExecutionAdapter, AbpDashboardOptionsProvider, and the IsJobExecutionEnabled rewire that lets a Hangfire-backed ABP host enqueue without executing."
+---
+
+`Volo.Abp.BackgroundJobs.HangFire` is a thin adapter: it replaces
+`IBackgroundJobManager` with a Hangfire‑backed implementation and
+delegates execution to a generic adapter type that Hangfire treats as
+the *job class*. The default ABP in‑process polling worker is gone —
+Hangfire is now responsible for queueing, persistence, retries, and the
+dashboard. The base `Volo.Abp.HangFire` module wires up the Hangfire
+container itself; this module sits on top.
+
+<CardGroup cols={2}>
+  <Card title="Abstractions" icon="cube" href="/framework/background/background-jobs-abstractions">
+    The IBackgroundJobManager contract this adapter implements.
+  </Card>
+  <Card title="Hangfire base module" icon="fire" href="/framework/background/hangfire">
+    AbpHangfireModule, AbpHangfireOptions, the BackgroundJobServer factory.
+  </Card>
+  <Card title="Default engine" icon="gears" href="/framework/background/background-jobs">
+    What the Hangfire adapter replaces.
+  </Card>
+  <Card title="Workers · Hangfire" icon="repeat" href="/framework/background/background-workers-hangfire">
+    HangfireBackgroundWorkerManager — the sibling adapter for periodic workers.
+  </Card>
+</CardGroup>
+
+## File inventory
+
+Source path: `framework/src/Volo.Abp.BackgroundJobs.HangFire/`. Note
+the `HangFire` casing on the assembly — Hangfire itself spells the
+namespace `Hangfire`.
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/BackgroundJobs/Hangfire/AbpBackgroundJobsHangfireModule.cs` | Module — wires the adapter and the *enqueue‑only* rewire |
+| `Volo/Abp/BackgroundJobs/Hangfire/HangfireBackgroundJobManager.cs` | `IBackgroundJobManager` over `BackgroundJob.Enqueue / Schedule` |
+| `Volo/Abp/BackgroundJobs/Hangfire/HangfireJobExecutionAdapter.cs` | The `IJob`‑like wrapper Hangfire actually runs |
+| `Volo/Abp/BackgroundJobs/Hangfire/AbpDashboardOptionsProvider.cs` | Renames the wrapper class in the Hangfire dashboard |
+| `Microsoft/AspNetCore/Builder/AbpHangfireApplicationBuilderExtensions.cs` | `UseAbpHangfireDashboard()` middleware helper |
+
+## Module wire‑up
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.HangFire/Volo/Abp/BackgroundJobs/Hangfire/AbpBackgroundJobsHangfireModule.cs
+[DependsOn(
+    typeof(AbpBackgroundJobsAbstractionsModule),
+    typeof(AbpHangfireModule)
+)]
+public class AbpBackgroundJobsHangfireModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddTransient(serviceProvider =>
+            serviceProvider.GetRequiredService<AbpDashboardOptionsProvider>().Get());
+    }
+
+    public override void OnPreApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var options = context.ServiceProvider.GetRequiredService<IOptions<AbpBackgroundJobOptions>>().Value;
+        if (!options.IsJobExecutionEnabled)
+        {
+            var hangfireOptions = context.ServiceProvider.GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+            hangfireOptions.BackgroundJobServerFactory = CreateOnlyEnqueueJobServer;
+        }
+    }
+
+    private BackgroundJobServer? CreateOnlyEnqueueJobServer(IServiceProvider serviceProvider)
+    {
+        serviceProvider.GetRequiredService<JobStorage>();
+        return null;
+    }
+}
+```
+
+Two interesting details:
+
+1. **Implicit `DependsOn`.** Pulling
+   `AbpBackgroundJobsHangfireModule` pulls
+   [`AbpHangfireModule`](/framework/background/hangfire), which calls
+   `services.AddHangfire(…)`. Application code never needs the
+   `AddHangfire` line itself; it only configures storage via
+   `services.PreConfigure<IGlobalConfiguration>(cfg => cfg.UseXyzStorage(…))`.
+2. **Enqueue‑only mode.** When the abstractions module flips
+   `IsJobExecutionEnabled` off (the data‑migration host does this), the
+   `BackgroundJobServer` factory is replaced with one that resolves the
+   `JobStorage` (so connections are validated) and returns `null` —
+   Hangfire never spins up the server, so jobs persist but nothing
+   drains them. The `null` is consumed by `AbpHangfireBackgroundJobServer`,
+   which guards the shutdown path with a null check.
+
+The `AddTransient` line registers `Hangfire.Dashboard.DashboardOptions`
+in DI, fed by the provider documented below — so middleware that
+resolves it gets the ABP‑aware display name function.
+
+## `HangfireBackgroundJobManager`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.HangFire/Volo/Abp/BackgroundJobs/Hangfire/HangfireBackgroundJobManager.cs
+[Dependency(ReplaceServices = true)]
+public class HangfireBackgroundJobManager : IBackgroundJobManager, ITransientDependency
+{
+    protected AbpBackgroundJobOptions Options { get; }
+
+    public HangfireBackgroundJobManager(IOptions<AbpBackgroundJobOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public virtual Task<string> EnqueueAsync<TArgs>(TArgs args, BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+        TimeSpan? delay = null)
+    {
+        return Task.FromResult(delay.HasValue
+            ? BackgroundJob.Schedule<HangfireJobExecutionAdapter<TArgs>>(
+                adapter => adapter.ExecuteAsync(GetQueueName(typeof(TArgs)), args, default),
+                delay.Value
+            )
+            : BackgroundJob.Enqueue<HangfireJobExecutionAdapter<TArgs>>(
+                adapter => adapter.ExecuteAsync(GetQueueName(typeof(TArgs)), args, default)
+            ));
+    }
+
+    protected virtual string GetQueueName(Type argsType)
+    {
+        var queueName = EnqueuedState.DefaultQueue;
+        var queueAttribute = Options.GetJob(argsType).JobType.GetCustomAttribute<QueueAttribute>();
+        if (queueAttribute != null)
+        {
+            queueName = queueAttribute.Queue;
+        }
+
+        return queueName;
+    }
+}
+```
+
+Notable behaviours:
+
+| Aspect | Implementation |
+| --- | --- |
+| Returned id | The string id Hangfire assigns to the persisted job |
+| Storage | Whatever was wired by `services.PreConfigure<IGlobalConfiguration>(…)` |
+| Priority parameter | **Ignored.** Hangfire does not expose a priority enum on `BackgroundJob.Enqueue` |
+| Delay parameter | `BackgroundJob.Schedule(…, delay)` |
+| Queue | Read from `[Queue("…")]` on the **job class** (not the args class). Falls back to `EnqueuedState.DefaultQueue` = `"default"` |
+| Cancellation token | Passed as `default` at enqueue — Hangfire substitutes its own at execute time |
+
+The expression argument given to `BackgroundJob.Enqueue<T>` is just a
+method reference Hangfire serializes into its storage. When Hangfire
+re‑activates the adapter later it deserializes the args (using its own
+JSON converters) and invokes `ExecuteAsync(queue, args, ct)`.
+
+```csharp Example — labelling a job class with a queue
+[Queue("emails")]
+public class SendWelcomeJob : AsyncBackgroundJob<SendWelcomeArgs>, ITransientDependency
+{
+    public override Task ExecuteAsync(SendWelcomeArgs args) => /* … */;
+}
+```
+
+That `[Queue("emails")]` is honoured both by `GetQueueName` (so the
+adapter is enqueued to the `emails` queue) and by Hangfire itself via
+the `[Queue("{0}")]` attribute on `ExecuteAsync`:
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.HangFire/Volo/Abp/BackgroundJobs/Hangfire/HangfireJobExecutionAdapter.cs
+[Queue("{0}")]
+public async Task ExecuteAsync(string queue, TArgs args, CancellationToken cancellationToken = default)
+```
+
+`{0}` references the first method argument, so the queue Hangfire
+records is the same string `GetQueueName` returned at enqueue time.
+
+## `HangfireJobExecutionAdapter<TArgs>`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.HangFire/Volo/Abp/BackgroundJobs/Hangfire/HangfireJobExecutionAdapter.cs
+public class HangfireJobExecutionAdapter<TArgs>
+{
+    protected AbpBackgroundJobOptions Options { get; }
+    protected IServiceScopeFactory ServiceScopeFactory { get; }
+    protected IBackgroundJobExecuter JobExecuter { get; }
+
+    [Queue("{0}")]
+    public async Task ExecuteAsync(string queue, TArgs args, CancellationToken cancellationToken = default)
+    {
+        if (!Options.IsJobExecutionEnabled)
+        {
+            throw new AbpException(
+                "Background job execution is disabled. This method should not be called! " +
+                $"If you want to enable the background job execution, set {nameof(AbpBackgroundJobOptions)}.{nameof(AbpBackgroundJobOptions.IsJobExecutionEnabled)} to true!");
+        }
+
+        using (var scope = ServiceScopeFactory.CreateScope())
+        {
+            var jobType = Options.GetJob(typeof(TArgs)).JobType;
+            var context = new JobExecutionContext(scope.ServiceProvider, jobType, args!, cancellationToken: cancellationToken);
+            await JobExecuter.ExecuteAsync(context);
+        }
+    }
+}
+```
+
+The adapter is the bridge between Hangfire's world (one *class* per
+*method invocation*, instantiated by the `JobActivator`) and ABP's
+world (`IBackgroundJobExecuter` over a real DI scope):
+
+- Hangfire's `JobActivator` (configured by the base `AbpHangfireModule`)
+  resolves the adapter from the *root* container. The adapter does
+  **not** open the application scope itself — it creates its own via
+  `ServiceScopeFactory.CreateScope()`.
+- The defensive `IsJobExecutionEnabled` check is the safety net for the
+  rewire described above. If the factory was replaced to return `null`
+  the server never starts, so this branch shouldn't fire in practice —
+  but it does fire if you toggle the option *after* startup and the
+  Hangfire server was already running.
+- `JobExecutionContext` is the same DTO the default engine uses, so
+  `BackgroundJobExecuter` does its tenant switch, cancellation
+  propagation, and `IExceptionNotifier` dispatch identically here.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant Mgr as HangfireBackgroundJobManager
+    participant HF as Hangfire BackgroundJob.*
+    participant Storage as JobStorage
+    participant Server as BackgroundJobServer
+    participant Adapter as HangfireJobExecutionAdapter&lt;TArgs&gt;
+    participant Exec as BackgroundJobExecuter
+
+    App->>Mgr: EnqueueAsync(args, _, delay?)
+    Mgr->>Mgr: GetQueueName(typeof(TArgs))
+    alt delay null
+        Mgr->>HF: Enqueue&lt;Adapter&gt;(ExecuteAsync(queue, args, _))
+    else
+        Mgr->>HF: Schedule&lt;Adapter&gt;(ExecuteAsync(queue, args, _), delay)
+    end
+    HF->>Storage: serialize + persist
+    Note over Server: worker thread polls
+    Server->>Adapter: activate via JobActivator
+    Server->>Adapter: ExecuteAsync(queue, args, ct)
+    Adapter->>Adapter: CreateScope()
+    Adapter->>Exec: ExecuteAsync(JobExecutionContext)
+    Exec-->>Adapter: Task complete / throws
+    Adapter-->>Server: Task
+    alt throws BackgroundJobExecutionException
+        Server->>Storage: schedule retry (Hangfire's policy)
+    end
+```
+
+### Retry behaviour
+
+Retries are owned by **Hangfire**, not by the adapter — the executer's
+`BackgroundJobExecutionException` is rethrown out of `ExecuteAsync`
+and Hangfire's `AutomaticRetryAttribute` (default 10 attempts with
+geometric back‑off) decides whether to reschedule. To customise it,
+add the attribute to your job class or your args class:
+
+```csharp Example — fewer retries for a cheap job
+[AutomaticRetry(Attempts = 3, OnAttemptsExceeded = AttemptsExceededAction.Delete)]
+public class SendWelcomeJob : AsyncBackgroundJob<SendWelcomeArgs>, ITransientDependency
+{
+    public override Task ExecuteAsync(SendWelcomeArgs args) => /* … */;
+}
+```
+
+Hangfire reads filter attributes via its `JobFilterProviderCollection`,
+which the base `AbpHangfireModule` lets you customise through
+`services.PreConfigure<IGlobalConfiguration>(…)`.
+
+## `AbpDashboardOptionsProvider`
+
+The Hangfire dashboard would otherwise display every job as
+`HangfireJobExecutionAdapter`1[SendWelcomeArgs].ExecuteAsync(…)`. The
+provider rewrites the display name to the original ABP job name:
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.HangFire/Volo/Abp/BackgroundJobs/Hangfire/AbpDashboardOptionsProvider.cs
+public virtual DashboardOptions Get()
+{
+    return new DashboardOptions
+    {
+        DisplayNameFunc = (_, job) =>
+        {
+            var jobName = job.ToString();
+            if (job.Args.Count == 3 && job.Args.Last() is CancellationToken)
+            {
+                jobName = AbpBackgroundJobOptions.GetJob(job.Args[1].GetType()).JobName;
+            }
+
+            return jobName;
+        }
+    };
+}
+```
+
+The signature check (`Args.Count == 3`, last argument is a
+`CancellationToken`) is how the provider distinguishes
+`HangfireJobExecutionAdapter.ExecuteAsync(queue, args, ct)` from
+ordinary Hangfire enqueues. When it matches, `Args[1]` is the actual
+`TArgs` instance, and `AbpBackgroundJobOptions.GetJob(…).JobName` is
+the same name the abstractions module computed at boot.
+
+## `UseAbpHangfireDashboard`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.HangFire/Microsoft/AspNetCore/Builder/AbpHangfireApplicationBuilderExtensions.cs
+public static IApplicationBuilder UseAbpHangfireDashboard(
+    this IApplicationBuilder app,
+    string pathMatch = "/hangfire",
+    Action<DashboardOptions>? configure = null,
+    JobStorage? storage = null)
+{
+    var options = app.ApplicationServices.GetRequiredService<AbpDashboardOptionsProvider>().Get();
+    configure?.Invoke(options);
+    return app.UseHangfireDashboard(pathMatch, options, storage);
+}
+```
+
+This is the convenience that pairs with the provider: rather than
+calling `app.UseHangfireDashboard("/hangfire")` and losing the
+`DisplayNameFunc`, call:
+
+```csharp
+app.UseAbpHangfireDashboard("/hangfire", o =>
+{
+    o.Authorization = new[] { new AbpHangfireAuthorizationFilter(
+        requiredPermissionName: "HangfireDashboard.View") };
+});
+```
+
+The optional `configure` callback runs **after** the provider applies
+its display name override, so attributes like `Authorization`,
+`DisplayStorageConnectionString`, and `DashboardTitle` are still
+yours. The base `Volo.Abp.HangFire` module ships
+`AbpHangfireAuthorizationFilter` for the `Authorization` slot — see
+the [Hangfire base module page](/framework/background/hangfire).
+
+## Storage selection
+
+Storage is configured **before** module composition through the
+pre‑configure pipeline on `IGlobalConfiguration`:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.AddHangfire(config => { });
+    PreConfigure<IGlobalConfiguration>(config =>
+    {
+        config.UseSqlServerStorage(_configuration.GetConnectionString("Default"));
+    });
+}
+```
+
+Inside `AbpHangfireModule.ConfigureServices`:
+
+```csharp framework/src/Volo.Abp.HangFire/Volo/Abp/Hangfire/AbpHangfireModule.cs
+var preActions = context.Services.GetPreConfigureActions<IGlobalConfiguration>();
+context.Services.AddHangfire(configuration =>
+{
+    preActions.Configure(configuration);
+});
+```
+
+— every pre‑configure action runs against the `IGlobalConfiguration`
+instance `AddHangfire` exposes, so storage, JSON settings, filter
+providers, and serializer registrations all stack.
+
+## Options surface (recap)
+
+There is no `AbpBackgroundJobsHangfireOptions` — everything tunable is
+either on `AbpBackgroundJobOptions` or on `AbpHangfireOptions`.
+
+| Option | Lives on | Effect |
+| --- | --- | --- |
+| `IsJobExecutionEnabled` | `AbpBackgroundJobOptions` | When `false`, factory replaced with the *enqueue‑only* one above |
+| `Storage` | `AbpHangfireOptions` | Falls back to DI `JobStorage` |
+| `ServerOptions` | `AbpHangfireOptions` | Default `BackgroundJobServerOptions` if not set |
+| `AdditionalProcesses` | `AbpHangfireOptions` | Resolved from DI `IEnumerable<IBackgroundProcess>` if not set |
+| `BackgroundJobServerFactory` | `AbpHangfireOptions` | The factory invoked once at startup; *this* module rewires it for migration mode |
+
+## Gotchas
+
+- **The args object must round‑trip through Hangfire's serializer**, not
+  ABP's `IBackgroundJobSerializer`. Hangfire defaults to Newtonsoft
+  with `TypeNameHandling = None`. If your args have polymorphic
+  properties you must either change Hangfire's serializer settings
+  (`services.AddHangfire(c => c.UseSerializerSettings(…))` /
+  `GlobalConfiguration.Configuration.UseSerializerSettings(…)`) or
+  flatten the type.
+- **`BackgroundJobPriority` is silently ignored.** Hangfire's
+  scheduling order is FIFO within a queue. Use multiple queues plus
+  per‑queue worker counts (`BackgroundJobServerOptions.Queues`,
+  `WorkerCount`) to prioritise.
+- **`[BackgroundJobName("…")]` does *not* rename the Hangfire job.**
+  The Hangfire job class is *always*
+  `HangfireJobExecutionAdapter<TArgs>` — the original name only shows
+  up in the dashboard, via `AbpDashboardOptionsProvider`.
+- **`AbpDashboardOptionsProvider` triggers only when args count == 3.**
+  If you compose your own adapter type, write a custom
+  `DisplayNameFunc` or your jobs will display as the adapter type name.
+- **`OnPreApplicationInitialization` runs before any background server
+  starts.** That is why the `IsJobExecutionEnabled` rewire is
+  effective. Changing the flag *after* `OnApplicationInitialization`
+  has run will leave the Hangfire server up and the adapter's defensive
+  `throw` will fire.
+- **The default storage is in‑memory.** If you forget to call
+  `UseSqlServerStorage` / `UseRedisStorage` / etc., your jobs vanish
+  on process restart. The Hangfire `MemoryStorage` package is not even
+  referenced — `AbpHangfireModule` will fail to resolve `JobStorage`
+  at startup if no storage was configured.

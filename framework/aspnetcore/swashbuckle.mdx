@@ -1,0 +1,397 @@
+---
+title: "Volo.Abp.Swashbuckle: OpenAPI integration with ABP conventions"
+sidebarTitle: "Swashbuckle"
+description: "AddAbpSwaggerGen helpers, OAuth2/OIDC security setup, the AbpSwashbuckleDocumentFilter that hides framework endpoints, and the enum schema filter."
+---
+
+`Volo.Abp.Swashbuckle` is a thin layer on top of
+`Swashbuckle.AspNetCore.SwaggerGen`. It does three things: it teaches
+Swashbuckle about ABP's `IRemoteStreamContent` upload/download type,
+it bundles a one-liner that wires up OAuth2 (and another one for
+OIDC), and it provides two filters that you can opt into to hide
+framework controllers and to render enums as friendly names.
+
+<CardGroup cols={2}>
+  <Card title="AspNetCore Mvc" icon="route" href="/framework/aspnetcore/aspnetcore-mvc">
+    The MVC integration that produces the action descriptors Swashbuckle reads.
+  </Card>
+  <Card title="OpenIddict integration" icon="key" href="/framework/auth/openiddict">
+    The authority you typically point `AddAbpSwaggerGenWithOAuth` at.
+  </Card>
+</CardGroup>
+
+## File map
+
+```text framework/src/Volo.Abp.Swashbuckle
+Microsoft/AspNetCore/Builder/
+└── AbpSwaggerUIBuilderExtensions.cs
+Microsoft/Extensions/DependencyInjection/
+├── AbpSwaggerGenOptionsExtensions.cs
+└── AbpSwaggerGenServiceCollectionExtensions.cs
+Volo/Abp/Swashbuckle/
+├── AbpSwaggerOidcFlows.cs
+├── AbpSwashbuckleController.cs
+├── AbpSwashbuckleDocumentFilter.cs
+├── AbpSwashbuckleEnumSchemaFilter.cs
+├── AbpSwashbuckleModule.cs
+├── ISwaggerHtmlResolver.cs
+└── SwaggerHtmlResolver.cs
+```
+
+## The module
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Volo/Abp/Swashbuckle/AbpSwashbuckleModule.cs
+[DependsOn(
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpAspNetCoreMvcModule))]
+public class AbpSwashbuckleModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpSwashbuckleModule>();
+        });
+    }
+}
+```
+
+The single responsibility is to register the module's embedded
+resources into the virtual file system (the embedded
+`swagger-ui/index.html` ABP ships uses ABP's auth-aware bootstrap
+script). Everything else — the registrations Swashbuckle actually
+needs — is opt-in via the extension methods documented below.
+
+## Abstractions table
+
+| Type | Kind | Purpose |
+| ---- | ---- | ------- |
+| `AddAbpSwaggerGen` | extension | Wraps `AddSwaggerGen` with `MapType<IRemoteStreamContent>(...)`. |
+| `AddAbpSwaggerGenWithOAuth` | extension | One-liner OAuth2 setup pointed at an authorisation server. |
+| `AddAbpSwaggerGenWithOidc` | extension | One-liner OIDC setup (uses `.well-known/openid-configuration`). |
+| `HideAbpEndpoints` | extension on `SwaggerGenOptions` | Apply `AbpSwashbuckleDocumentFilter`. |
+| `UserFriendlyEnums` | extension on `SwaggerGenOptions` | Apply `AbpSwashbuckleEnumSchemaFilter`. |
+| `AbpSwashbuckleDocumentFilter` | `IDocumentFilter` | Drops every path under `Volo.*` controllers from the document. |
+| `AbpSwashbuckleEnumSchemaFilter` | `ISchemaFilter` | Renders enums as a string with the value names enumerated. |
+| `AbpSwaggerOidcFlows` | constants | `"authorization_code"`, `"implicit"`, `"password"`, `"client_credentials"`. |
+| `ISwaggerHtmlResolver` | abstraction | Source for the customised swagger-ui HTML. |
+| `AbpSwashbuckleController` | controller | Renders the ABP-flavoured swagger-ui page. |
+
+## `AddAbpSwaggerGen`
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Microsoft/Extensions/DependencyInjection/AbpSwaggerGenServiceCollectionExtensions.cs
+public static IServiceCollection AddAbpSwaggerGen(
+    this IServiceCollection services,
+    Action<SwaggerGenOptions>? setupAction = null)
+{
+    return services.AddSwaggerGen(
+        options =>
+        {
+            Func<OpenApiSchema> remoteStreamContentSchemaFactory = () => new OpenApiSchema()
+            {
+                Type = "string",
+                Format = "binary"
+            };
+
+            options.MapType<RemoteStreamContent>(remoteStreamContentSchemaFactory);
+            options.MapType<IRemoteStreamContent>(remoteStreamContentSchemaFactory);
+
+            setupAction?.Invoke(options);
+        });
+}
+```
+
+Calling `AddAbpSwaggerGen()` instead of `AddSwaggerGen()` guarantees
+that endpoints returning `IRemoteStreamContent` (the framework's
+"stream a file" type) are described as `type: string, format: binary`
+in the OpenAPI document — which is what Swagger UI needs to render a
+download button.
+
+## OAuth2 in one call
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Microsoft/Extensions/DependencyInjection/AbpSwaggerGenServiceCollectionExtensions.cs
+public static IServiceCollection AddAbpSwaggerGenWithOAuth(
+    this IServiceCollection services,
+    [NotNull] string authority,
+    [NotNull] Dictionary<string, string> scopes,
+    Action<SwaggerGenOptions>? setupAction = null,
+    string authorizationEndpoint = "/connect/authorize",
+    string tokenEndpoint = "/connect/token")
+{
+    var authorizationUrl = new Uri($"{authority.TrimEnd('/')}{authorizationEndpoint.EnsureStartsWith('/')}");
+    var tokenUrl = new Uri($"{authority.TrimEnd('/')}{tokenEndpoint.EnsureStartsWith('/')}");
+
+    return services
+        .AddAbpSwaggerGen()
+        .AddSwaggerGen(
+            options =>
+            {
+                options.AddSecurityDefinition("oauth2", new OpenApiSecurityScheme
+                {
+                    Type = SecuritySchemeType.OAuth2,
+                    Flows = new OpenApiOAuthFlows
+                    {
+                        AuthorizationCode = new OpenApiOAuthFlow
+                        {
+                            AuthorizationUrl = authorizationUrl,
+                            Scopes = scopes,
+                            TokenUrl = tokenUrl
+                        }
+                    }
+                });
+
+                options.AddSecurityRequirement(new OpenApiSecurityRequirement
+                {
+                    {
+                        new OpenApiSecurityScheme
+                        {
+                            Reference = new OpenApiReference
+                            {
+                                Type = ReferenceType.SecurityScheme,
+                                Id = "oauth2"
+                            }
+                        },
+                        Array.Empty<string>()
+                    }
+                });
+
+                setupAction?.Invoke(options);
+            });
+}
+```
+
+In practice you call it like this:
+
+```csharp
+services.AddAbpSwaggerGenWithOAuth(
+    authority: "https://identity.example.com",
+    scopes: new Dictionary<string, string>
+    {
+        ["MyApp"] = "MyApp API"
+    },
+    setupAction: options =>
+    {
+        options.SwaggerDoc("v1", new OpenApiInfo { Title = "MyApp", Version = "v1" });
+    });
+```
+
+Endpoints `/connect/authorize` and `/connect/token` match
+`OpenIddict`'s default routes — override them for custom authorisation
+servers. Authorisation Code flow is the only flow configured by this
+overload; if you need a different flow, use `AddAbpSwaggerGenWithOidc`
+or set the flows manually.
+
+## OIDC in one call
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Microsoft/Extensions/DependencyInjection/AbpSwaggerGenServiceCollectionExtensions.cs
+public static IServiceCollection AddAbpSwaggerGenWithOidc(
+    this IServiceCollection services,
+    [NotNull] string authority,
+    string[]? scopes = null,
+    string[]? flows = null,
+    string? discoveryEndpoint = null,
+    Action<SwaggerGenOptions>? setupAction = null)
+{
+    var discoveryUrl = discoveryEndpoint != null ?
+        new Uri($"{discoveryEndpoint.TrimEnd('/')}/.well-known/openid-configuration") :
+        new Uri($"{authority.TrimEnd('/')}/.well-known/openid-configuration");
+
+    flows ??= new [] { AbpSwaggerOidcFlows.AuthorizationCode };
+
+    services.Configure<SwaggerUIOptions>(swaggerUiOptions =>
+    {
+        swaggerUiOptions.ConfigObject.AdditionalItems["oidcSupportedFlows"] = flows;
+        swaggerUiOptions.ConfigObject.AdditionalItems["oidcSupportedScopes"] = scopes;
+        swaggerUiOptions.ConfigObject.AdditionalItems["oidcDiscoveryEndpoint"] = discoveryEndpoint;
+    });
+
+    return services
+        .AddAbpSwaggerGen()
+        .AddSwaggerGen(
+            options =>
+            {
+                options.AddSecurityDefinition("oidc", new OpenApiSecurityScheme
+                {
+                    Type = SecuritySchemeType.OpenIdConnect,
+                    OpenIdConnectUrl = discoveryUrl
+                });
+
+                options.AddSecurityRequirement(new OpenApiSecurityRequirement
+                {
+                    {
+                        new OpenApiSecurityScheme
+                        {
+                            Reference = new OpenApiReference
+                            {
+                                Type = ReferenceType.SecurityScheme,
+                                Id = "oidc"
+                            }
+                        },
+                        Array.Empty<string>()
+                    }
+                });
+                setupAction?.Invoke(options);
+            });
+}
+```
+
+The OIDC variant is generally what you want against an OpenIddict /
+Auth0 / Azure AD / Cognito / Keycloak authority — the discovery
+document points at the right endpoints, the JWKS, and the supported
+flows. The supported flow constants live in
+`AbpSwaggerOidcFlows`:
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Volo/Abp/Swashbuckle/AbpSwaggerOidcFlows.cs
+public static class AbpSwaggerOidcFlows
+{
+    public const string AuthorizationCode = "authorization_code";
+    public const string Implicit          = "implicit";
+    public const string Password          = "password";
+    public const string ClientCredentials = "client_credentials";
+}
+```
+
+## Filter list
+
+The package ships two opt-in filters surfaced through extension methods
+on `SwaggerGenOptions`:
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Microsoft/Extensions/DependencyInjection/AbpSwaggerGenOptionsExtensions.cs
+public static class AbpSwaggerGenOptionsExtensions
+{
+    public static void HideAbpEndpoints(this SwaggerGenOptions swaggerGenOptions)
+    {
+        swaggerGenOptions.DocumentFilter<AbpSwashbuckleDocumentFilter>();
+    }
+
+    public static void UserFriendlyEnums(this SwaggerGenOptions swaggerGenOptions)
+    {
+        swaggerGenOptions.SchemaFilter<AbpSwashbuckleEnumSchemaFilter>();
+    }
+}
+```
+
+### `AbpSwashbuckleDocumentFilter`
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Volo/Abp/Swashbuckle/AbpSwashbuckleDocumentFilter.cs
+public class AbpSwashbuckleDocumentFilter : IDocumentFilter
+{
+    protected virtual string[] ActionUrlPrefixes { get; set; } = new[] { "Volo." };
+
+    protected virtual string RegexConstraintPattern => @":regex\(([^()]*)\)";
+
+    public virtual void Apply(OpenApiDocument swaggerDoc, DocumentFilterContext context)
+    {
+        var actionUrls = context.ApiDescriptions
+            .Select(apiDescription => apiDescription.ActionDescriptor)
+            .Where(actionDescriptor => !string.IsNullOrEmpty(actionDescriptor.DisplayName) &&
+                                       ActionUrlPrefixes.Any(actionUrlPrefix => !actionDescriptor.DisplayName.Contains(actionUrlPrefix)))
+            .DistinctBy(actionDescriptor => actionDescriptor.AttributeRouteInfo?.Template)
+            .Select(RemoveRouteParameterConstraints)
+            .Where(actionUrl => !string.IsNullOrEmpty(actionUrl))
+            .ToList();
+
+        swaggerDoc
+            .Paths
+            .RemoveAll(path => !actionUrls.Contains(path.Key));
+    }
+
+    protected virtual string? RemoveRouteParameterConstraints(ActionDescriptor actionDescriptor)
+    {
+        var route = actionDescriptor.AttributeRouteInfo?.Template?.EnsureStartsWith('/').Replace("?", "");
+        if (string.IsNullOrWhiteSpace(route)) return route;
+
+        route = Regex.Replace(route, RegexConstraintPattern, "");
+
+        while (route.Contains(':'))
+        {
+            var startIndex = route.IndexOf(":", StringComparison.Ordinal);
+            var endIndex = route.IndexOf("}", startIndex);
+            if (endIndex == -1) break;
+            route = route.Remove(startIndex, (endIndex - startIndex));
+        }
+
+        return route;
+    }
+}
+```
+
+The filter does two related jobs:
+
+1. **Hide ABP's own controllers.** Any action whose
+   `DisplayName` (typically `Namespace.Type.Action (Assembly)`) contains
+   `"Volo."` is excluded — that drops the application-configuration,
+   permission, settings, etc. endpoints from your customer-facing
+   OpenAPI document.
+2. **Normalise route constraints.** Swashbuckle struggles with
+   `regex(...)` and type constraints (e.g. `{id:guid}`). The filter
+   strips them so the displayed paths are clean.
+
+To extend the hide list to other namespaces, subclass and replace the
+default `DocumentFilter<>` with your own.
+
+### `AbpSwashbuckleEnumSchemaFilter`
+
+```csharp framework/src/Volo.Abp.Swashbuckle/Volo/Abp/Swashbuckle/AbpSwashbuckleEnumSchemaFilter.cs
+public class AbpSwashbuckleEnumSchemaFilter : ISchemaFilter
+{
+    public void Apply(OpenApiSchema schema, SchemaFilterContext context)
+    {
+        if (context.Type.IsEnum)
+        {
+            schema.Enum.Clear();
+            schema.Type = nameof(String);
+            schema.Format = nameof(String);
+            Enum.GetNames(context.Type)
+                .ToList()
+                .ForEach(name => schema.Enum.Add(new OpenApiString($"{name}")));
+        }
+    }
+}
+```
+
+Default Swashbuckle behaviour is to render enums as `integer`. The ABP
+filter rewrites every enum schema as `string` with the names enumerated
+— matching what camelCase-aware JSON serialisers see when an enum is
+converted by `JsonStringEnumConverter`.
+
+## Putting it together
+
+```csharp
+services.AddAbpSwaggerGenWithOidc(
+    authority: configuration["AuthServer:Authority"],
+    scopes: new[] { "MyApp" },
+    flows: new[] { AbpSwaggerOidcFlows.AuthorizationCode },
+    discoveryEndpoint: configuration["AuthServer:MetaAddress"],
+    setupAction: options =>
+    {
+        options.SwaggerDoc("v1", new OpenApiInfo { Title = "MyApp", Version = "v1" });
+        options.HideAbpEndpoints();
+        options.UserFriendlyEnums();
+        options.EnableAnnotations();        // Swashbuckle.AspNetCore.Annotations
+    });
+```
+
+`EnableAnnotations()` is an upstream Swashbuckle helper — it lights up
+`[SwaggerOperation]`, `[SwaggerResponse]` etc on your actions and is
+generally on by default in ABP starter templates.
+
+## Filter / extension summary
+
+| Where used | Hook | Effect |
+| ---------- | ---- | ------ |
+| `AddAbpSwaggerGen` (always) | `MapType<IRemoteStreamContent>` | Renders file return types as `string/binary`. |
+| `AddAbpSwaggerGenWithOAuth` | `AddSecurityDefinition("oauth2", …)` | Authorisation Code flow against the given authority. |
+| `AddAbpSwaggerGenWithOidc` | `AddSecurityDefinition("oidc", …)` | OpenIdConnect via discovery URL. |
+| `HideAbpEndpoints` | `DocumentFilter<AbpSwashbuckleDocumentFilter>` | Drops framework controllers from the document. |
+| `UserFriendlyEnums` | `SchemaFilter<AbpSwashbuckleEnumSchemaFilter>` | Enums become strings. |
+
+## See also
+
+- [`AspNetCore.Mvc`](/framework/aspnetcore/aspnetcore-mvc) for how
+  `RemoteServiceAttribute` propagates to the API explorer group name.
+- [`Api Versioning`](/framework/aspnetcore/api-versioning) for the
+  `IRequestedApiVersion` consumed by per-version OpenAPI documents.
+- [Swashbuckle.AspNetCore docs](https://github.com/domaindrivendev/Swashbuckle.AspNetCore)
+  for the upstream extension points (`EnableAnnotations`, document
+  filters, operation filters).

@@ -1,0 +1,259 @@
+---
+title: "Volo.Abp.UI: UI-agnostic primitives shared by every ABP frontend"
+sidebarTitle: "Volo.Abp.UI"
+description: "Tour of Volo.Abp.UI — the branding provider, layout-hook registry, embedded localization resource, and module wiring that every ABP UI assembly (MVC, Blazor Server, Blazor WASM, MAUI) consumes."
+---
+
+`Volo.Abp.UI` is the smallest of the UI packages but the one every other UI assembly depends on. It defines **UI-agnostic primitives** — pieces of state that any front-end (Razor pages, Blazor components, MAUI views) needs but that have no idea whether the runtime is HTTP or in-process. The package ships:
+
+- The `IBrandingProvider` contract and a default implementation so layouts can render the application name and logo without hard-coding.
+- The `LayoutHooks` registry that lets any module inject a view component into a named "slot" (`Header.First`, `Body.Last`, …) of any layout.
+- The `AbpUiResource` embedded localization resource that aggregates all UI-side strings under the `"AbpUi"` resource name and inherits from the exception-handling resource (so every UI gets translated error messages for free).
+- The `AbpUiModule` itself, which depends on `AbpExceptionHandlingModule` and wires the localization + virtual file system.
+
+The package targets `netstandard2.0` plus `net7.0` — that is intentional so the same DLL can be loaded from a Blazor WebAssembly bundle as well as an ASP.NET Core host.
+
+## Package layout
+
+```text framework/src/Volo.Abp.UI/
+Localization/Resources/AbpUi/AbpUiResource.cs
+Volo/Abp/Ui/AbpUiModule.cs
+Volo/Abp/Ui/Branding/IBrandingProvider.cs
+Volo/Abp/Ui/Branding/DefaultBrandingProvider.cs
+Volo/Abp/Ui/LayoutHooks/AbpLayoutHookOptions.cs
+Volo/Abp/Ui/LayoutHooks/LayoutHookInfo.cs
+Volo/Abp/Ui/LayoutHooks/LayoutHookViewModel.cs
+Volo/Abp/Ui/LayoutHooks/LayoutHooks.cs
+```
+
+Two folders — `Branding` and `LayoutHooks` — are the public surface. The rest is module plumbing.
+
+## The module
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/AbpUiModule.cs
+[DependsOn(
+    typeof(AbpExceptionHandlingModule)
+)]
+public class AbpUiModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpUiModule>();
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Add<AbpUiResource>("en")
+                .AddBaseTypes(typeof(AbpExceptionHandlingResource))
+                .AddVirtualJson("/Localization/Resources/AbpUi");
+        });
+    }
+}
+```
+
+Three observations:
+
+| Concern | Mechanism |
+| --- | --- |
+| Module dependency | `AbpExceptionHandlingModule` (so the localization resource can inherit the exception messages) |
+| Embedded files | `AddEmbedded<AbpUiModule>()` exposes every `.json` under `/Localization/Resources/AbpUi/*.json` to the virtual file system |
+| Localization | `AbpUiResource` is registered with the **English** default culture, inherits `AbpExceptionHandlingResource`, and pulls translations from the virtual JSON folder |
+
+The module has no `IServiceCollection.Add*` calls. Branding, hook options and the resource are simply registered through the conventional/attribute scanner in [`Volo.Abp.Core`](/framework/core/volo-abp-core).
+
+## Branding
+
+`IBrandingProvider` is consumed by every layout to render the app name and two logo variants (light and dark backgrounds).
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/Branding/IBrandingProvider.cs
+public interface IBrandingProvider
+{
+    string AppName { get; }
+
+    /// <summary>Logo on white background</summary>
+    string? LogoUrl { get; }
+
+    /// <summary>Logo on dark background</summary>
+    string? LogoReverseUrl { get; }
+}
+```
+
+The default implementation is intentionally bland — solution templates always override it:
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/Branding/DefaultBrandingProvider.cs
+public class DefaultBrandingProvider : IBrandingProvider, ITransientDependency
+{
+    public virtual string AppName => "MyApplication";
+    public virtual string? LogoUrl => null;
+    public virtual string? LogoReverseUrl => null;
+}
+```
+
+Two things to notice:
+
+1. **All members are `virtual`** so a custom provider only overrides what it needs.
+2. **`ITransientDependency`** ensures it is auto-registered and replaced as soon as a derived class is found (because the conventional registrar exposes both `IBrandingProvider` and the concrete type).
+
+To replace it in an application module:
+
+```csharp
+public class MyBrandingProvider : DefaultBrandingProvider
+{
+    public override string AppName => "Acme Inc.";
+    public override string? LogoUrl => "/images/logo.svg";
+    public override string? LogoReverseUrl => "/images/logo-dark.svg";
+}
+```
+
+No `Configure<>` call is required; ABP's `Volo.Abp.DependencyInjection` will pick the most-derived `IBrandingProvider`.
+
+## Layout hooks
+
+A layout hook is a **named slot** in a layout that any module can fill with a view component (or a Blazor component). The MVC `LayoutHookViewComponent` (see [`mvc-ui`](/framework/ui-mvc/mvc-ui)) and the Blazor `AbpLayoutHooks` component both read this registry, so a hook registered once works across every UI.
+
+### Standard hook names
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/LayoutHooks/LayoutHooks.cs
+public static class LayoutHooks
+{
+    public static class Head
+    {
+        public const string First = "Header.First";
+        public const string Last = "Header.Last";
+    }
+
+    public static class Body
+    {
+        public const string First = "Body.First";
+        public const string Last = "Body.Last";
+    }
+
+    public static class PageContent
+    {
+        public const string First = "PageContent.First";
+        public const string Last = "PageContent.Last";
+    }
+}
+```
+
+| Constant | Where it renders |
+| --- | --- |
+| `LayoutHooks.Head.First` | Just after `<head>` opens — perfect for analytics snippets that must run before anything else. |
+| `LayoutHooks.Head.Last` | Just before `</head>` — for late-bound `<link>` / `<meta>` tags. |
+| `LayoutHooks.Body.First` | Just after `<body>` opens — for chat widgets, GDPR banners. |
+| `LayoutHooks.Body.Last` | Just before `</body>` — for tail scripts. |
+| `LayoutHooks.PageContent.First` / `.Last` | Wraps the page body — for "you are impersonating…" banners, etc. |
+
+### Registering a hook
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/LayoutHooks/AbpLayoutHookOptions.cs
+public class AbpLayoutHookOptions
+{
+    public IDictionary<string, List<LayoutHookInfo>> Hooks { get; }
+
+    public AbpLayoutHookOptions Add(string name, Type componentType, string? layout = null)
+    {
+        Hooks
+            .GetOrAdd(name, () => new List<LayoutHookInfo>())
+            .Add(new LayoutHookInfo(componentType, layout));
+
+        return this;
+    }
+}
+```
+
+`Add` is **additive** — many modules can register hooks against the same name. The optional `layout` parameter narrows the scope to a specific theme layout name (e.g. `"Application"` or `"Account"`); when `null` the hook fires in every layout.
+
+```csharp
+public class MyUiModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLayoutHookOptions>(options =>
+        {
+            options.Add(
+                LayoutHooks.Body.Last,
+                typeof(MyAnalyticsViewComponent)
+            );
+
+            options.Add(
+                LayoutHooks.Head.Last,
+                typeof(MyMetaTagViewComponent),
+                layout: StandardLayouts.Application
+            );
+        });
+    }
+}
+```
+
+The hook is stored as a `LayoutHookInfo`:
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/LayoutHooks/LayoutHookInfo.cs
+public class LayoutHookInfo
+{
+    /// <summary>Component type.</summary>
+    public Type ComponentType { get; }
+
+    /// <summary>
+    /// Specifies the layout name to apply this hook.
+    /// null indicates that this hook will be applied to all layouts.
+    /// </summary>
+    public string? Layout { get; }
+}
+```
+
+…and rendered through a small view model:
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/LayoutHooks/LayoutHookViewModel.cs
+public class LayoutHookViewModel
+{
+    public LayoutHookInfo[] Hooks { get; }
+    public string? Layout { get; }
+}
+```
+
+The MVC implementation in [`Volo.Abp.AspNetCore.Mvc.UI`](/framework/ui-mvc/mvc-ui) loops through the matching hooks and emits each component; the Blazor implementation does the same on the client side.
+
+## The `AbpUi` localization resource
+
+```csharp framework/src/Volo.Abp.UI/Localization/Resources/AbpUi/AbpUiResource.cs
+[LocalizationResourceName("AbpUi")]
+public class AbpUiResource
+{
+}
+```
+
+It is intentionally empty — the strings live in embedded JSON files under `Localization/Resources/AbpUi/*.json` (one file per culture). Because the module adds it as the base of every other UI resource, framework UIs (Account, Identity, Settings…) inherit its keys, which means any application can localize a common key — `"AbpUi:Save"`, `"AbpUi:Cancel"` — once and have every screen pick it up.
+
+```csharp framework/src/Volo.Abp.UI/Volo/Abp/Ui/AbpUiModule.cs
+Configure<AbpLocalizationOptions>(options =>
+{
+    options.Resources
+        .Add<AbpUiResource>("en")
+        .AddBaseTypes(typeof(AbpExceptionHandlingResource))
+        .AddVirtualJson("/Localization/Resources/AbpUi");
+});
+```
+
+That `.AddBaseTypes(typeof(AbpExceptionHandlingResource))` is the key — every translated `BusinessException` code flows through `AbpUi` consumers automatically.
+
+## How consumers wire in
+
+| Consumer | What it does with `Volo.Abp.UI` |
+| --- | --- |
+| [`Volo.Abp.UI.Navigation`](/framework/ui-mvc/ui-navigation) | Depends on `AbpUiModule` to inherit `AbpUiResource` for menu localization. |
+| [`Volo.Abp.AspNetCore.Mvc.UI`](/framework/ui-mvc/mvc-ui) | Hosts `LayoutHookViewComponent`, which reads `AbpLayoutHookOptions`. |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared` | Reads `IBrandingProvider` in `_Layout.cshtml` of every shared theme. |
+| `Volo.Abp.AspNetCore.Components.Web` | Consumes `IBrandingProvider` and `LayoutHooks` from Blazor components. |
+| Module solution templates | Always derive a custom `BrandingProvider` here. |
+
+## Cross-references
+
+- The exception-handling base type comes from [`Volo.Abp.ExceptionHandling`](/framework/core/exception-handling).
+- The embedded localization JSON is loaded through [`Volo.Abp.VirtualFileSystem`](/framework/core/virtual-file-system).
+- The MVC realisation of layout hooks lives in [`mvc-ui`](/framework/ui-mvc/mvc-ui) — see `LayoutHookViewComponent`.
+- The Blazor realisation is documented under the Blazor pages.
+- For menus, breadcrumbs and the toolbar that complement branding, jump to [`ui-navigation`](/framework/ui-mvc/ui-navigation) and [`mvc-ui-theme-shared`](/framework/ui-mvc/mvc-ui-theme-shared).

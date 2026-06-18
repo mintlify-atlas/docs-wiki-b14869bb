@@ -1,0 +1,240 @@
+---
+title: "Volo.Abp.EntityFrameworkCore.Sqlite — SQLite provider package"
+description: "AbpDbContextOptionsSqliteExtensions.UseSqlite wires Microsoft.EntityFrameworkCore.Sqlite into AbpDbContextOptions. Covers AbpSqliteModelBuilderExtensions, the existing-DbConnection overload used by in-memory tests, the SqliteConnectionStringChecker, and file-based vs in-memory deployment patterns."
+---
+
+`Volo.Abp.EntityFrameworkCore.Sqlite` is the smallest provider package in the family. SQLite has no GUID byte-order optimisations to set, no system database to probe and no `ServerVersion` to detect — the module body is empty. The package exists to centralise `UseSqlite` wiring, expose a `SqliteConnectionStringChecker` and ship the `AbpSqliteModelBuilderExtensions.UseSqlite(modelBuilder)` marker.
+
+SQLite is overwhelmingly used by ABP solutions in three scenarios: integration tests that swap the production provider for an in-memory `:memory:` database, demo applications that ship a portable `.db` file, and edge deployments where the application owns its data store.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/EntityFrameworkCore/Sqlite/AbpEntityFrameworkCoreSqliteModule.cs` | Empty module that `DependsOn(typeof(AbpEntityFrameworkCoreModule))`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsSqliteExtensions.cs` | `UseSqlite(...)` and `UseSqlite<TDbContext>(...)` on `AbpDbContextOptions`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextConfigurationContextSqliteExtensions.cs` | Inner `UseSqlite(...)` extensions. Includes an overload accepting a pre-built `DbConnection` for shared in-memory tests. |
+| `Volo/Abp/EntityFrameworkCore/ConnectionStrings/SqliteConnectionStringChecker.cs` | `[Dependency(ReplaceServices = true)]` checker — simply opens the connection. |
+| `Microsoft/EntityFrameworkCore/AbpSqliteModelBuilderExtensions.cs` | `modelBuilder.UseSqlite()` tags the model with `EfCoreDatabaseProvider.Sqlite`. |
+| `Volo.Abp.EntityFrameworkCore.Sqlite.csproj` | Targets `net7.0`; references `Microsoft.EntityFrameworkCore.Sqlite` via the shared `$(MicrosoftEntityFrameworkCorePackageVersion)` property (7.0.x). |
+
+## The module
+
+```csharp
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreSqliteModule : AbpModule
+{
+}
+```
+
+No `ConfigureServices` body — SQLite is content with the framework's default sequential-GUID strategy (`SequentialAsString`) because SQLite stores GUIDs as `TEXT` blobs by default and their lexicographic ordering already matches insertion order for ABP-generated values.
+
+## `AbpDbContextOptions.UseSqlite`
+
+```csharp
+public static class AbpDbContextOptionsSqliteExtensions
+{
+    public static void UseSqlite(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<SqliteDbContextOptionsBuilder> sqliteOptionsAction = null)
+        => options.Configure(context => context.UseSqlite(sqliteOptionsAction));
+
+    public static void UseSqlite<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<SqliteDbContextOptionsBuilder> sqliteOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+        => options.Configure<TDbContext>(context => context.UseSqlite(sqliteOptionsAction));
+}
+```
+
+The `Action<SqliteDbContextOptionsBuilder>` lets you set the few SQLite-specific knobs (mostly `MigrationsAssembly` and `CommandTimeout`).
+
+## `AbpDbContextConfigurationContext.UseSqlite`
+
+The inner extension has two overloads. The connection-string variant:
+
+```csharp
+public static DbContextOptionsBuilder UseSqlite(
+    [NotNull] this AbpDbContextConfigurationContext context,
+    [CanBeNull] Action<SqliteDbContextOptionsBuilder> sqliteOptionsAction = null)
+{
+    if (context.ExistingConnection != null)
+    {
+        return context.DbContextOptions.UseSqlite(context.ExistingConnection, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            sqliteOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+    else
+    {
+        return context.DbContextOptions.UseSqlite(context.ConnectionString, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            sqliteOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+}
+```
+
+The explicit-`DbConnection` variant:
+
+```csharp
+public static DbContextOptionsBuilder UseSqlite(
+    [NotNull] this AbpDbContextConfigurationContext context,
+    DbConnection connection,
+    [CanBeNull] Action<SqliteDbContextOptionsBuilder> sqliteOptionsAction = null)
+{
+    if (context.ExistingConnection != null)
+    {
+        return context.DbContextOptions.UseSqlite(context.ExistingConnection, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            sqliteOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+    else
+    {
+        return context.DbContextOptions.UseSqlite(connection, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            sqliteOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+}
+```
+
+The second overload exists for tests that want to control the `SqliteConnection` lifetime explicitly — the most common pattern is opening an in-memory connection (`new SqliteConnection("DataSource=:memory:")`) at fixture setup and keeping it open for the lifetime of the test class, then injecting it into every DbContext through this overload.
+
+As with the other providers, `QuerySplittingBehavior.SplitQuery` is forced first.
+
+## Model-builder marker
+
+```csharp
+public static class AbpSqliteModelBuilderExtensions
+{
+    public static void UseSqlite(this ModelBuilder modelBuilder)
+    {
+        modelBuilder.SetDatabaseProvider(EfCoreDatabaseProvider.Sqlite);
+    }
+}
+```
+
+`AbpDbContext.OnModelCreating` already auto-detects this from `Database.ProviderName == "Microsoft.EntityFrameworkCore.Sqlite"`.
+
+## SQLite connection-string checker
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class SqliteConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        try
+        {
+            await using var conn = new SqliteConnection(connectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+SQLite has no system database to probe against — opening the connection is sufficient. `Microsoft.Data.Sqlite` will create a missing file when `DataSource=path.db` points at a non-existent path *and* the connection mode is `ReadWriteCreate` (the default), so the checker returns `DatabaseExists = true` even on first-time runs. Lock down by passing `Mode=ReadOnly` if you want the checker to actually fail for missing files.
+
+## In-memory pattern (tests)
+
+A typical integration-test fixture spins up SQLite as the throwaway database:
+
+```csharp
+public class TestEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var connection = new SqliteConnection("DataSource=:memory:");
+        connection.Open(); // keep open for the lifetime of the fixture
+
+        context.Services.AddSingleton(connection); // optional, for assertions
+
+        context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.Configure<MyAppDbContext>(ctx =>
+            {
+                ctx.UseSqlite(connection); // the explicit-DbConnection overload
+            });
+        });
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        // Materialise schema once
+        using var scope = context.ServiceProvider.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MyAppDbContext>();
+        db.Database.EnsureCreated();
+    }
+}
+```
+
+Notes:
+
+* `DataSource=:memory:` creates a connection-scoped database. As long as the `SqliteConnection` is open, the data stays. Close it and everything is gone — perfect for parallel test fixtures that need isolation without filesystem cleanup.
+* `Database.EnsureCreated()` skips migrations and creates the schema from the model. ABP's `AbpDbContext.OnModelCreating` runs as usual, so soft-delete/multi-tenant filters and the `AbpDateTimeValueConverter` are wired even in-memory.
+* The `UseSqlite(connection)` overload defeats `AbpDbContextConfigurationContext.ConnectionString` resolution — useful when there is no real connection string to look up.
+
+## File-based pattern (demos, edge)
+
+For a file-based deployment, the connection string in `appsettings.json` looks like:
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "DataSource=app.db;Cache=Shared"
+  }
+}
+```
+
+And the module:
+
+```csharp
+Configure<AbpDbContextOptions>(options =>
+{
+    options.UseSqlite(sqlite =>
+    {
+        sqlite.MigrationsAssembly(typeof(MyApplicationEntityFrameworkCoreModule).Assembly.FullName);
+    });
+});
+```
+
+`Cache=Shared` lets multiple connections inside the same process see each other's writes — essential when ABP's UoW manager opens one DbContext per `IDbContextProvider.GetDbContextAsync` call (per connection-string key). Without `Cache=Shared`, tests with multiple DbContexts will return inconsistent results.
+
+## Version constraints
+
+```xml
+<TargetFramework>net7.0</TargetFramework>
+<PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="$(MicrosoftEntityFrameworkCorePackageVersion)" />
+```
+
+`Microsoft.Data.Sqlite` is pulled transitively. The bundled native SQLite library is `SQLitePCLRaw.bundle_e_sqlite3` 2.1.x.
+
+## Gotchas
+
+* **SQLite cannot enforce all foreign-key behaviours.** It supports `ON DELETE CASCADE`/`SET NULL` only when `PRAGMA foreign_keys = ON;` is issued per connection. Microsoft.Data.Sqlite issues this by default since EF Core 3.0; double-check if you use raw `IDbConnection` directly.
+* **`DateTime` precision is `TEXT`-encoded ISO-8601.** `AbpDateTimeValueConverter` (UTC by default) means the stored value is round-trippable, but range-queries with `WHERE Date > '2024-01-01'` compare strings — index them with `CREATE INDEX ... ON Orders(OrderDate)` for the optimiser to recognise the inequality.
+* **No `DECIMAL` precision.** SQLite stores numerics as `REAL` (double). For currency, use `[Column(TypeName = "TEXT")]` with manual conversion or `decimal? -> string` in your entity. Identity/Tenant/Setting modules don't store currencies, so this only matters for your own entities.
+* **Migrations may produce non-portable SQL.** `dotnet ef migrations add` against a SQLite provider emits SQLite-specific DDL: `ALTER TABLE … RENAME COLUMN` only works on SQLite 3.25+, and `DROP COLUMN` requires the "rebuild table" workaround on older versions. Don't share migrations between providers.
+* **Concurrency.** SQLite serialises writes at the database level. Under load, multiple ABP unit-of-work commits queue behind each other. Use `journal_mode=WAL` (set via connection string `Cache=Shared;Pooling=True;Journal Mode=WAL`) for concurrent readers.
+* **`DateTimeOffset` is stored as TEXT, not a native type.** Range comparisons work because EF Core stores ISO 8601 with offset, but timezone-aware queries are tricky. Stick to `DateTime` (UTC) inside ABP entities when possible.
+* **In-memory `:memory:` is single-connection.** Each open `SqliteConnection` with that DataSource gets its own database unless you use `DataSource=file::memory:?cache=shared&mode=memory` and reuse the same connection string. The `UseSqlite(connection)` overload sidesteps this by binding the DbContext to the exact `DbConnection` instance.
+* **`Database.AutoTransactionBehavior = AutoTransactionBehavior.Never`** is set when ABP's `AlwaysDisableTransactionsUnitOfWorkManager` is registered. This is required because SQLite cannot share transactions across DbContext instances and ABP's UoW manager would otherwise attempt to open nested transactions on the same connection.
+* **No connection-string checker network round-trip.** The SQLite checker is effectively a no-op — it only verifies that `SqliteConnection.OpenAsync()` succeeds. If your administrative UI uses the checker to validate user input, you may need additional file-existence checks for SQLite.
+* **`UseQuerySplittingBehavior(SplitQuery)` is forced.** SQLite handles split queries fine; override only if you have a specific reason.

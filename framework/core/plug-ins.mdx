@@ -1,0 +1,479 @@
+---
+title: "Plug-in modules: dynamic assembly loading in ABP"
+sidebarTitle: "Plug-Ins"
+description: "How PlugInSourceList, FolderPlugInSource, FilePlugInSource, and TypePlugInSource feed extra AbpModule types into the ModuleLoader at startup."
+---
+
+ABP's modularity story revolves around `[DependsOn]` chains rooted at a
+single startup module. That works when every module the application
+needs is referenced at compile time, but ABP also supports another
+shape: assemblies the host discovers at startup, loads through
+`AssemblyLoadContext`, scans for `AbpModule` types, and grafts onto the
+dependency graph. The umbrella name for that mechanism is **plug-in
+modules**.
+
+This page walks the four `IPlugInSource` implementations, the
+`PlugInSourceList` that hosts them, the extension methods you call from
+your startup, and the single line in `ModuleLoader` that joins plug-in
+discovered types into the rest of the module graph.
+
+<CardGroup cols={2}>
+  <Card title="AbpModule" icon="cubes" href="/framework/core/abp-module">
+    The same lifecycle plug-in modules participate in.
+  </Card>
+  <Card title="Modularity Internals" icon="diagram-project" href="/framework/core/modularity-internals">
+    Where plug-in sources sit in the load + sort pipeline.
+  </Card>
+</CardGroup>
+
+## File map
+
+Everything plug-in related lives in one folder:
+
+```
+framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/
+├── FilePlugInSource.cs
+├── FolderPlugInSource.cs
+├── IPlugInSource.cs
+├── PlugInSourceExtensions.cs
+├── PlugInSourceList.cs
+├── PlugInSourceListExtensions.cs
+└── TypePlugInSource.cs
+```
+
+A consumer never instantiates any of these types directly outside of
+their `AbpApplicationCreationOptions.PlugInSources` configuration; the
+list extensions in `PlugInSourceListExtensions` are the public surface.
+
+## `IPlugInSource`
+
+The contract is intentionally trivial: one method returns the
+`AbpModule` types this source contributes.
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/IPlugInSource.cs
+using System;
+using JetBrains.Annotations;
+
+namespace Volo.Abp.Modularity.PlugIns;
+
+public interface IPlugInSource
+{
+    [NotNull]
+    Type[] GetModules();
+}
+```
+
+Implementations decide how to find those types. ABP ships three
+strategies — file, folder, raw types — and any custom source you write
+plugs into the same pipeline.
+
+## `TypePlugInSource`
+
+The simplest implementation: you already have the `Type` objects.
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/TypePlugInSource.cs
+public class TypePlugInSource : IPlugInSource
+{
+    private readonly Type[] _moduleTypes;
+
+    public TypePlugInSource(params Type[]? moduleTypes)
+    {
+        _moduleTypes = moduleTypes ?? new Type[0];
+    }
+
+    [NotNull]
+    public Type[] GetModules() => _moduleTypes;
+}
+```
+
+Use it when:
+
+- A host references the plug-in module's assembly transitively, but you
+  want the kernel to treat it as a plug-in (so it lands in the descriptor
+  list with `IsLoadedAsPlugIn = true`).
+- Tests want to inject a synthetic module without touching the
+  filesystem.
+
+`PlugInSourceListExtensions.AddTypes` constructs the source for you.
+
+## `FilePlugInSource`
+
+Loads explicit DLL paths and scans them for `AbpModule` types.
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/FilePlugInSource.cs
+public class FilePlugInSource : IPlugInSource
+{
+    public string[] FilePaths { get; }
+
+    public FilePlugInSource(params string[]? filePaths)
+    {
+        FilePaths = filePaths ?? new string[0];
+    }
+
+    public Type[] GetModules()
+    {
+        var modules = new List<Type>();
+
+        foreach (var filePath in FilePaths)
+        {
+            var assembly = AssemblyLoadContext.Default.LoadFromAssemblyPath(filePath);
+
+            try
+            {
+                foreach (var type in assembly.GetTypes())
+                {
+                    if (AbpModule.IsAbpModule(type))
+                    {
+                        modules.AddIfNotContains(type);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new AbpException(
+                    "Could not get module types from assembly: " + assembly.FullName, ex);
+            }
+        }
+
+        return modules.ToArray();
+    }
+}
+```
+
+Key behaviour:
+
+- Uses **`AssemblyLoadContext.Default`** — plug-in DLLs share the host's
+  ALC. There is no isolation; types loaded by a plug-in can be unified
+  with already-referenced assemblies based on identity.
+- Wraps reflection failures (notably `ReflectionTypeLoadException`) in
+  `AbpException` so the source of the failure is named in the message.
+- Filters with `AbpModule.IsAbpModule` — only non-abstract,
+  non-generic, concrete classes that implement `IAbpModule` are
+  accepted.
+
+## `FolderPlugInSource`
+
+Scans a directory for assemblies, applies an optional filter, and
+returns every `AbpModule` type they contain.
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/FolderPlugInSource.cs
+public class FolderPlugInSource : IPlugInSource
+{
+    public string Folder { get; }
+    public SearchOption SearchOption { get; set; }
+    public Func<string, bool>? Filter { get; set; }
+
+    public FolderPlugInSource(
+        [NotNull] string folder,
+        SearchOption searchOption = SearchOption.TopDirectoryOnly)
+    {
+        Check.NotNull(folder, nameof(folder));
+        Folder = folder;
+        SearchOption = searchOption;
+    }
+
+    public Type[] GetModules()
+    {
+        var modules = new List<Type>();
+
+        foreach (var assembly in GetAssemblies())
+        {
+            try
+            {
+                foreach (var type in assembly.GetTypes())
+                {
+                    if (AbpModule.IsAbpModule(type))
+                    {
+                        modules.AddIfNotContains(type);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new AbpException(
+                    "Could not get module types from assembly: " + assembly.FullName, ex);
+            }
+        }
+
+        return modules.ToArray();
+    }
+
+    private List<Assembly> GetAssemblies()
+    {
+        var assemblyFiles = AssemblyHelper.GetAssemblyFiles(Folder, SearchOption);
+
+        if (Filter != null)
+        {
+            assemblyFiles = assemblyFiles.Where(Filter);
+        }
+
+        return assemblyFiles
+            .Select(AssemblyLoadContext.Default.LoadFromAssemblyPath)
+            .ToList();
+    }
+}
+```
+
+`AssemblyHelper.GetAssemblyFiles` returns every `.dll` and `.exe`
+under `Folder` honoring the supplied `SearchOption`
+(`TopDirectoryOnly` by default, or `AllDirectories` for recursive
+discovery).
+
+The optional `Filter` is convenient when a folder contains the host's
+own DLLs in addition to plug-ins; you can require `path =>
+Path.GetFileName(path).StartsWith("MyApp.PlugIn.")` to keep the loader
+from scanning unrelated files.
+
+## `PlugInSourceList`
+
+`PlugInSourceList` is a plain `List<IPlugInSource>` with one internal
+method that the loader uses:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/PlugInSourceList.cs
+public class PlugInSourceList : List<IPlugInSource>
+{
+    [NotNull]
+    internal Type[] GetAllModules(ILogger logger)
+    {
+        return this
+            .SelectMany(pluginSource => pluginSource.GetModulesWithAllDependencies(logger))
+            .Distinct()
+            .ToArray();
+    }
+}
+```
+
+The method visits every source, asks each one for its modules **plus
+the transitive `[DependsOn]` chain reachable from those modules**, and
+returns the unique union. That is what makes plug-in modules participate
+in the same topological sort as compile-time modules.
+
+The transitive walk happens in `PlugInSourceExtensions`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/PlugInSourceExtensions.cs
+public static class PlugInSourceExtensions
+{
+    [NotNull]
+    public static Type[] GetModulesWithAllDependencies(
+        [NotNull] this IPlugInSource plugInSource, ILogger logger)
+    {
+        Check.NotNull(plugInSource, nameof(plugInSource));
+
+        return plugInSource
+            .GetModules()
+            .SelectMany(type => AbpModuleHelper.FindAllModuleTypes(type, logger))
+            .Distinct()
+            .ToArray();
+    }
+}
+```
+
+`AbpModuleHelper.FindAllModuleTypes` recurses through every module's
+`DependsOnAttribute`s, logs the discovered tree at `LogLevel.Information`,
+and returns the flat list. The same helper is used for the startup
+module's compile-time graph, so plug-in modules can declare
+`[DependsOn(typeof(SomeFrameworkModule))]` and the kernel honors it.
+
+## `PlugInSourceListExtensions`
+
+Three extension methods are the public API ABP recommends:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/PlugInSourceListExtensions.cs
+public static class PlugInSourceListExtensions
+{
+    public static void AddFolder(
+        [NotNull] this PlugInSourceList list,
+        [NotNull] string folder,
+        SearchOption searchOption = SearchOption.TopDirectoryOnly)
+    {
+        Check.NotNull(list, nameof(list));
+        list.Add(new FolderPlugInSource(folder, searchOption));
+    }
+
+    public static void AddTypes(
+        [NotNull] this PlugInSourceList list,
+        params Type[] moduleTypes)
+    {
+        Check.NotNull(list, nameof(list));
+        list.Add(new TypePlugInSource(moduleTypes));
+    }
+
+    public static void AddFiles(
+        [NotNull] this PlugInSourceList list,
+        params string[] filePaths)
+    {
+        Check.NotNull(list, nameof(list));
+        list.Add(new FilePlugInSource(filePaths));
+    }
+}
+```
+
+Typical use looks like:
+
+```csharp
+var app = await AbpApplicationFactory.CreateAsync<MyAppHostModule>(options =>
+{
+    options.PlugInSources.AddFolder(
+        Path.Combine(AppContext.BaseDirectory, "plugins"));
+    options.PlugInSources.AddFiles("c:/ext/MyApp.PlugIn.Reporting.dll");
+    options.PlugInSources.AddTypes(typeof(MyExtraModule));
+});
+```
+
+You can mix any number of sources of any kind; `PlugInSourceList`
+deduplicates the resulting module types.
+
+## How `ModuleLoader` consumes the list
+
+`AbpApplicationBase.LoadModules` forwards
+`AbpApplicationCreationOptions.PlugInSources` straight into
+`IModuleLoader.LoadModules`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs
+protected virtual IReadOnlyList<IAbpModuleDescriptor> LoadModules(
+    IServiceCollection services,
+    AbpApplicationCreationOptions options)
+{
+    return services
+        .GetSingletonInstance<IModuleLoader>()
+        .LoadModules(
+            services,
+            StartupModuleType,
+            options.PlugInSources
+        );
+}
+```
+
+Inside `ModuleLoader`, plug-in types are concatenated after the
+compile-time graph:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+protected virtual void FillModules(
+    List<AbpModuleDescriptor> modules,
+    IServiceCollection services,
+    Type startupModuleType,
+    PlugInSourceList plugInSources)
+{
+    var logger = services.GetInitLogger<AbpApplicationBase>();
+
+    //All modules starting from the startup module
+    foreach (var moduleType in AbpModuleHelper.FindAllModuleTypes(startupModuleType, logger))
+    {
+        modules.Add(CreateModuleDescriptor(services, moduleType));
+    }
+
+    //Plugin modules
+    foreach (var moduleType in plugInSources.GetAllModules(logger))
+    {
+        if (modules.Any(m => m.Type == moduleType))
+        {
+            continue;
+        }
+
+        modules.Add(CreateModuleDescriptor(services, moduleType, isLoadedAsPlugIn: true));
+    }
+}
+```
+
+Three things happen in that loop:
+
+1. **Compile-time modules go in first** so they always sort earliest
+   when ties exist.
+2. **A plug-in type that already exists in the compile-time graph is
+   skipped.** No double-instantiation, no descriptor duplication.
+3. **Otherwise the type is added as a descriptor with `isLoadedAsPlugIn:
+   true`** — `IAbpModuleDescriptor.IsLoadedAsPlugIn` is a flag downstream
+   code can check (for example, to decide whether to expose the module
+   in administration UIs).
+
+After `FillModules`, the loader calls `SetDependencies` and
+`SortByDependency`, which treat compile-time and plug-in descriptors
+identically:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs
+protected virtual List<IAbpModuleDescriptor> SortByDependency(
+    List<IAbpModuleDescriptor> modules, Type startupModuleType)
+{
+    var sortedModules = modules.SortByDependencies(m => m.Dependencies);
+    sortedModules.MoveItem(m => m.Type == startupModuleType, modules.Count - 1);
+    return sortedModules;
+}
+```
+
+The startup module is forced to be **last** so its `ConfigureServices`
+runs after every dependency has already registered its bindings. A
+plug-in module without a compile-time path from the startup module is
+free to land anywhere in the graph, but the topological sort always
+respects its `[DependsOn]` declarations.
+
+## Side-by-side comparison of sources
+
+| Source | What it scans | Constructor | When to pick it |
+| ------ | ------------- | ----------- | --------------- |
+| `TypePlugInSource` | Explicit `Type[]` | `new(params Type[]? moduleTypes)` | The module type is already referenced; you want the kernel to flag it as a plug-in. |
+| `FilePlugInSource` | A list of DLL paths | `new(params string[]? filePaths)` | Known DLLs at fixed locations, e.g. tenant-specific extensions. |
+| `FolderPlugInSource` | Every assembly under a directory (optionally recursive) | `new(string folder, SearchOption = TopDirectoryOnly)` plus optional `Filter` | "Drop a DLL in `plugins/`" style discovery. |
+
+All three rely on `AbpModule.IsAbpModule` to filter found types. None
+of them isolate plug-ins into a dedicated `AssemblyLoadContext` — that
+is intentional, because the kernel needs the plug-in module's types to
+be unifiable with the host's compile-time types (otherwise
+`[DependsOn(typeof(AbpAuditingModule))]` would not match).
+
+## Diagnostics
+
+`AbpModuleHelper.FindAllModuleTypes` writes the discovered tree to the
+`IInitLogger<AbpApplicationBase>` while it walks. The log entries are
+buffered until `AbpApplicationBase.WriteInitLogs` replays them through
+the real `ILogger<AbpApplicationBase>`. The output looks like:
+
+```text
+Loaded ABP modules:
+- MyApp.MyAppHostModule
+  - Volo.Abp.AspNetCore.Mvc.AbpAspNetCoreMvcModule
+    - Volo.Abp.Modularity.AbpAspNetCoreModule
+      - ...
+- MyApp.PlugIn.Reporting.ReportingPlugInModule
+  - Volo.Abp.Caching.AbpCachingModule
+```
+
+Plug-in modules show up exactly once each — `Distinct()` in
+`PlugInSourceList.GetAllModules` removes duplicates contributed by
+multiple sources.
+
+## Caveats
+
+A few sharp edges are worth knowing about:
+
+- **`AssemblyLoadContext.Default` only.** Both `FilePlugInSource` and
+  `FolderPlugInSource` load into the default ALC. The kernel does not
+  support per-plug-in isolation; plug-in DLLs that bring conflicting
+  versions of a library will fail to bind at runtime exactly as they
+  would for a normal application.
+- **Type unification.** Because the host and plug-ins share an ALC, the
+  plug-in must depend on the same major version of the framework
+  modules it `[DependsOn]`. If the runtime resolves two copies of a
+  module type, the `Any(m => m.Type == moduleType)` check inside
+  `FillModules` would treat them as different modules.
+- **Reflection failures.** `assembly.GetTypes()` can throw
+  `ReflectionTypeLoadException` when a plug-in references an assembly
+  the host doesn't have. The catch in `FilePlugInSource` /
+  `FolderPlugInSource` converts that into an `AbpException` with the
+  offending assembly's full name, which makes troubleshooting easier.
+
+## Take-aways
+
+- A plug-in module is just an `AbpModule` discovered via
+  `IPlugInSource` instead of `[DependsOn]`. Once the loader knows
+  about it, every other ABP system treats it identically.
+- `PlugInSourceList` lives on `AbpApplicationCreationOptions`; the
+  list's `GetAllModules(logger)` is what `ModuleLoader.FillModules`
+  consumes after the compile-time graph.
+- The three built-in sources (`TypePlugInSource`,
+  `FilePlugInSource`, `FolderPlugInSource`) cover most needs; custom
+  sources need only implement `IPlugInSource.GetModules`.
+
+<Card title="Next: Dependency Injection conventions" icon="arrow-right" href="/framework/core/dependency-injection">
+  Lifetime markers, exposed services, and the lazy/cached providers
+  ABP ships.
+</Card>

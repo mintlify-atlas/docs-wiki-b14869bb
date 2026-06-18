@@ -1,0 +1,443 @@
+---
+title: "NuGet package metadata and packaging conventions"
+sidebarTitle: "NuGet Packaging"
+description: "common.props metadata, NuGet.Config feed, the nupkg/ pack folder, and the .abppkg.json / .abppkg.analyze.json content files that ship inside every Volo.Abp.* package."
+---
+
+Every NuGet package produced by `abpframework/abp` is shaped by three files at the repo root — `common.props`, `Directory.Build.props` and `NuGet.Config` — plus per-project `.abppkg.json` / `.abppkg.analyze.json` content files. Packing itself happens in `nupkg/`, driven by `nupkg/pack.ps1` and `nupkg/common.ps1`.
+
+This page documents what each piece contributes to the final `.nupkg`.
+
+## File map
+
+| File | Role |
+|------|------|
+| `common.props` | Shared MSBuild metadata — version, license, source link, README, abppkg content inclusion |
+| `Directory.Build.props` | Repo-wide dependency versions and the `IsTestProject` discriminator |
+| `configureawait.props` | Adds `ConfigureAwait.Fody` to all Release builds |
+| `NuGet.Config` | The single restore feed (nuget.org) |
+| `NuGet.md` | The package README shipped inside every `.nupkg` |
+| `nupkg/common.ps1` | The flat list of *projects* to pack and push |
+| `nupkg/pack.ps1` | Restores, runs `dotnet pack -c Release --no-build` on each project, collects `.nupkg` files |
+| `nupkg/push_packages.ps1` | Pushes each `.nupkg` to nuget.org with `--skip-duplicate` |
+| `*.abppkg.json` | Per-project role marker (`lib.framework`, etc.) — embedded as content |
+| `*.abppkg.analyze.json` | Static analysis index of the project's modules and contracts |
+| `tools/nuget/nuget.exe` | Bundled NuGet CLI for legacy scripts |
+
+## `common.props` — shared metadata
+
+`common.props` is `Import`ed by every shipping `.csproj`. The full contents (matching v7.4.0):
+
+```xml
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Version>7.4.0</Version>
+    <NoWarn>$(NoWarn);CS1591;CS0436</NoWarn>
+    <PackageIconUrl>https://abp.io/assets/abp_nupkg.png</PackageIconUrl>
+    <PackageProjectUrl>https://abp.io/</PackageProjectUrl>
+    <PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/abpframework/abp/</RepositoryUrl>
+    <PackageReadmeFile>NuGet.md</PackageReadmeFile>
+    <PackageTags>aspnetcore boilerplate framework web best-practices angular maui blazor mvc csharp webapp</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Include symbol files (*.pdb) in the built .nupkg -->
+    <AllowedOutputExtensionsInPackageBuildOutputFolder>$(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb</AllowedOutputExtensionsInPackageBuildOutputFolder>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\NuGet.md" Pack="true" PackagePath="\"/>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.1.1">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(UsingMicrosoftNETSdkWeb)' != 'true' AND '$(UsingMicrosoftNETSdkRazor)' != 'true'">
+    <None Remove="*.abppkg.analyze.json" />
+    <Content Include="*.abppkg.analyze.json">
+        <Pack>true</Pack>
+        <PackagePath>content\</PackagePath>
+    </Content>
+    <None Remove="*.abppkg.json" />
+    <Content Include="*.abppkg.json">
+        <Pack>true</Pack>
+        <PackagePath>content\</PackagePath>
+    </Content>
+  </ItemGroup>
+  <ItemGroup Condition="$(AssemblyName.EndsWith('HttpApi.Client'))">
+    <EmbeddedResource Include="**\*generate-proxy.json" />
+    <Content Remove="**\*generate-proxy.json" />
+  </ItemGroup>
+</Project>
+```
+
+### Property-by-property
+
+| Property | Value | Effect |
+|----------|-------|--------|
+| `LangVersion` | `latest` | Allows new C# features without per-project opt-in |
+| `Version` | `7.4.0` | Single source of truth for the framework version; read by `deploy/_run_all.ps1`, `publish-utils.js`, `nupkg/pack.ps1`, etc. |
+| `NoWarn` | `CS1591;CS0436` | Silences "missing XML doc comment" and "type conflicts with imported type" — both noisy across the modular codebase |
+| `PackageIconUrl` | `https://abp.io/assets/abp_nupkg.png` | Icon on nuget.org |
+| `PackageProjectUrl` | `https://abp.io/` | Project URL on nuget.org |
+| `PackageLicenseExpression` | `LGPL-3.0-only` | SPDX license identifier (the framework ships under LGPL-3.0) |
+| `RepositoryType` / `RepositoryUrl` | `git` / `https://github.com/abpframework/abp/` | Wired into source link |
+| `PackageReadmeFile` | `NuGet.md` | The README displayed on the package page |
+| `PackageTags` | `aspnetcore boilerplate framework web ...` | nuget.org search tags |
+| `GenerateDocumentationFile` | `true` | Forces every project to emit an `.xml` doc file, which is then bundled in the package |
+| `AllowedOutputExtensionsInPackageBuildOutputFolder` | adds `.pdb` | Symbols ship *inside* the main `.nupkg` (not as a separate `.snupkg`) so debuggers can resolve frames without symbol servers |
+
+### Item groups
+
+* **`NuGet.md` inclusion** — `<None Include="..\..\NuGet.md" Pack="true" PackagePath="\"/>` pulls the repo-root README into every package. The `..\..\` segment is correct because shipping projects live at `framework/src/<Name>/<Name>.csproj`.
+* **Source Link** — `Microsoft.SourceLink.GitHub` 1.1.1 with `PrivateAssets=all` means consumers do not transitively pick it up. Combined with `.pdb` inclusion, this makes step-into-source work in Visual Studio for users referencing the packages.
+* **`.abppkg.json` / `.abppkg.analyze.json` packing** — these files are embedded into `content\` of the `.nupkg`. The condition skips web / Razor projects, where MSBuild would otherwise double-include them via the Web SDK's content globs.
+* **`generate-proxy.json` embedding** — for projects whose assembly name ends in `HttpApi.Client`, the build switches `*generate-proxy.json` from a `Content` to an `EmbeddedResource`. This lets the ABP CLI's proxy generator read the proxy specification from the assembly at runtime instead of needing the loose JSON file.
+
+## `NuGet.Config`
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+    <packageSources>
+        <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    </packageSources>
+</configuration>
+```
+
+A deliberately minimal config. There is no `<clear/>` before the `<add/>`, so consumers using parent `NuGet.config` files inherit anything else they have configured. The framework itself only needs nuget.org during restore.
+
+## `Directory.Build.props` — repo-wide versions
+
+`Directory.Build.props` is auto-imported by MSBuild and pins the third-party dependency versions referenced from individual `.csproj` files via `$(...PackageVersion)`. The relevant excerpt for packaging:
+
+```xml
+<MicrosoftAspNetCorePackageVersion>7.0.10</MicrosoftAspNetCorePackageVersion>
+<MicrosoftEntityFrameworkCorePackageVersion>7.0.10</MicrosoftEntityFrameworkCorePackageVersion>
+<MicrosoftPackageVersion>7.0.0</MicrosoftPackageVersion>
+<MicrosoftNETTestSdkPackageVersion>17.2.0</MicrosoftNETTestSdkPackageVersion>
+<NSubstitutePackageVersion>4.3.0</NSubstitutePackageVersion>
+<ShouldlyPackageVersion>4.1.0</ShouldlyPackageVersion>
+<xUnitPackageVersion>2.4.1</xUnitPackageVersion>
+<OpenIddictPackageVersion>4.8.0</OpenIddictPackageVersion>
+```
+
+It also defines the `IsTestProject` discriminator used by `delete-bin-obj.ps1`, `coverlet.collector` injection and the test scripts:
+
+```xml
+<IsTestProject Condition="$(MSBuildProjectFullPath.Contains('test')) and ($(MSBuildProjectName.EndsWith('.Tests')) or $(MSBuildProjectName.EndsWith('.TestBase')))">true</IsTestProject>
+```
+
+And conditionally injects the coverage collector:
+
+```xml
+<PackageReference Condition="'$(IsTestProject)' == 'true'" Include="coverlet.collector" Version="3.1.2">
+    <PrivateAssets>all</PrivateAssets>
+    <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+</PackageReference>
+```
+
+Test projects never produce a NuGet package, but they share the same import tree, which is why `Volo.Abp.TestBase` and `Volo.Abp.AspNetCore.TestBase` — both of which *are* shipped — explicitly `<Import Project="..\..\..\common.props" />` to opt back into the package metadata.
+
+## `configureawait.props`
+
+```xml
+<Project>
+  <ItemGroup Condition="'$(Configuration)' == 'Release'">
+      <PackageReference Include="ConfigureAwait.Fody" Version="3.3.1" PrivateAssets="All" />
+      <PackageReference Include="Fody" Version="6.6.1">
+        <PrivateAssets>All</PrivateAssets>
+        <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+      </PackageReference>
+  </ItemGroup>
+</Project>
+```
+
+This is imported by every shipping project (look for `<Import Project="..\..\..\configureawait.props" />` in a `.csproj`). The `Condition="'$(Configuration)' == 'Release'"` means the IL-rewriting Fody addin only runs for release builds — Debug builds skip it so debugger stepping works as expected. The result is that every `await` in shipped ABP DLLs has an implicit `.ConfigureAwait(false)` injected at IL-time.
+
+## `nupkg/` — the pack folder
+
+```text
+nupkg/
+├── 0                              # UTF-16 placeholder; ignored
+├── common.ps1                     # Solution + project list, helper functions
+├── common.ps1.bak                 # Backup, do not edit
+├── pack.ps1                       # dotnet restore + dotnet pack loop
+├── push_packages.ps1              # dotnet nuget push loop
+├── push-nightly-packages-myget.ps1 # nightly variant (myget feed)
+└── unit_test.ps1                  # dotnet test loop for all solutions
+```
+
+### `nupkg/common.ps1`
+
+It exports `Write-Info`, `Write-Error`, `Seperator`, `Get-Current-Version`, `Get-Current-Branch`, `Read-File`, plus two flat lists used throughout the release pipeline:
+
+* `$solutions` — folder paths for `dotnet restore` (e.g. `framework`, `modules/account`, …).
+* `$projects` — the explicit list of *project folder paths*, in pack order. Every entry is a folder under `framework/src/`, `modules/<name>/src/` or `source-code/` containing a single `.csproj`.
+
+A small slice illustrates the convention:
+
+```powershell
+# List of projects
+$projects = (
+
+    # framework
+    "framework/src/Volo.Abp.ApiVersioning.Abstractions",
+    "framework/src/Volo.Abp.AspNetCore.Authentication.JwtBearer",
+    ...
+    "framework/src/Volo.Abp.Ddd.Domain",
+    "framework/src/Volo.Abp.Ddd.Domain.Shared",
+    ...
+    # modules/account
+    "modules/account/src/Volo.Abp.Account.Application.Contracts",
+    "modules/account/src/Volo.Abp.Account.Application",
+    "modules/account/src/Volo.Abp.Account.HttpApi.Client",
+    ...
+    "source-code/Volo.Abp.Account.SourceCode",
+    ...
+)
+```
+
+Helper functions worth noting:
+
+```powershell
+function Get-Current-Version {
+    $commonPropsFilePath = resolve-path "../common.props"
+    $commonPropsXmlCurrent = [xml](Get-Content $commonPropsFilePath )
+    $currentVersion = $commonPropsXmlCurrent.Project.PropertyGroup.Version.Trim()
+    return $currentVersion
+}
+
+function Get-Current-Branch {
+    return git branch --show-current
+}
+```
+
+`Get-Current-Version` is reused by `deploy/_run_all.ps1`, `deploy/8-download-release-zip.ps1` and the npm `publish-utils.js`. There is exactly one place the version is authored — `common.props` — and every other consumer reads it from there.
+
+### `nupkg/pack.ps1`
+
+```powershell
+. ".\common.ps1"
+# Delete existing nupkg files
+del *.nupkg
+
+# Rebuild all solutions
+foreach($solution in $solutions) {
+    $solutionFolder = Join-Path $rootFolder $solution
+    Set-Location $solutionFolder
+    dotnet restore
+}
+
+# Create all packages
+$i = 0
+$projectsCount = $projects.length
+Write-Info "Running dotnet pack on $projectsCount projects..."
+
+foreach($project in $projects) {
+    $i += 1
+    $projectFolder = Join-Path $rootFolder $project
+    $projectName = ($project -split '/')[-1]
+
+    # Create nuget pack
+    Write-Info "[$i / $projectsCount] - Packing project: $projectName"
+    Set-Location $projectFolder
+
+    #dotnet clean
+   dotnet pack -c Release --no-build -- /maxcpucount
+
+    if (-Not $?) {
+        Write-Error "Packaging failed for the project: $projectName"
+        exit $LASTEXITCODE
+    }
+
+    # Move nuget package
+    $projectName = $project.Substring($project.LastIndexOf("/") + 1)
+    $projectPackPath = Join-Path $projectFolder ("/bin/Release/" + $projectName + ".*.nupkg")
+    Move-Item -Force $projectPackPath $packFolder
+
+    Seperator
+}
+
+# Go back to the pack folder
+Set-Location $packFolder
+```
+
+Sequence:
+
+1. **Clean** — `del *.nupkg` removes any prior packages in `nupkg/`.
+2. **Restore** — `dotnet restore` per solution folder. This is needed because `dotnet pack --no-build` will not implicitly restore.
+3. **Pack** — `dotnet pack -c Release --no-build -- /maxcpucount` packs the *already-built* Release binaries (produced earlier by `build-all-release.ps1`).
+4. **Collect** — every `bin/Release/<ProjectName>.*.nupkg` is moved into `nupkg/`.
+5. **Reset** — `Set-Location $packFolder` so subsequent scripts find the packages.
+
+The `--no-build` is essential: it guarantees the bits being packed are byte-identical to what `build-all-release.ps1` produced, and it cuts the wall-time roughly in half.
+
+### `nupkg/push_packages.ps1`
+
+```powershell
+. ".\common.ps1"
+
+$apiKey = $args[0]
+
+# Get the version
+[xml]$commonPropsXml = Get-Content (Join-Path $rootFolder "common.props")
+$version = $commonPropsXml.Project.PropertyGroup.Version
+
+# Publish all packages
+$i = 0
+$errorCount = 0
+$totalProjectsCount = $projects.length
+$nugetUrl = "https://api.nuget.org/v3/index.json"
+Set-Location $packFolder
+
+foreach($project in $projects) {
+    $i += 1
+    $projectFolder = Join-Path $rootFolder $project
+    $projectName = ($project -split '/')[-1]
+    $nugetPackageName = $projectName + "." + $version + ".nupkg"
+    $nugetPackageExists = Test-Path $nugetPackageName -PathType leaf
+
+    Write-Info "[$i / $totalProjectsCount] - Pushing: $nugetPackageName"
+
+    if ($nugetPackageExists)
+    {
+        dotnet nuget push $nugetPackageName --skip-duplicate -s $nugetUrl --api-key "$apiKey"
+    }
+    else
+    {
+        Write-Host ("********** ERROR PACKAGE NOT FOUND: " + $nugetPackageName) -ForegroundColor red
+        $errorCount += 1
+    }
+
+    Write-Host "--------------------------------------------------------------`r`n"
+}
+
+if ($errorCount > 0)
+{
+    Write-Host ("******* $errorCount error(s) occured *******") -ForegroundColor red
+}
+```
+
+Key behaviours:
+
+* **`--skip-duplicate`** — re-running the release on the same version does not error; nuget.org silently rejects duplicate uploads.
+* **Per-project file check** — if `Test-Path` fails the script counts the error and keeps going. This is intentional: a missing pack should not abort the entire release because nuget.org is a fire-and-forget upload anyway.
+* The API key arrives as `$args[0]`, fed by `deploy/3-nuget-push.ps1` which reads `nuget-api-key.txt` or prompts.
+
+### `nupkg/push-nightly-packages-myget.ps1`
+
+A trimmed variant used for nightly previews:
+
+```powershell
+param(
+  [string]$source,
+  [string]$apikey
+)
+
+if (!$source) { $source = "https://nuget.org/" }
+if (!$apikey) { $apikey = "dummy" }
+
+dotnet nuget push '*.nupkg' -s $source --skip-duplicate --api-key $apikey
+```
+
+It does not iterate the project list — it glob-pushes everything in the current folder. Originally aimed at the MyGet nightly feed, kept for any custom feed.
+
+### `nupkg/unit_test.ps1`
+
+```powershell
+. ".\common.ps1"
+
+foreach($solution in $solutions) {
+    $solutionFolder = Join-Path $rootFolder $solution
+    Set-Location $solutionFolder
+    dotnet test --no-build --logger trx
+}
+```
+
+Unlike `build/test-all.ps1` this one emits TRX files (no coverage). It is the entry point used by the legacy CI runner; new builds prefer `build/test-all.ps1`.
+
+## `.abppkg.json` and `.abppkg.analyze.json`
+
+Every shipping project ships two small JSON files inside `content\` of its `.nupkg`. They are read by the ABP CLI for module classification and by Studio for static analysis.
+
+### `Volo.Abp.Ddd.Domain.abppkg.json`
+
+```json
+{
+  "role": "lib.framework"
+}
+```
+
+The role tells tooling whether the package is framework infrastructure, a module's domain layer, a UI theme, etc. Roles used across the repo include `lib.framework`, `lib.module`, `lib.module.web`, `lib.theme` and similar — the CLI's "list modules" and "switch UI" commands key off these.
+
+### `Volo.Abp.Ddd.Domain.abppkg.analyze.json`
+
+```json
+{
+  "name": "Volo.Abp.Ddd.Domain",
+  "hash": "",
+  "contents": [
+    {
+      "namespace": "Volo.Abp.Domain",
+      "dependsOnModules": [
+        { "declaringAssemblyName": "Volo.Abp.Auditing", "namespace": "Volo.Abp.Auditing", "name": "AbpAuditingModule" },
+        { "declaringAssemblyName": "Volo.Abp.Data",     "namespace": "Volo.Abp.Data",     "name": "AbpDataModule" },
+        { "declaringAssemblyName": "Volo.Abp.EventBus", "namespace": "Volo.Abp.EventBus", "name": "AbpEventBusModule" },
+        { "declaringAssemblyName": "Volo.Abp.Guids",    "namespace": "Volo.Abp.Guids",    "name": "AbpGuidsModule" },
+        { "declaringAssemblyName": "Volo.Abp.Timing",   "namespace": "Volo.Abp.Timing",   "name": "AbpTimingModule" },
+        { "declaringAssemblyName": "Volo.Abp.ObjectMapping", "namespace": "Volo.Abp.ObjectMapping", "name": "AbpObjectMappingModule" },
+        { "declaringAssemblyName": "Volo.Abp.ExceptionHandling", "namespace": "Volo.Abp.ExceptionHandling", "name": "AbpExceptionHandlingModule" },
+        { "declaringAssemblyName": "Volo.Abp.Specifications", "namespace": "Volo.Abp.Specifications", "name": "AbpSpecificationsModule" },
+        { "declaringAssemblyName": "Volo.Abp.Caching", "namespace": "Volo.Abp.Caching", "name": "AbpCachingModule" }
+      ],
+      "implementingInterfaces": [
+        { "name": "IAbpModule", "namespace": "Volo.Abp.Modularity", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.Modularity.IAbpModule" },
+        { "name": "IOnPreApplicationInitialization", "namespace": "Volo.Abp.Modularity", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.Modularity.IOnPreApplicationInitialization" },
+        { "name": "IOnApplicationInitialization", "namespace": "Volo.Abp", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.IOnApplicationInitialization" },
+        { "name": "IOnPostApplicationInitialization", "namespace": "Volo.Abp.Modularity", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.Modularity.IOnPostApplicationInitialization" },
+        { "name": "IOnApplicationShutdown", "namespace": "Volo.Abp", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.IOnApplicationShutdown" },
+        { "name": "IPreConfigureServices", "namespace": "Volo.Abp.Modularity", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.Modularity.IPreConfigureServices" },
+        { "name": "IPostConfigureServices", "namespace": "Volo.Abp.Modularity", "declaringAssemblyName": "Volo.Abp.Core", "fullName": "Volo.Abp.Modularity.IPostConfigureServices" }
+      ],
+      "contentType": "abpModule",
+      "name": "AbpDddDomainModule",
+      "summary": null
+    }
+  ]
+}
+```
+
+The `analyze.json` index is consumed by ABP Studio, the CLI's dependency graph view, and several documentation generators. It mirrors what the runtime reflection would see — `dependsOnModules` matches `[DependsOn(typeof(...))]`, `implementingInterfaces` lists the modularity lifecycle interfaces the module type implements. The `hash` field is left empty in the checked-in copy; build automation may populate it.
+
+These files are picked up by the `<Content Include="*.abppkg.json">` / `*.abppkg.analyze.json` glob in `common.props` and packed into `content\` of the produced `.nupkg`.
+
+## `tools/nuget/`
+
+```text
+tools/nuget/
+└── nuget.exe
+```
+
+A pinned copy of `nuget.exe` is kept here for any script or developer workflow that needs the classic CLI (the deploy pipeline does not — it uses `dotnet nuget push`). This is still useful for `nuget locals all -clear` operations, manual package signing, or pushing on machines without the .NET SDK in `PATH`.
+
+## End-to-end packaging flow
+
+```text
+build/build-all-release.ps1   (produces bin/Release/*.dll, *.pdb, *.xml)
+  └─► nupkg/pack.ps1
+        ├─ dotnet restore (per solution)
+        └─ dotnet pack -c Release --no-build (per project)
+              ├─ common.props metadata
+              ├─ configureawait.props IL rewrite
+              ├─ NuGet.md as README
+              ├─ *.abppkg.json + *.abppkg.analyze.json under content/
+              ├─ *.pdb under lib/<tfm>/
+              └─ XML doc files
+  └─► nupkg/*.nupkg
+        └─► nupkg/push_packages.ps1 → nuget.org
+```
+
+See [Build Scripts](/build/build-scripts) for the build stage and [Deploy Pipeline](/build/deploy-pipeline) for the full release sequence including npm publishing and the GitHub release.

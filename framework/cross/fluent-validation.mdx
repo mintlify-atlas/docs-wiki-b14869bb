@@ -1,0 +1,255 @@
+---
+title: "Volo.Abp.FluentValidation: FluentValidation plug-in for ABP"
+sidebarTitle: "FluentValidation"
+description: "How AbpFluentValidationModule registers IValidator<T> implementations by convention and slots FluentObjectValidationContributor into the validation pipeline next to data-annotations."
+---
+
+`Volo.Abp.FluentValidation` adds a second contributor to the [validation pipeline](/framework/cross/validation). After the data-annotation contributor finishes, `FluentObjectValidationContributor` resolves an `IValidator<TArg>` for the current parameter type — if one is registered — and folds its `ValidationFailure`s into the same `ObjectValidationContext.Errors` list. The module also ships a custom conventional registrar (`AbpFluentValidationConventionalRegistrar`) so users can drop `AbstractValidator<T>` subclasses anywhere in their assembly without manual `services.AddTransient<IValidator<T>, MyValidator>()` calls.
+
+Everything lives in `framework/src/Volo.Abp.FluentValidation/` — three files, ~80 lines combined.
+
+## File inventory
+
+| Path under `framework/src/Volo.Abp.FluentValidation/Volo/Abp/FluentValidation/` | Role |
+| --- | --- |
+| `AbpFluentValidationModule.cs` | Registers the conventional registrar in `PreConfigureServices`. Depends on `AbpValidationModule`. |
+| `AbpFluentValidationConventionalRegistrar.cs` | Picks up every type implementing `IValidator<T>` and exposes it as the service `IValidator<T>` with transient lifetime. |
+| `FluentObjectValidationContributor.cs` | The `IObjectValidationContributor` that runs the resolved validator and converts `ValidationFailure` → `ValidationResult`. |
+
+The package has a single NuGet dependency: `FluentValidation` (the standalone runtime — not `FluentValidation.AspNetCore`, since the integration point is the ABP validation contributor, not MVC's filter).
+
+## Key abstractions
+
+| Member | Signature | Purpose |
+| --- | --- | --- |
+| `AbpFluentValidationModule` | `[DependsOn(typeof(AbpValidationModule))]` | Hooks the registrar in `PreConfigureServices`. |
+| `AbpFluentValidationConventionalRegistrar` | extends `DefaultConventionalRegistrar` | Replaces ABP's default rules for types implementing `IValidator<T>`. |
+| `FluentObjectValidationContributor` | `IObjectValidationContributor, ITransientDependency` | Auto-discovered by `AbpValidationModule.AutoAddObjectValidationContributors`. |
+
+## How `IValidator<T>` instances are registered
+
+ABP's DI layer applies a chain of `IConventionalRegistrar`s during `ConfigureServices`. Each registrar walks the assemblies, examines every public class, and decides:
+
+1. Whether to *skip* the type (via `IsConventionalRegistrationDisabled`).
+2. Which service types it should be exposed as (`GetExposedServiceTypes`).
+3. Which lifetime to use (`GetDefaultLifeTimeOrNull`).
+
+`AbpFluentValidationConventionalRegistrar` overrides all three:
+
+```csharp
+public class AbpFluentValidationConventionalRegistrar : DefaultConventionalRegistrar
+{
+    protected override bool IsConventionalRegistrationDisabled(Type type)
+    {
+        return !type.GetInterfaces().Any(x => x.IsGenericType && x.GetGenericTypeDefinition() == typeof(IValidator<>))
+               || base.IsConventionalRegistrationDisabled(type);
+    }
+
+    protected override ServiceLifetime? GetDefaultLifeTimeOrNull(Type type)
+    {
+        return ServiceLifetime.Transient;
+    }
+
+    protected override List<Type> GetExposedServiceTypes(Type type)
+    {
+        return new List<Type>
+        {
+            typeof(IValidator<>).MakeGenericType(GetFirstGenericArgumentOrNull(type, 1)!)
+        };
+    }
+
+    private static Type? GetFirstGenericArgumentOrNull(Type type, int depth)
+    {
+        const int maxFindDepth = 8;
+        if (depth >= maxFindDepth) return null;
+        if (type.IsGenericType && type.GetGenericArguments().Length >= 1)
+            return type.GetGenericArguments()[0];
+        return GetFirstGenericArgumentOrNull(type.BaseType!, depth + 1);
+    }
+}
+```
+
+Three things worth noting:
+
+- **Discriminator** — only types that implement *some* `IValidator<T>` go through this registrar. Everything else falls through to the next registrar (typically ABP's default).
+- **Service type is `IValidator<T>`** — not the concrete validator class. So `_serviceProvider.GetService<IValidator<BookDto>>()` is the resolution shape, *not* `GetService<BookValidator>()`. This matters because `FluentObjectValidationContributor` resolves via the open-generic.
+- **Lifetime is always transient** — FluentValidation validators are designed to be cheap to construct and may capture DTO state via the validation context; transient is the safe default.
+
+`GetFirstGenericArgumentOrNull` exists because `AbstractValidator<T>` is itself generic; the registrar walks the base chain (up to depth 8) until it finds the first `IsGenericType` ancestor and extracts `T`. So:
+
+```csharp
+public class BookValidator : AbstractValidator<BookDto>       // T = BookDto
+public class CrudValidator<T> : AbstractValidator<T>          // open generic — skipped (no concrete T)
+public class CategoryValidator : CrudValidator<CategoryDto>   // T = CategoryDto (walks two bases)
+```
+
+Open-generic validators are not registered — `GetGenericArguments()` on `CrudValidator<>` returns the type parameter symbol, not a closed type, and the registrar's `MakeGenericType` would fail. Keep the closed subclass approach.
+
+`AbpFluentValidationModule.PreConfigureServices` plugs the registrar into ABP's service registration pipeline:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.AddConventionalRegistrar(new AbpFluentValidationConventionalRegistrar());
+}
+```
+
+This must run in `PreConfigureServices` because conventional registrars participate in the very service-registration sweep that follows. By the time `ConfigureServices` runs, the registration list is closed.
+
+## How the contributor plugs into validation
+
+`AbpValidationModule.PreConfigureServices` auto-adds every class implementing `IObjectValidationContributor` to `Options.ObjectValidationContributors` via `services.OnRegistered(...)` (see [Validation](/framework/cross/validation)). Because `FluentObjectValidationContributor` is `[Dependency... no, just ITransientDependency]`, it lands in the list automatically — no manual `Options.ObjectValidationContributors.Add<...>()`.
+
+### `FluentObjectValidationContributor` implementation
+
+```csharp
+public class FluentObjectValidationContributor : IObjectValidationContributor, ITransientDependency
+{
+    private readonly IServiceProvider _serviceProvider;
+
+    public FluentObjectValidationContributor(IServiceProvider serviceProvider)
+    {
+        _serviceProvider = serviceProvider;
+    }
+
+    public virtual async Task AddErrorsAsync(ObjectValidationContext context)
+    {
+        var serviceType = typeof(IValidator<>).MakeGenericType(context.ValidatingObject.GetType());
+        var validator   = _serviceProvider.GetService(serviceType) as IValidator;
+        if (validator == null) return;
+
+        var result = await validator.ValidateAsync((IValidationContext)Activator.CreateInstance(
+            typeof(ValidationContext<>).MakeGenericType(context.ValidatingObject.GetType()),
+            context.ValidatingObject)!);
+
+        if (!result.IsValid)
+        {
+            context.Errors.AddRange(
+                result.Errors.Select(error =>
+                    new ValidationResult(error.ErrorMessage, new[] { error.PropertyName })));
+        }
+    }
+}
+```
+
+Step by step:
+
+1. Construct the *closed* `IValidator<T>` service type using `context.ValidatingObject.GetType()` — the runtime type, not the declared parameter type. Subclassed DTOs flow through the correct validator.
+2. Resolve via `IServiceProvider.GetService` (not `GetRequiredService`) — *missing* validator is the no-op case, not an error.
+3. Construct a `FluentValidation.ValidationContext<T>` via reflection (since `T` is only known at runtime). The non-generic `IValidationContext` is the FluentValidation abstraction used by the runtime.
+4. Call `ValidateAsync` on the non-generic `IValidator` interface (which `AbstractValidator<T>` also implements via explicit interface implementation).
+5. Convert each `ValidationFailure` into a `System.ComponentModel.DataAnnotations.ValidationResult` with the property name as the single `MemberName`.
+
+The conversion is *lossy*: FluentValidation's severity (`Warning`, `Info`) is dropped, custom state is dropped, and the error code is dropped. The ABP exception-handling layer only consumes `ErrorMessage` + `MemberNames`, so for the standard 400 payload nothing important is lost.
+
+## Sequence
+
+```mermaid
+sequenceDiagram
+    participant App as ApplicationService
+    participant Int as ValidationInterceptor
+    participant MIV as MethodInvocationValidator
+    participant OV as ObjectValidator
+    participant DA as DataAnnotationContributor
+    participant FV as FluentObjectValidationContributor
+    participant Reg as IValidator&lt;BookDto&gt;
+    App->>Int: CreateAsync(bookDto)
+    Int->>MIV: ValidateAsync(ctx)
+    MIV->>OV: GetErrorsAsync(bookDto)
+    OV->>DA: AddErrorsAsync
+    DA-->>OV: [Required] etc.
+    OV->>FV: AddErrorsAsync
+    FV->>Reg: ServiceProvider.GetService(IValidator<BookDto>)
+    alt validator registered
+        FV->>Reg: ValidateAsync(ValidationContext<BookDto>)
+        Reg-->>FV: ValidationResult
+        FV->>FV: Convert failures to ValidationResult[]
+        FV-->>OV: Errors appended
+    else no validator
+        FV-->>OV: no-op
+    end
+    OV-->>MIV: combined errors
+    MIV->>MIV: throw AbpValidationException if any
+```
+
+## Writing a validator
+
+```csharp
+public class BookCreateDto
+{
+    public string Name { get; set; } = "";
+    public DateTime PublishDate { get; set; }
+    public decimal Price { get; set; }
+}
+
+public class BookCreateDtoValidator : AbstractValidator<BookCreateDto>
+{
+    public BookCreateDtoValidator()
+    {
+        RuleFor(x => x.Name).NotEmpty().MaximumLength(BookConsts.MaxNameLength);
+        RuleFor(x => x.PublishDate).GreaterThan(DateTime.UtcNow.AddYears(-200));
+        RuleFor(x => x.Price).GreaterThanOrEqualTo(0);
+    }
+}
+```
+
+No registration code is needed. As soon as the assembly hosting `BookCreateDtoValidator` is in the module graph, the conventional registrar registers `IValidator<BookCreateDto>` and `FluentObjectValidationContributor` picks it up on the next call to a `*AppService` method that accepts a `BookCreateDto`.
+
+### Composing with data annotations
+
+The two contributors compose additively. A common pattern is to keep simple "is this present?" checks as annotations and complex cross-field rules in FluentValidation:
+
+```csharp
+public class BookCreateDto
+{
+    [Required] public string Name { get; set; } = "";
+    public DateTime StartDate { get; set; }
+    public DateTime EndDate { get; set; }
+}
+
+public class BookCreateDtoValidator : AbstractValidator<BookCreateDto>
+{
+    public BookCreateDtoValidator()
+    {
+        // Don't repeat the [Required] — it'll already have been reported.
+        RuleFor(x => x.EndDate).GreaterThan(x => x.StartDate)
+            .When(x => x.StartDate != default && x.EndDate != default);
+    }
+}
+```
+
+If `Name == ""`, both contributors will emit an error for `Name` — there's no de-duplication. The conversion happens in append order, and `RemoteServiceValidationErrorInfo[]` is returned to the client as-is.
+
+## Recursion behavior
+
+`FluentObjectValidationContributor` is called per validating object. `ObjectValidator.GetErrorsAsync` is called once per *method parameter* — recursion into property objects is done only by the data-annotation contributor's `ValidateObjectRecursively`, not by FluentValidation. To validate nested objects with FluentValidation, use `SetValidator`:
+
+```csharp
+public class OrderDtoValidator : AbstractValidator<OrderDto>
+{
+    public OrderDtoValidator()
+    {
+        RuleFor(x => x.Customer).SetValidator(new CustomerDtoValidator());
+        RuleForEach(x => x.Lines).SetValidator(new OrderLineDtoValidator());
+    }
+}
+```
+
+This means a `CustomerDtoValidator` registered as `IValidator<CustomerDto>` is **not** automatically applied to a `Customer` property hanging off `OrderDto`. The ABP pipeline only validates the top-level argument; nested FluentValidation must be wired with `SetValidator`. (Data annotations *do* recurse — that asymmetry is intentional.)
+
+## Async rules
+
+`ValidateAsync` is invoked, so async rules (`MustAsync`, async preconditions) work as expected. The contributor is `await`-friendly all the way to the contributor manager in `ObjectValidator`.
+
+## Gotchas
+
+- **Open generics are not registered.** `class CrudValidator<T> : AbstractValidator<T>` is skipped — only closed subclasses survive `MakeGenericType`. Always derive a concrete validator per DTO.
+- **Validators are resolved by *runtime* type.** A polymorphic parameter typed as `BaseDto` with a runtime `BookDto` resolves `IValidator<BookDto>`, not `IValidator<BaseDto>`. If you want base-validation behavior, expose the base validator and call it from the derived class's validator via `SetValidator(this).BaseValidator()`-style composition.
+- **No nested object recursion.** Only the top-level argument is checked. Use `SetValidator` and `RuleForEach` explicitly.
+- **Missing validator = silent skip.** `GetService` returns `null` for an unregistered type and the contributor moves on. There's no startup-time check that "every DTO has a validator" — make that a CI test if you need it.
+- **Severity dropped.** FluentValidation `Warning` and `Info` failures become regular `ValidationResult`s — the client cannot distinguish them. If severity matters, emit a custom `IObjectValidationContributor` that preserves it via `ValidationResult.Properties`.
+- **Custom error codes dropped.** Only `ErrorMessage` and `PropertyName` flow into the ABP error. Stash any extra info in the message itself.
+- **Conventional registrar runs in `PreConfigureServices`.** Adding a custom validator from a module that runs *after* registration is a no-op. Define validators in the same assembly as the DTO (or any earlier module).
+- **`AbpFluentValidationModule` does not depend on AspNetCore.** The classic FluentValidation MVC filter is not registered. If you want both — ABP's interceptor for app services *and* MVC's filter for controllers — also reference `FluentValidation.AspNetCore` and call `AddFluentValidation(...)` in MVC bootstrap. Duplicate errors may appear; prefer ABP-only for app services.
+- **`IServiceProvider.GetService` is captured at construction.** The contributor is transient, so a fresh scope is used per parameter — but if your validator depends on scoped services (e.g. a `DbContext`), those scoped services live for the duration of one contributor call, not the whole request. Aggregate or load data eagerly inside the rule body.
+- **Returned `ValidationResult.MemberNames` is exactly one entry.** If a `RuleFor` emits multi-field errors, you need a custom `IObjectValidationContributor` (or hand-construct the `ValidationResult` inside the rule via FluentValidation's `WithMessage`/state hooks).

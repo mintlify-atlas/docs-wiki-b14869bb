@@ -1,0 +1,622 @@
+---
+title: "NPM publishing pipeline for ABP packs and ng-packs"
+sidebarTitle: "NPM Publish"
+description: "Lerna + Nx workspaces under npm/, the publish-mvc.ps1 / publish-ng.ps1 / preview-publish.ps1 scripts, helper Node utilities (replace-with-tilde, update-gulp, publish-utils, package-update-script), and the verdaccio-containers test harness."
+---
+
+The `npm/` folder ships two parallel package sets:
+
+* **`npm/packs/`** — vanilla JavaScript / CSS distributions of `@abp/*` libraries consumed by the MVC and Razor Pages UI. Managed by a flat Lerna workspace.
+* **`npm/ng-packs/`** — the Angular ecosystem (`@abp/ng.core`, `@abp/ng.identity`, schematics, etc.). Managed by Nx with a separate Lerna config for the publish step.
+
+Three PowerShell entry points and a handful of Node helpers drive everything.
+
+## Folder map
+
+```text
+npm/
+├── lerna.json                     # MVC packs Lerna workspace
+├── package.json                   # Top-level Node deps + helper scripts
+├── packs/                         # ~50 published @abp/* packages
+├── publish-mvc.ps1                # Publish flow for packs/
+├── publish-ng.ps1                 # Publish flow for ng-packs/
+├── preview-publish.ps1            # Convenience: publish-mvc + publish-ng to a custom registry
+├── replace-with-tilde.js          # Pin @abp/* deps with ~
+├── update-gulp.js                 # Refresh wwwroot/libs across the repo
+├── package-update-script.js       # ncu-driven version bumps
+├── publish-utils.js               # Read <Version> from ../common.props
+├── scripts/                       # validate-versions + remove-lock-files
+├── ng-packs/                      # Nx workspace for Angular packages
+│   ├── nx.json
+│   ├── lerna.version.json         # `packages/*` for version bumps
+│   ├── lerna.publish.json         # `dist/packages/*` for publishing built output
+│   ├── package.json
+│   └── scripts/                   # build, publish, replace-with-tilde, etc.
+└── verdaccio-containers/          # Docker-Compose end-to-end test harness
+```
+
+## Lerna and version anchors
+
+### `npm/lerna.json`
+
+```json
+{
+  "version": "7.4.0",
+  "packages": [
+    "packs/*"
+  ],
+  "npmClient": "yarn",
+  "lerna": "3.18.4"
+}
+```
+
+This is the Lerna workspace for the MVC side. It targets every directory under `packs/` and uses yarn as the npm client.
+
+### `npm/package.json`
+
+```json
+{
+  "version": "2.3.0",
+  "scripts": {
+    "lerna": "lerna",
+    "ncu": "ncu",
+    "update-gulp": "node update-gulp.js",
+    "replace-with-tilde": "node replace-with-tilde.js",
+    "update": "node package-update-script.js"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^8.0.1",
+    "glob": "^7.1.5",
+    "lerna": "^3.18.4",
+    "npm-check-updates": "^11.3.0"
+  },
+  "dependencies": {
+    "commander": "^6.0.0",
+    "execa": "^3.4.0",
+    "fast-glob": "^3.2.7",
+    "fs-extra": "^8.1.0",
+    "semver": "^7.3.5"
+  }
+}
+```
+
+The `version` field is the local helpers' version (`2.3.0`), not the framework version. The framework version is always read out of `../common.props` via `publish-utils.js`.
+
+### `npm/ng-packs/lerna.version.json` and `lerna.publish.json`
+
+```json
+// lerna.version.json — used by `nx generate @abp/nx.generators:update-version`
+{
+  "version": "7.2.3",
+  "packages": ["packages/*"],
+  "npmClient": "yarn"
+}
+```
+
+```json
+// lerna.publish.json — used by ng-packs/scripts/publish.ts
+{
+  "version": "1.0.0",
+  "packages": ["dist/packages/*"],
+  "npmClient": "yarn"
+}
+```
+
+Two configs are needed because the Angular side splits *source* (`packages/*`) from *built output* (`dist/packages/*`). Versions are bumped in source, packages are built into `dist/`, and Lerna publishes from there.
+
+## `npm/publish-mvc.ps1`
+
+```powershell
+param(
+  [string]$Version,
+  [string]$Registry
+)
+
+yarn install
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+$RootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+if (-Not $Version) {
+  $Version = $NextVersion;
+}
+
+if (-Not $Registry) {
+  $Registry = "https://registry.npmjs.org";
+}
+
+$PacksPublishCommand = "npm run lerna -- exec 'npm publish --registry $Registry'"
+
+$IsPrerelease = $(node publish-utils.js --prerelease --customVersion $Version) -eq "true";
+
+if ($IsPrerelease) {
+  $PacksPublishCommand = $PacksPublishCommand.Substring(0, $PacksPublishCommand.Length - 1) + " --tag next'"
+}
+
+$commands = (
+  "npm run lerna -- version $Version --yes --no-commit-hooks --skip-git --force-publish",
+  "yarn replace-with-tilde",
+  "cd scripts",
+  "yarn install",
+  "yarn validate-versions --compareVersion $Version --path ../packs",
+  "cd ..",
+  $PacksPublishCommand
+)
+
+foreach ($command in $commands) {
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-Host $command
+  Invoke-Expression $command
+  if ($LASTEXITCODE -ne '0' -And $command -notlike '*cd *') {
+    Write-Host ("Process failed! " + $command)
+    Set-Location $RootFolder
+    exit $LASTEXITCODE
+  }
+  $timer.Stop()
+  $total = $timer.Elapsed
+  Write-Output "-------------------------"
+  Write-Output "$command command took $total (Hours:Minutes:Seconds.Milliseconds)"
+  Write-Output "-------------------------"
+}
+```
+
+Step-by-step:
+
+1. **`yarn install`** at `npm/` resolves the helpers' deps.
+2. **`node publish-utils.js --nextVersion`** parses `<Version>` out of `../common.props` to get the framework version (default when `-Version` is not passed).
+3. **Prerelease detection** — `publish-utils.js --prerelease --customVersion $Version` returns `"true"` if the semver parses with a prerelease tag (e.g. `7.4.0-rc.1`). In that case the publish command is mutated to append `--tag next`, so installers using `@abp/core@latest` are not auto-pushed to the prerelease.
+4. **`lerna version`** — `--yes --no-commit-hooks --skip-git --force-publish` bumps every `packs/*/package.json` to `$Version` without touching git. `--force-publish` ignores Lerna's change-detection (it would otherwise skip packages with no diff vs the previous tag).
+5. **`yarn replace-with-tilde`** — runs `replace-with-tilde.js` (see below) to convert `^` ranges on internal `@abp/*` deps to `~`.
+6. **`yarn validate-versions`** in `scripts/` cross-checks that every `package.json` in `packs/` matches `$Version`.
+7. **Final publish** — `lerna exec 'npm publish --registry $Registry [--tag next]'` runs `npm publish` inside each `packs/*` folder.
+
+The wrapping `Stopwatch` blocks and `cd` exclusions in the failure check are pure ergonomics — `cd` is allowed to "fail" (PowerShell returns 0 anyway, but the exclusion keeps the failure-handler code symmetric).
+
+## `npm/publish-ng.ps1`
+
+```powershell
+param(
+  [string]$Version,
+  [string]$Registry
+)
+
+yarn install
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+$RootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+if (-Not $Version) {
+  $Version = $NextVersion;
+}
+
+if (-Not $Registry) {
+  $Registry = "https://registry.npmjs.org";
+}
+$UpdateNgPacksCommand   = "yarn update-version $Version"
+$NgPacksPublishCommand  = "npm run publish-packages -- --nextVersion $Version --skipGit --registry $Registry --skipVersionValidation"
+$UpdateGulpCommand      = "yarn update-gulp --registry $Registry"
+
+
+$IsPrerelease = $(node publish-utils.js --prerelease --customVersion $Version) -eq "true";
+
+if ($IsPrerelease) {
+  $UpdateGulpCommand   += " --prerelease"
+  $UpdateNgPacksCommand += " --prerelease"
+}
+
+$commands = (
+  "cd ng-packs",
+  "yarn install",
+  $UpdateNgPacksCommand,
+  "cd scripts",
+  "yarn install",
+  $NgPacksPublishCommand,
+  "cd ../../",
+  "cd scripts",
+  "yarn remove-lock-files",
+  "cd ..",
+  $UpdateGulpCommand
+)
+
+foreach ($command in $commands) {
+  $timer = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-Host $command
+  Invoke-Expression $command
+  if ($LASTEXITCODE -ne '0' -And $command -notlike '*cd *') {
+    Write-Host ("Process failed! " + $command)
+    Set-Location $RootFolder
+    exit $LASTEXITCODE
+  }
+  $timer.Stop()
+  $total = $timer.Elapsed
+  Write-Output "-------------------------"
+  Write-Output "$command command took $total (Hours:Minutes:Seconds.Milliseconds)"
+  Write-Output "-------------------------"
+}
+```
+
+Sequence:
+
+1. **`cd ng-packs && yarn install`** — install Nx workspace deps.
+2. **`yarn update-version $Version`** maps to `nx generate @abp/nx.generators:update-version` (defined in `ng-packs/package.json`). That generator updates the version field in every `packages/*/package.json` and the `peerDependencies` graph between them.
+3. **`cd scripts && yarn install`** — the publish-side scripts have their own Node deps.
+4. **`npm run publish-packages -- --nextVersion $Version --skipGit --registry $Registry --skipVersionValidation`** — runs `ng-packs/scripts/publish.ts` which builds via Nx into `dist/packages/*` and then `npm publish`es each. `--skipGit` and `--skipVersionValidation` mirror what `publish-mvc.ps1` does at the Lerna level.
+5. **`yarn remove-lock-files`** — `ng-packs/scripts/remove-lock-files.ts` deletes per-package `yarn.lock` files that ng-packagr may have generated; only the root lockfile is checked in.
+6. **`yarn update-gulp --registry $Registry`** — runs `update-gulp.js` to refresh the `wwwroot/libs` folders across the repo using the newly published `@abp/*` versions.
+
+The `--prerelease` switch propagates to both `update-version` (so Nx uses the right semver target) and `update-gulp` (so `ncu` walks prereleases too).
+
+## `npm/preview-publish.ps1`
+
+```powershell
+param(
+  [string]$Version,
+  [string]$Registry
+)
+$commands = (
+  ".\publish-mvc.ps1 $Version $Registry",
+  ".\publish-ng.ps1 $Version $Registry"
+);
+
+$NextVersion = $(node publish-utils.js --nextVersion)
+$RootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+if(-Not $Version) {
+$Version = $NextVersion;
+}
+
+if(-Not $Registry) {
+exit
+}
+
+foreach ($command in $commands) {
+  Write-Host $command
+  Invoke-Expression $command
+  if($LASTEXITCODE -ne '0' -And $command -notlike '*cd *') {
+    Write-Host ("Process failed! " + $command)
+    Set-Location $RootFolder
+    exit $LASTEXITCODE
+  }
+}
+```
+
+`preview-publish.ps1` chains both publishers. The early `if(-Not $Registry) { exit }` guard is the safety: this script is intentionally only useful against a custom registry — typically a local Verdaccio (see below) — so calling it without `-Registry` is a no-op.
+
+## Node helpers
+
+### `npm/replace-with-tilde.js`
+
+```javascript
+const glob = require("glob");
+const fse = require("fs-extra");
+
+function replace(filePath) {
+  const pkg = fse.readJsonSync(filePath);
+
+  const { dependencies } = pkg;
+
+  if (!dependencies) return;
+
+  Object.keys(dependencies).forEach((key) => {
+    if (key.includes("@abp/")) {
+      dependencies[key] = dependencies[key].replace("^", "~");
+    }
+  });
+
+  fse.writeJsonSync(filePath, { ...pkg, dependencies }, { spaces: 2 });
+}
+
+glob("./packs/**/package.json", {}, (er, files) => {
+  files.forEach((path) => {
+    if (path.includes("node_modules")) {
+      return;
+    }
+
+    replace(path);
+  });
+});
+```
+
+Purpose: ensure that **internal `@abp/*` dependencies pin to `~` (patch range) instead of `^` (minor range)**. This is enforced in MVC packs so a `7.4.x` patch of `@abp/core` cannot accidentally drag in a `7.5.x` of `@abp/identity` at install time.
+
+The Angular side has its own equivalent at `ng-packs/scripts/replace-with-tilde.ts`.
+
+### `npm/update-gulp.js`
+
+```javascript
+const glob = require('fast-glob');
+const childProcess = require('child_process');
+const execa = require('execa');
+const fse = require('fs-extra');
+const { program } = require('commander');
+
+program.version('0.0.1');
+program.option('-pr, --prerelease', 'whether version is prerelease');
+program.option(
+  '-rg, --registry <registry>',
+  'NPM server registry',
+  'https://registry.npmjs.org'
+);
+program.parse(process.argv);
+
+const gulp = (folderPath) => {
+  if (
+    !fse.existsSync(folderPath + 'gulpfile.js') ||
+    !glob.sync(folderPath + '*.csproj').length
+  ) {
+    return;
+  }
+
+  try {
+    fse.removeSync(`${folderPath}/wwwroot/libs`);
+    execa.sync('yarn', ['install'], { cwd: folderPath, stdio: 'inherit' });
+    execa.sync('yarn', ['gulp'], { cwd: folderPath, stdio: 'inherit' });
+  } catch (error) {
+    console.log('\x1b[31m', 'Error: ' + error.message);
+  }
+};
+
+const updatePackages = (pkgJsonPath) => {
+  try {
+    const result = childProcess
+      .execSync(
+        `ncu "/^@abp.*$/" --packageFile ${pkgJsonPath} -u${
+          program.prerelease ? ' --target newest' : ''
+        } --registry ${program.registry}`
+      )
+      .toString();
+    console.log('\x1b[0m', result);
+  } catch (error) {
+    console.log('\x1b[31m', 'Error: ' + error.message);
+  }
+};
+```
+
+Workflow per `package.json` found in `../**`:
+
+1. Skip anything under `node_modules`, `wwwroot`, `bin`, `obj`.
+2. Run `ncu` (npm-check-updates) for every dep matching `/^@abp.*$/` and `-u`pdate it in place. With `--prerelease`, target `newest` (includes prereleases); otherwise default `patch` target.
+3. If the same folder has a `gulpfile.js` *and* a `.csproj`, clear `wwwroot/libs`, run `yarn install`, then `yarn gulp` — i.e. recopy front-end assets for the just-bumped `@abp/*` packages into the static-files directory used by ASP.NET Core projects.
+
+This is what keeps every template's `wwwroot/libs/abp/...` directory in step with the newly published packs.
+
+### `npm/package-update-script.js`
+
+```javascript
+const glob = require('glob');
+const childProcess = require('child_process');
+const { program } = require('commander');
+
+program.version('0.0.1');
+program.option('-pr, --prerelease', 'whether version is prerelease');
+program.option('-rg, --registry <registry>', 'target npm server registry');
+program.parse(process.argv);
+
+const packages = (process.argv[3] || 'abp').split(',').join('|');
+
+const check = (pkgJsonPath) => {
+  try {
+    return childProcess
+      .execSync(
+        `ncu "/^@(${packages}).*$/" --packageFile ${pkgJsonPath} -u${
+          program.prerelease ? ' --target greatest' : ' --target patch'
+        }${program.registry ? ` --registry ${program.registry}` : ''}`
+      )
+      .toString();
+  } catch (error) {
+    console.log('exec error: ' + error.message);
+    process.exit(error.status);
+  }
+};
+
+const folder = process.argv[2] || '.';
+
+glob(folder + '/**/package.json', {}, (er, files) => {
+  files.forEach((file) => {
+    if (
+      file.includes('node_modules') ||
+      file.includes('ng-packs/dist') ||
+      file.includes('wwwroot') ||
+      file.includes('bin/Debug')
+    ) {
+      return;
+    }
+
+    console.log(check(file));
+  });
+});
+```
+
+Exposed via `npm run update` (mapped to `node package-update-script.js`). Differences from `update-gulp.js`:
+
+* Scope is parameterised — `packages = (process.argv[3] || 'abp').split(',').join('|')` lets you pass a comma list. Calling `node package-update-script.js . abp,angular` bumps both `@abp/*` and `@angular/*`.
+* Folder root is parameterised (`process.argv[2] || '.'`).
+* Default target is `patch`, switchable to `greatest` for prereleases — slightly different semantics from `update-gulp.js`'s `newest`/default split.
+* Does not run any gulp tasks; metadata-only.
+
+### `npm/publish-utils.js`
+
+```javascript
+const { program } = require('commander');
+const fse = require('fs-extra');
+const semverParse = require('semver/functions/parse');
+
+program.version('0.0.1');
+program.option('-n, --nextVersion', 'version in common.props');
+program.option('-pr, --prerelease', 'whether version is prerelease');
+program.option('-cv, --customVersion <customVersion>', 'set exact version');
+
+program.parse(process.argv);
+
+if (program.nextVersion) console.log(getVersion());
+
+if (program.prerelease)
+  console.log(!!semverParse(getVersion()).prerelease?.length);
+
+function getVersion() {
+  if (program.customVersion) return program.customVersion;
+  const commonProps = fse.readFileSync('../common.props').toString();
+  const versionTag = '<Version>';
+  const versionEndTag = '</Version>';
+  const first = commonProps.indexOf(versionTag) + versionTag.length;
+  const last = commonProps.indexOf(versionEndTag);
+  return commonProps.substring(first, last);
+}
+```
+
+This tiny CLI does two things:
+
+* `--nextVersion` prints the framework's current `<Version>` from `../common.props`, so the PowerShell scripts have a single source of truth.
+* `--prerelease [--customVersion x.y.z]` prints `true` / `false` based on whether the SemVer parse has a non-empty `prerelease` array (e.g. `7.4.0-rc.1` has `prerelease = ['rc', 1]`).
+
+`semver/functions/parse` returns `null` for invalid input; the chained `?.length` plus `!!` collapses that to a clean boolean.
+
+### `npm/scripts/`
+
+```text
+npm/scripts/
+├── package.json
+├── tsconfig.json
+├── remove-lock-files.ts         # delete per-package yarn.lock
+├── validate-versions.ts         # cross-check every package.json
+└── utils/
+```
+
+`validate-versions.ts` is invoked by `publish-mvc.ps1` to confirm every `packs/*/package.json` matches the version Lerna just stamped. `remove-lock-files.ts` is invoked by `publish-ng.ps1` after the Nx build.
+
+## `npm/ng-packs/` — Nx workspace
+
+`ng-packs/package.json` exposes the Nx-flavoured scripts the publish flow leans on:
+
+```json
+{
+  "name": "abp-ng-packs",
+  "version": "0.0.0",
+  "scripts": {
+    "ng": "nx",
+    "nx": "nx",
+    "build:all": "nx run-many --target=build --all --exclude=dev-app,schematics --prod &&  npm run build:schematics",
+    "test:all":  "nx run-many --target=test  --all",
+    "lint:all":  "nx run-many --target=lint  --all",
+    "affected:build": "nx affected:build --parallel 1",
+    "build:schematics": "cd scripts && yarn && yarn build:schematics && cd ..",
+    "update-version":   "nx generate @abp/nx.generators:update-version",
+    "lerna": "lerna"
+  }
+}
+```
+
+`nx.json` declares the workspace shape:
+
+```json
+{
+  "npmScope": "abp",
+  "affected": { "defaultBase": "dev" },
+  "tasksRunnerOptions": {
+    "default": {
+      "runner": "nx/tasks-runners/default",
+      "options": {
+        "cacheableOperations": ["build", "lint", "test", "e2e"],
+        "parallel": 3
+      }
+    }
+  },
+  "workspaceLayout": { "libsDir": "packages", "appsDir": "" },
+  "defaultProject": "dev-app"
+}
+```
+
+Notable points:
+
+* `npmScope: "abp"` is what makes every library default to `@abp/<name>`.
+* `affected.defaultBase: "dev"` — Nx's affected-graph computation compares against the `dev` branch, which is the framework's default working branch.
+* `libsDir: "packages"` matches `lerna.version.json`'s `packages: ["packages/*"]`, while `apps` are at the workspace root (the `apps/` folder contains `dev-app` and a couple of e2e harnesses).
+
+`ng-packs/scripts/` holds the TypeScript publish pipeline (`publish.ts`, `build.ts`, `prod-build.ts`, `replace-with-tilde.ts`, `replace-with-preview.ts`, `copy-packages-to-templates.ts`, `build-schematics.ts`). These are compiled by ts-node and invoked via `npm run publish-packages`.
+
+## `npm/verdaccio-containers/` — end-to-end test harness
+
+`README.md` for the folder:
+
+> The duty of this compose is to publish the packages to the [Verdaccio](https://verdaccio.org/) (a custom NPM server) running in the container and to serve the Angular pro template (copied from `abp/templates/app/angular` folder) that is consumed these packages from the Verdaccio.
+
+The `docker-compose.yml`:
+
+```yaml
+version: '3.9'
+
+services:
+  verdaccio:
+    image: verdaccio/verdaccio:4.0
+    container_name: 'verdaccio'
+    networks:
+      - docker_network
+    environment:
+      - VERDACCIO_PORT=4873
+    ports:
+      - '4873:4873'
+    expose:
+      - '4873/tcp'
+  publish:
+    build:
+      context: ./publish-packages
+      dockerfile: Dockerfile
+      args:
+        next_version: ''
+    container_name: 'verdaccio_publish'
+    networks:
+      - docker_network
+    depends_on:
+      - verdaccio
+    expose:
+      - '4872'
+  app:
+    build: ./serve-app
+    container_name: 'verdaccio_app'
+    networks:
+      - docker_network
+    depends_on:
+      - publish
+    ports:
+      - '4200:4200'
+    expose:
+      - '4200/tcp'
+networks:
+  docker_network:
+    driver: bridge
+```
+
+The three-service compose stands up:
+
+1. **`verdaccio`** — Verdaccio 4.0 on port `4873`, acting as a private npm registry.
+2. **`publish`** — builds an image from `verdaccio-containers/publish-packages/`. The `next_version` build arg is the version to publish; on container start it runs the equivalent of `preview-publish.ps1 -Version <x> -Registry http://verdaccio:4873`.
+3. **`app`** — built from `verdaccio-containers/serve-app/`, which copies `templates/app/angular`, points its `package.json` at the private registry, installs, and serves on `4200`.
+
+The README explicitly says the process takes ~30 minutes and that you start it with:
+
+```bash
+docker-compose rm -f && docker-compose build --build-arg next_version="<version here>" && docker-compose up
+```
+
+This is how the team validates a release candidate's npm packages against a real Angular template *before* the packs are pushed to npmjs.org.
+
+## End-to-end publish sequencing
+
+| Step | Trigger | Script | Notes |
+|------|---------|--------|-------|
+| 1 | `deploy/4-npm-publish-mvc.ps1` | `npm/publish-mvc.ps1` | Lerna version bump + `npm publish` per `packs/*` |
+| 2 | `deploy/5-npm-publish-angular.ps1` | `npm/publish-ng.ps1` | Nx `update-version`, build, `publish-packages`, then `update-gulp` |
+| Aux | Manual / preview | `npm/preview-publish.ps1` | Chains both into a single registry (typically Verdaccio) |
+| Aux | Manual maintenance | `npm/package-update-script.js` | `npm run update` — patch-bump `@abp/*` deps across the repo |
+
+See [Deploy Pipeline](/build/deploy-pipeline) for how steps 4 and 5 are stitched into the release sequence and which credentials they pull from `npm-auth-token.txt`.
+
+## Common gotchas
+
+| Symptom | Cause | Resolution |
+|---------|-------|------------|
+| Publish picks `latest` tag for an RC | `publish-utils.js --prerelease` returned `false` | Check `common.props` `<Version>` includes the prerelease suffix (e.g. `-rc.1`) |
+| Internal `@abp/*` deps install a newer minor | `replace-with-tilde` was skipped | Ensure `yarn replace-with-tilde` ran (publish-mvc.ps1 step 5) |
+| `update-gulp` rebuilds `wwwroot/libs` everywhere — too slow | Default behavior; runs once per release | Pre-restrict by deleting `gulpfile.js` in unrelated folders, or skip the step |
+| `npm publish` 403 on first run | Auth token not set | Set via `npm set //registry.npmjs.org/:_authToken <token>`, which `deploy/4-npm-publish-mvc.ps1` does for you |
+| Verdaccio container rejects publish | `next_version` build arg not supplied | Rebuild with `--build-arg next_version=...` |

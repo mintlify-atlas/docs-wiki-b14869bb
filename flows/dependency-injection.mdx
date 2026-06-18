@@ -1,0 +1,165 @@
+---
+title: "Dependency injection: convention, exposure, and Autofac"
+sidebarTitle: "Dependency injection"
+description: "Trace ABP's auto-registration: ITransientDependency markers, ExposeServicesAttribute, DefaultConventionalRegistrar, and Autofac property injection."
+---
+
+ABP avoids hand-written `services.AddTransient<...>()` boilerplate by scanning module assemblies through a pluggable conventional registration system. The Autofac integration adds property injection and propagates the lifetime tagging onto Autofac's container. This page traces how a plain `public class FooAppService : ITransientDependency` ends up resolvable from any module that depends on it.
+
+## Sequence
+
+```mermaid
+sequenceDiagram
+    participant App as AbpApplicationBase
+    participant SCE as ServiceCollectionConventionalRegistrationExtensions
+    participant List as ConventionalRegistrarList
+    participant Reg as DefaultConventionalRegistrar
+    participant Base as ConventionalRegistrarBase
+    participant ESE as ExposedServiceExplorer
+    participant SC as IServiceCollection
+    participant Factory as AbpAutofacServiceProviderFactory
+    participant Autofac as ContainerBuilder
+    participant Lazy as AbpLazyServiceProvider
+
+    App->>SCE: Services.AddAssembly(assembly)
+    SCE->>List: GetConventionalRegistrars()
+    List-->>SCE: [DefaultConventionalRegistrar]
+    SCE->>Reg: AddAssembly(services, assembly)
+    Reg->>Base: AddAssembly → AddTypes → AddType(type)
+    Reg->>Reg: IsConventionalRegistrationDisabled?
+    Reg->>Reg: GetDependencyAttributeOrNull, GetLifeTimeOrNull
+    Reg->>ESE: GetExposedServices(type)
+    ESE-->>Reg: ITransientDependency markers + ExposeServices
+    Reg->>SC: services.Add(ServiceDescriptor)
+    App->>Factory: builder.Build()
+    Factory->>Autofac: Populate(services); Build()
+    Autofac-->>Factory: AutofacServiceProvider
+    Note over Autofac: AbpPropertySelector resolves properties without [DisablePropertyInjection]
+    Lazy->>Autofac: LazyGetService(Type) (cached per scope)
+```
+
+## Step-by-step walk-through
+
+1. **`Services.AddAssembly`.** During `ConfigureServices`, `AbpApplicationBase` loops over each module's `AllAssemblies` and calls `Services.AddAssembly(assembly)` from `framework/src/Volo.Abp.Core/Microsoft/Extensions/DependencyInjection/ServiceCollectionConventionalRegistrationExtensions.cs`:
+   ```csharp
+   public static IServiceCollection AddAssembly(this IServiceCollection services, Assembly assembly)
+   {
+       foreach (var registrar in services.GetConventionalRegistrars())
+       {
+           registrar.AddAssembly(services, assembly);
+       }
+       return services;
+   }
+   ```
+
+2. **Registrar list bootstrap.** `GetOrCreateRegistrarList` lazily creates a `ConventionalRegistrarList` containing a single `DefaultConventionalRegistrar` and stores it in an `IObjectAccessor<ConventionalRegistrarList>` (see `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ConventionalRegistrarList.cs`). Modules can push more registrars via `services.AddConventionalRegistrar(...)`.
+
+3. **Type discovery.** `ConventionalRegistrarBase.AddAssembly` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ConventionalRegistrarBase.cs`) filters with `AssemblyHelper.GetAllTypes(assembly)`:
+   ```csharp
+   var types = AssemblyHelper
+       .GetAllTypes(assembly)
+       .Where(type => type != null && type.IsClass && !type.IsAbstract && !type.IsGenericType)
+       .ToArray();
+   ```
+   It then calls `AddTypes(services, types)` which loops `AddType` per type.
+
+4. **Per-type decision.** `DefaultConventionalRegistrar.AddType` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DefaultConventionalRegistrar.cs`):
+   ```csharp
+   if (IsConventionalRegistrationDisabled(type)) return;
+   var dependencyAttribute = GetDependencyAttributeOrNull(type);
+   var lifeTime = GetLifeTimeOrNull(type, dependencyAttribute);
+   if (lifeTime == null) return;
+   var exposedServiceTypes = GetExposedServiceTypes(type);
+   TriggerServiceExposing(services, type, exposedServiceTypes);
+   foreach (var exposedServiceType in exposedServiceTypes)
+   {
+       var serviceDescriptor = CreateServiceDescriptor(type, exposedServiceType, exposedServiceTypes, lifeTime.Value);
+       if (dependencyAttribute?.ReplaceServices == true) services.Replace(serviceDescriptor);
+       else if (dependencyAttribute?.TryRegister == true) services.TryAdd(serviceDescriptor);
+       else services.Add(serviceDescriptor);
+   }
+   ```
+
+5. **Lifetime resolution.** `ConventionalRegistrarBase.GetLifeTimeOrNull` honors:
+   - `[Dependency(Lifetime = ...)]` (`DependencyAttribute.Lifetime`).
+   - `ITransientDependency`, `ISingletonDependency`, `IScopedDependency` marker interfaces from `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/`.
+   - `GetDefaultLifeTimeOrNull(type)` — null by default. Subclasses (e.g. `MvcConventionalRegistrar` in MVC layers) can extend.
+
+6. **Exposed services.** `ExposedServiceExplorer.GetExposedServices` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposedServiceExplorer.cs`) consults every `IExposedServiceTypesProvider` attribute on the type, defaulting to `IncludeDefaults = true, IncludeSelf = true`. `ExposeServicesAttribute` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposeServicesAttribute.cs`) lets you declare exactly which interfaces are bound:
+   ```csharp
+   [ExposeServices(typeof(IAuditingStore))]
+   public class MyAuditingStore : IAuditingStore, ITransientDependency { }
+   ```
+   The default set comes from `GetDefaultServices` — interfaces whose name equals `I` + className without `Async`/generic suffixes (see implementation).
+
+7. **Service-exposing pipeline.** `TriggerServiceExposing` runs every action registered via `services.OnExposing(...)` from `framework/src/Volo.Abp.Core/Microsoft/Extensions/DependencyInjection/ServiceCollectionRegistrationActionExtensions.cs`, allowing modules to filter or transform the exposed list (`IOnServiceExposingContext`).
+
+8. **Descriptor creation.** `CreateServiceDescriptor` decides between a direct mapping and a factory that resolves the implementation type once and casts. The forwarded `serviceProvider.GetService(implementationType)` keeps `Replace` semantics consistent: replacing the implementation also replaces the exposed-as registration.
+
+9. **Container hand-off.** Once `ConfigureServices` returns, the host calls `AbpAutofacServiceProviderFactory.CreateBuilder` (`framework/src/Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacServiceProviderFactory.cs`):
+   ```csharp
+   public ContainerBuilder CreateBuilder(IServiceCollection services)
+   {
+       _services = services;
+       _builder.Populate(services);
+       return _builder;
+   }
+   ```
+   `Populate` is the upstream Autofac extension from `framework/src/Volo.Abp.Autofac/Autofac/Extensions/DependencyInjection/AutofacRegistration.cs`. It iterates `ServiceDescriptor`s and registers them as `InstancePerLifetimeScope`, `SingleInstance`, or `InstancePerDependency` according to `ServiceLifetime`.
+
+10. **Property injection.** `AbpAutofacModule.PreConfigureServices` adds `AbpPropertySelector` (`framework/src/Volo.Abp.Autofac/Volo/Abp/Autofac/AbpPropertySelector.cs`) so Autofac fills public settable properties on resolved instances unless they carry `[DisablePropertyInjection]` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DisablePropertyInjectionAttribute.cs`).
+
+11. **`AbpLazyServiceProvider`.** Inside any resolved class, `IAbpLazyServiceProvider` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/AbpLazyServiceProvider.cs`) caches resolutions per scope. `LazyGetRequiredService<T>()` and `LazyGetService<T>(factory)` are the recommended patterns inside `AbpController`, `ApplicationService`, and `DomainService` so the constructor doesn't grow without bound.
+
+12. **`CachedServiceProvider` / `ICachedServiceProvider`.** Application services use the scoped `CachedServiceProvider` (`framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/CachedServiceProvider.cs`) for transitive resolves; `RootServiceProvider` (`RootServiceProvider.cs`) injects access to the root scope when singletons need to spawn child scopes.
+
+## Lifetime cheat-sheet
+
+| Marker | Lifetime | Resolved from |
+| --- | --- | --- |
+| `ITransientDependency` | Transient | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ITransientDependency.cs` |
+| `IScopedDependency` | Scoped | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IScopedDependency.cs` |
+| `ISingletonDependency` | Singleton | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ISingletonDependency.cs` |
+| `[Dependency(Lifetime=Singleton, ReplaceServices=true)]` | Override class-level lifetime, swap existing registration | `DependencyAttribute.cs` |
+| `[Dependency(TryRegister=true)]` | `services.TryAdd` semantics | `DependencyAttribute.cs` |
+
+## Hooks and extension points
+
+| Hook | File | Purpose |
+| --- | --- | --- |
+| `IConventionalRegistrar` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IConventionalRegistrar.cs` | Replace or add to the registration convention. |
+| `IExposedServiceTypesProvider` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IExposedServiceTypesProvider.cs` | Custom expose-as logic via attributes. |
+| `IOnServiceRegistredContext` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IOnServiceRegistredContext.cs` | Modify generated `ServiceDescriptor`s. |
+| `IOnServiceExposingContext` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IOnServiceExposingContext.cs` | Add or remove exposed types per implementation. |
+| `[DisableConventionalRegistration]` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DisableConventionalRegistrationAttribute.cs` | Opt out of scanning. |
+| `[DisablePropertyInjection]` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DisablePropertyInjectionAttribute.cs` | Tell `AbpPropertySelector` to skip a property. |
+| `IAbpLazyServiceProvider` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IAbpLazyServiceProvider.cs` | Cache lazy resolutions per scope. |
+| `ICachedServiceProvider` / `ITransientCachedServiceProvider` | `…/ICachedServiceProvider.cs`, `…/ITransientCachedServiceProvider.cs` | Cache resolutions across one operation. |
+
+## Related options classes
+
+| Options / type | File |
+| --- | --- |
+| `ConventionalRegistrarList` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ConventionalRegistrarList.cs` |
+| `ServiceRegistrationActionList` | `framework/src/Volo.Abp.Core/Microsoft/Extensions/DependencyInjection/ServiceCollectionRegistrationActionExtensions.cs` |
+| `ServiceExposingActionList` | same file |
+| `IObjectAccessor<T>` / `ObjectAccessor<T>` | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ObjectAccessor.cs` |
+| `AbpAutofacServiceProviderFactory` | `framework/src/Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacServiceProviderFactory.cs` |
+
+## Gotchas
+
+- **Marker order matters.** If a class implements both `ITransientDependency` and `ISingletonDependency`, `GetServiceLifetimeFromClassHierarchy` checks transient first and singleton second; the *first* matching interface in source order wins, so don't double-mark.
+- **`ExposeServicesAttribute` replaces defaults only when `IncludeDefaults` is false.** Adding `[ExposeServices(typeof(IFoo))]` without setting flags adds `IFoo` to the *default* set rather than restricting it.
+- **`Replace` is a global swap.** A class decorated with `[Dependency(ReplaceServices=true)]` evicts every previously registered service descriptor for the same exposed type — including ones from modules loaded after yours.
+- **Property injection is post-construction.** Inside a constructor, `LazyServiceProvider` is still null because Autofac fills properties after the constructor returns. Wrap property access in lazy fields if you need it during construction (and remove `init`-only setters).
+- **`AddConventionalRegistrar` should run in `PreConfigureServices`.** Adding registrars after the first `AddAssembly` runs means that assembly is not re-scanned by your new registrar.
+- **Open generics aren't scanned.** `ConventionalRegistrarBase.AddAssembly` skips generic types — register `MyGeneric<>` manually with `services.AddTransient(typeof(IGeneric<>), typeof(MyGeneric<>))`.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Application startup" icon="play" href="/flows/application-startup" />
+  <Card title="Autofac integration" icon="boxes-stacked" href="/framework/core/autofac" />
+  <Card title="Volo.Abp.Core DI primitives" icon="link" href="/framework/core/volo-abp-core" />
+  <Card title="Unit of work" icon="database" href="/flows/unit-of-work" />
+</CardGroup>

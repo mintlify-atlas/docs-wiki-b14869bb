@@ -1,0 +1,339 @@
+---
+title: "Volo.Abp.Http.Client.IdentityModel.WebAssembly: forwarding tokens from MSAL in the browser"
+sidebarTitle: "IdentityModel.WebAssembly"
+description: "How WebAssemblyAbpAccessTokenProvider bridges Microsoft.AspNetCore.Components.WebAssembly.Authentication's IAccessTokenProvider into the ABP proxy pipeline, and how JwtClaimTypes are remapped to AbpClaimTypes."
+---
+
+`Volo.Abp.Http.Client.IdentityModel.WebAssembly` is the Blazor
+WebAssembly counterpart of
+[`identitymodel-web`](/framework/httpclient/identitymodel-web). It plugs
+the standard `Microsoft.AspNetCore.Components.WebAssembly.Authentication`
+flow (MSAL / OIDC running in the browser) into the ABP proxy pipeline
+so each outgoing call carries the access token negotiated when the
+user signed in.
+
+The package replaces two services:
+
+- `IAbpAccessTokenProvider` → `WebAssemblyAbpAccessTokenProvider`,
+  which delegates to `Microsoft.AspNetCore.Components.WebAssembly.Authentication.IAccessTokenProvider`.
+- `IRemoteServiceHttpClientAuthenticator` →
+  `AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator`,
+  which forwards the token on the request and falls back to OIDC
+  client‑credentials when no user is signed in.
+
+It also remaps a handful of `AbpClaimTypes` to the JWT‑shaped claim
+names emitted by the authority — without this remap, claims such as
+`UserId` or `UserName` would not be populated by the WASM
+authentication state provider.
+
+## Package layout
+
+```
+framework/src/Volo.Abp.Http.Client.IdentityModel.WebAssembly/Volo/Abp/Http/Client/IdentityModel/WebAssembly/
+├── AbpHttpClientIdentityModelWebAssemblyModule.cs
+├── AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator.cs
+└── WebAssemblyAbpAccessTokenProvider.cs
+```
+
+## The module
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.WebAssembly/Volo/Abp/Http/Client/IdentityModel/WebAssembly/AbpHttpClientIdentityModelWebAssemblyModule.cs
+[DependsOn(
+    typeof(AbpHttpClientIdentityModelModule),
+    typeof(AbpAspNetCoreComponentsWebAssemblyModule)
+)]
+public class AbpHttpClientIdentityModelWebAssemblyModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        AbpClaimTypes.UserName = JwtClaimTypes.PreferredUserName;
+        AbpClaimTypes.Name = JwtClaimTypes.GivenName;
+        AbpClaimTypes.SurName = JwtClaimTypes.FamilyName;
+        AbpClaimTypes.UserId = JwtClaimTypes.Subject;
+        AbpClaimTypes.Role = JwtClaimTypes.Role;
+        AbpClaimTypes.Email = JwtClaimTypes.Email;
+    }
+}
+```
+
+`ConfigureServices` does no DI registration — both replacement services
+are picked up by conventional registration. What it does instead is
+mutate the static `AbpClaimTypes` table so the canonical claim
+identifiers (used everywhere in ABP, e.g.
+`ICurrentUser.Id`, `ICurrentUser.UserName`) map onto the JWT names
+the authority writes into the token.
+
+| `AbpClaimTypes` slot | New value | Why |
+| --- | --- | --- |
+| `UserId` | `JwtClaimTypes.Subject` (`"sub"`) | The OIDC subject claim. |
+| `UserName` | `JwtClaimTypes.PreferredUserName` (`"preferred_username"`) | Standard OIDC username. |
+| `Name`, `SurName` | `JwtClaimTypes.GivenName`, `JwtClaimTypes.FamilyName` | Names. |
+| `Role` | `JwtClaimTypes.Role` (`"role"`) | Authorities emit `role`, not `roles`. |
+| `Email` | `JwtClaimTypes.Email` | `email`. |
+
+On a server-side ASP.NET Core host these claims arrive via
+`ClaimsTransformer` chains and have richer URLs. In WASM the
+authentication state provider in
+`Microsoft.AspNetCore.Components.WebAssembly.Authentication` builds a
+`ClaimsPrincipal` directly from the JWT, so the canonical claim names
+need to be the JWT names if `CurrentUser` is to look populated.
+
+The module depends on `AbpAspNetCoreComponentsWebAssemblyModule` —
+which already registers the AspNetCore Blazor WebAssembly
+authentication services that own the `IAccessTokenProvider`.
+
+## The access‑token provider
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.WebAssembly/Volo/Abp/Http/Client/IdentityModel/WebAssembly/WebAssemblyAbpAccessTokenProvider.cs
+[Dependency(ReplaceServices = true)]
+public class WebAssemblyAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    protected IAccessTokenProvider AccessTokenProvider { get; }
+
+    public WebAssemblyAbpAccessTokenProvider(IAccessTokenProvider accessTokenProvider)
+    {
+        AccessTokenProvider = accessTokenProvider;
+    }
+
+    public virtual async Task<string> GetTokenAsync()
+    {
+        if (AccessTokenProvider == null)
+        {
+            return null;
+        }
+
+        var result = await AccessTokenProvider.RequestAccessToken();
+        if (result.Status != AccessTokenResultStatus.Success)
+        {
+            return null;
+        }
+
+        result.TryGetToken(out var token);
+        return token.Value;
+    }
+}
+```
+
+The implementation is a faithful bridge from ABP's
+`IAbpAccessTokenProvider` to the framework's
+`Microsoft.AspNetCore.Components.WebAssembly.Authentication.IAccessTokenProvider`:
+
+1. `RequestAccessToken()` returns an `AccessTokenResult` whose
+   `Status` is one of `Success`, `RequiresRedirect`, or `Failure`.
+   The Blazor framework caches a non‑expired token and silently
+   renews it through a hidden iframe when refresh tokens are
+   available.
+2. **Only `Success` returns a token.** `RequiresRedirect` means the
+   browser must navigate to the login page to interactively
+   re‑authenticate; the WASM hosting model handles this through its
+   own UI components, not through the proxy pipeline. The provider
+   simply returns `null` and lets the authenticator fall back.
+3. `result.TryGetToken(out var token)` then yields the
+   `AccessToken { Value, Expires, GrantedScopes }` record from which
+   we extract the JWT.
+
+In Persistent‑state Blazor (`Standalone` and `Hosted`) the actual
+storage is either browser session storage or local storage,
+configured via
+`Microsoft.AspNetCore.Components.WebAssembly.Authentication.RemoteAuthenticationOptions`.
+That detail is invisible to the bridge — *Blazor handles persistence*,
+this provider just asks for the current token.
+
+## The authenticator
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.WebAssembly/Volo/Abp/Http/Client/IdentityModel/WebAssembly/AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator.cs
+[Dependency(ReplaceServices = true)]
+public class AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator
+    : IdentityModelRemoteServiceHttpClientAuthenticator
+{
+    protected IAbpAccessTokenProvider AccessTokenProvider { get; }
+
+    public AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator(
+        IIdentityModelAuthenticationService identityModelAuthenticationService,
+        IAbpAccessTokenProvider accessTokenProvider)
+        : base(identityModelAuthenticationService)
+    {
+        AccessTokenProvider = accessTokenProvider;
+    }
+
+    public async override Task Authenticate(RemoteServiceHttpClientAuthenticateContext context)
+    {
+        if (context.RemoteService.GetUseCurrentAccessToken() != false)
+        {
+            var accessToken = await AccessTokenProvider.GetTokenAsync();
+            if (accessToken != null)
+            {
+                context.Request.SetBearerToken(accessToken);
+                return;
+            }
+        }
+
+        await base.Authenticate(context);
+    }
+}
+```
+
+Structurally identical to the Web authenticator on
+[identitymodel-web](/framework/httpclient/identitymodel-web), only the
+source of the token differs:
+
+| Condition | Action |
+| --- | --- |
+| `RemoteService["UseCurrentAccessToken"] == "false"` | Skip the WASM token entirely. Always client‑credentials. |
+| `WebAssemblyAbpAccessTokenProvider.GetTokenAsync()` returned a non‑null token | Apply with `SetBearerToken` on the **request**. |
+| Otherwise | Delegate to `IdentityModelRemoteServiceHttpClientAuthenticator` — client‑credentials. |
+
+The base‑class fall‑through is rarely reached in practice for an
+**interactive** WASM app: there is no anonymous server‑to‑server
+context in the browser, so either the user is signed in (token
+present) or `RequiresRedirect` is in flight (the user is being
+prompted), in which case the proxy call typically fails and the UI
+recovers on the next navigation. The fall‑through *is* useful for
+WASM apps that talk to a service the user has not been granted access
+to but the application itself has via a separate client.
+
+## End‑to‑end flow
+
+```
+[App boots]
+        ↓
+Builder configures OIDC with AddOidcAuthentication(...).
+The framework registers IAccessTokenProvider.
+        ↓
+User clicks "Login"
+        ↓
+RemoteAuthenticatorView completes auth-code flow with PKCE.
+Token is cached by the framework (sessionStorage / localStorage).
+        ↓
+App calls _userAppService.GetAsync(id) (proxy)
+        ↓
+ClientProxyBase<T>.RequestAsync
+    builds HttpRequestMessage
+        ↓
+ClientAuthenticator.Authenticate(context)
+        ↓
+AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator
+    GetUseCurrentAccessToken == false ? skip : do
+        IAbpAccessTokenProvider.GetTokenAsync
+          → IAccessTokenProvider.RequestAccessToken()
+          → Success → SetBearerToken on request
+        ↓
+client.SendAsync(...)
+        Browser issues fetch() with Authorization: Bearer ...
+        Sees Set-Cookie? Yes, browser handles cookies natively
+        (HttpClientHandler.UseCookies is left at default in BROWSER OS).
+```
+
+The note about `UseCookies` in the primary handler is the
+counterpart of this story: see
+[`http-client`](/framework/httpclient/http-client#how-the-named-httpclient-is-configured)
+where `RuntimeInformation.IsOSPlatform(OSPlatform.Create("BROWSER"))`
+guards the cookie‑disable flag. In the browser, cookies are managed
+by the JavaScript runtime; on the server they are not.
+
+## Why remap `AbpClaimTypes`?
+
+ABP's identity abstractions (`CurrentUser`, role checks, multi‑tenant
+filters, audit logging) read claims through the static
+`AbpClaimTypes` map. The defaults match what an ASP.NET Core host
+produces — namespaced URLs such as
+`http://schemas.microsoft.com/ws/2008/06/identity/claims/role`. A
+Blazor WASM app receives the JWT verbatim, so the same logical claim
+arrives as the OIDC short name `role`.
+
+Without the remap:
+
+```text
+ICurrentUser.Id          ← returns null
+ICurrentUser.UserName    ← returns null
+[Authorize(Roles = "admin")] never fires
+```
+
+After the module runs, the same lookups succeed because
+`AbpClaimTypes.UserId` is `"sub"`, `AbpClaimTypes.Role` is `"role"`,
+etc. — the names that the JWT uses.
+
+Important: the mutation is **global static state**. Once the WASM
+module is loaded, every component sees the remapped values. There is
+no need to remap per‑component — and you should not, because a
+double‑mutation later in the boot sequence could leave a partially
+inconsistent state.
+
+## Caveats
+
+- **No refresh logic here.** Token refresh is owned by the Blazor
+  WASM authentication infrastructure. The provider simply asks for
+  the current token. If silent refresh fails, `RequestAccessToken`
+  returns `RequiresRedirect` and `GetTokenAsync` returns `null`.
+  The proxy call falls through to client‑credentials, which —
+  because a WASM app does not typically have a client secret in the
+  bundle — almost certainly fails with `null` too, surfacing as
+  `AbpRemoteCallException` on the call site.
+- **Client secret in `AbpIdentityClientOptions`** is *not* the same
+  as the WASM client id. The WASM authority is configured through
+  `AddOidcAuthentication(options => ...)` in `Program.cs`. The
+  ABP fallback configuration is separately resolved from `IConfiguration`
+  and would typically *not* be present in a WASM app. Set
+  `RemoteServices.<Name>.UseCurrentAccessToken = "true"` (the default)
+  to skip the fall‑back entirely.
+- **CORS.** The downstream service must accept the Bearer token from
+  a browser origin. Without server‑side CORS the fetch() will fail
+  before any header is read.
+
+## Concrete configuration example
+
+A typical `Program.cs` for a Blazor WebAssembly host that consumes ABP
+remote services through this package:
+
+```csharp
+var builder = WebAssemblyHostBuilder.CreateDefault(args);
+
+builder.Services.AddOidcAuthentication(options =>
+{
+    builder.Configuration.Bind("AuthServer", options.ProviderOptions);
+    options.ProviderOptions.DefaultScopes.Add("MyService");
+    options.ProviderOptions.ResponseType = "code";
+});
+
+await builder.AddApplicationAsync<MyWasmHostModule>(options =>
+{
+    options.UseAutofac();
+});
+
+await builder.Build().RunAsync();
+```
+
+And the matching `appsettings.json` section:
+
+```json
+{
+  "AuthServer": {
+    "Authority": "https://login.example.com",
+    "ClientId": "MyWasmApp",
+    "PostLogoutRedirectUri": "/authentication/logout-callback",
+    "RedirectUri": "/authentication/login-callback"
+  },
+  "RemoteServices": {
+    "Default": {
+      "BaseUrl": "https://api.example.com",
+      "UseCurrentAccessToken": "true"
+    }
+  }
+}
+```
+
+`UseCurrentAccessToken = "true"` is the default — included here for
+documentation only. Once the user signs in through the standard
+`RemoteAuthenticatorView`, every proxy call forwards their JWT.
+
+## Related pages
+
+- [identitymodel](/framework/httpclient/identitymodel) — the
+  `IdentityModelRemoteServiceHttpClientAuthenticator` base class.
+- [identitymodel-web](/framework/httpclient/identitymodel-web) — the
+  ASP.NET Core counterpart that reads the token from the auth
+  cookie.
+- [identitymodel-mauiblazor](/framework/httpclient/identitymodel-mauiblazor) —
+  the MAUI Blazor counterpart that uses platform secure storage.
+- [http-client](/framework/httpclient/http-client) — the proxy
+  pipeline that calls into this authenticator.

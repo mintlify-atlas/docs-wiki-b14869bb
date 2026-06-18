@@ -1,0 +1,654 @@
+---
+title: "Volo.Abp.EntityFrameworkCore — AbpDbContext, repositories and registration"
+description: "Deep-dive into the Entity Framework Core integration: AbpDbContext save-changes pipeline, global query filters for soft-delete and multi-tenancy, domain-event collection, AbpDbContextOptions, AbpDbContextRegistrationOptions and the EfCoreRepository<TDbContext, TEntity, TKey> generic repository."
+---
+
+`Volo.Abp.EntityFrameworkCore` is the bridge between ABP's domain layer (entities, repositories, the unit of work, the data filter, domain events) and Microsoft.EntityFrameworkCore. The package ships an abstract `AbpDbContext<TDbContext>` that every application-specific DbContext derives from, a generic repository `EfCoreRepository<TDbContext, TEntity, TKey>` that satisfies `IRepository<TEntity, TKey>`, an `AbpDbContextOptions` configuration object used during application start-up, and an `AbpDbContextRegistrationOptions` builder consumed by the `AddAbpDbContext<TDbContext>` extension to wire repositories, replaced DbContexts and custom entity options into the DI container.
+
+Behind a single call to `repository.InsertAsync(entity)` the framework performs a surprising amount of work: it discovers the per-tenant connection string, opens (or reuses) an `EfCoreDatabaseApi` inside the ambient unit of work, attaches the entity, runs ABP concept handlers (audit properties, soft-delete flagging, concurrency stamps, GUID generation, domain-event capture) on `ChangeTracker.Tracked` and `ChangeTracker.StateChanged`, applies the `IsDeleted`/`TenantId` global query filters that were added during `OnModelCreating`, then on `SaveChangesAsync` translates the operation into SQL and republishes the collected events through the UoW. This page walks the entire pipeline directly against the v7.4.0 source.
+
+## File inventory
+
+| File | Role |
+| --- | --- |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContext.cs` | Abstract DbContext base. Owns `OnModelCreating`, `SaveChangesAsync`, change-tracker event handlers and ABP concept handlers. |
+| `Volo/Abp/EntityFrameworkCore/IAbpEfCoreDbContext.cs` | Marker interface inherited by `AbpDbContext<TDbContext>`. |
+| `Volo/Abp/EntityFrameworkCore/IEfCoreDbContext.cs` | Public contract the repository depends on (`SaveChangesAsync`, `Set<T>()`, `Database`, etc.). |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextOptions.cs` | Holds default and per-`TDbContext` `PreConfigure` / `Configure` actions plus the multi-tenant DbContext replacement map. |
+| `Volo/Abp/EntityFrameworkCore/AbpEntityFrameworkCoreModule.cs` | DependsOn `AbpDddDomainModule`; registers `UnitOfWorkDbContextProvider<>`, outbox/inbox providers and the default `LazyLoadOnDisposedContext` warning suppression. |
+| `Volo/Abp/EntityFrameworkCore/AbpEfCoreDbContextInitializationContext.cs` | Passed into `AbpDbContext.Initialize` from `UnitOfWorkDbContextProvider`. |
+| `Volo/Abp/EntityFrameworkCore/DbContextHelper.cs` | Builds the runtime DbContext using `DbContextOptionsFactory`. |
+| `Volo/Abp/EntityFrameworkCore/EfCoreDatabaseProvider.cs` | Enum used by extensions: `SqlServer`, `PostgreSql`, `MySql`, `Oracle`, `Sqlite`, `InMemory`, `Firebird`, `Cosmos`. |
+| `Volo/Abp/EntityFrameworkCore/QueryFilterExpressionHelper.cs` | Combines `ISoftDelete` and `IMultiTenant` filter expressions into a single `Expression<Func<TEntity, bool>>`. |
+| `Volo/Abp/EntityFrameworkCore/DependencyInjection/AbpDbContextRegistrationOptions.cs` | Per-entity options bag built by `AddAbpDbContext<TDbContext>`. Inherits from `AbpCommonDbContextRegistrationOptions`. |
+| `Volo/Abp/EntityFrameworkCore/DependencyInjection/AbpDbContextConfigurationContext.cs` | Carries the `DbContextOptionsBuilder`, connection string and existing `DbConnection` to provider extensions. |
+| `Volo/Abp/EntityFrameworkCore/DependencyInjection/DbContextOptionsFactory.cs` | Resolves connection string at runtime, runs `PreConfigure`/`Configure` actions, returns `DbContextOptions<TDbContext>`. |
+| `Volo/Abp/EntityFrameworkCore/DependencyInjection/EfCoreRepositoryRegistrar.cs` | Iterates the DbContext entity types and registers default repositories. |
+| `Volo/Abp/EntityFrameworkCore/DependencyInjection/AbpEntityOptions.cs` | Per-entity options including `DefaultWithDetailsFunc`. |
+| `Volo/Abp/Uow/EntityFrameworkCore/UnitOfWorkDbContextProvider.cs` | `IDbContextProvider<TDbContext>` implementation that ties DbContext lifetime to the ambient `IUnitOfWork`. |
+| `Volo/Abp/Uow/EntityFrameworkCore/EfCoreDatabaseApi.cs` | Stores the DbContext inside the UoW database-api dictionary. |
+| `Volo/Abp/Uow/EntityFrameworkCore/EfCoreTransactionApi.cs` | Wraps `IDbContextTransaction` so `IUnitOfWork.CompleteAsync` can commit. |
+| `Volo/Abp/Domain/Repositories/EntityFrameworkCore/IEfCoreRepository.cs` | Provider-specific repository contract (`GetDbContextAsync`, `GetDbSetAsync`). |
+| `Volo/Abp/Domain/Repositories/EntityFrameworkCore/EfCoreRepository.cs` | Default repository implementation backed by `IDbContextProvider<TDbContext>`. |
+| `Volo/Abp/Domain/Repositories/EntityFrameworkCore/IEfCoreBulkOperationProvider.cs` | Optional hook that third-party packages (e.g. EFCore.BulkExtensions) plug into for `InsertManyAsync`/`UpdateManyAsync`/`DeleteManyAsync`. |
+| `Volo/Abp/EntityFrameworkCore/Modeling/*` (`AbpEntityTypeBuilderExtensions`, `HasAbpQueryFilter`) | Convention helpers used by `ConfigureByConvention` and global-filter wiring. |
+| `Volo/Abp/EntityFrameworkCore/ValueConverters/AbpDateTimeValueConverter.cs` | Normalises `DateTime` to UTC / configured `IClock` kind on read and write. |
+| `Volo/Abp/EntityFrameworkCore/DistributedEvents/{Db,EventOutbox,EventInbox}*.cs` | Outbox / inbox persistence used by distributed event bus integrations. |
+| `Microsoft/EntityFrameworkCore/AbpModelBuilderExtensions.cs` | `SetDatabaseProvider`, `ConfigureByConvention`, base-property configuration helpers. |
+| `Microsoft/Extensions/DependencyInjection/AbpEfCoreServiceCollectionExtensions.cs` | The public `AddAbpDbContext<TDbContext>` entry point. |
+
+## AbpDbContext: the abstract base class
+
+Every ABP DbContext inherits from `AbpDbContext<TDbContext>` (`Volo/Abp/EntityFrameworkCore/AbpDbContext.cs`). The class is declared as:
+
+```csharp
+public abstract class AbpDbContext<TDbContext> : DbContext, IAbpEfCoreDbContext, ITransientDependency
+    where TDbContext : DbContext
+{
+    protected AbpDbContext(DbContextOptions<TDbContext> options) : base(options) { }
+}
+```
+
+Two properties on the class drive everything downstream:
+
+* `IAbpLazyServiceProvider LazyServiceProvider { get; set; }` — property-injected by ABP DI. Used as the entry point for every framework collaborator (`ICurrentTenant`, `IDataFilter`, `IAuditPropertySetter`, `IGuidGenerator`, `IClock`, `IUnitOfWorkManager`, `IDistributedEventBus`, `ILocalEventBus`, `IEntityChangeEventHelper`, `IEntityHistoryHelper`, `ILogger<AbpDbContext<TDbContext>>`).
+* `protected virtual Guid? CurrentTenantId => CurrentTenant?.Id;` — read by the multi-tenant global filter expression.
+
+`IsSoftDeleteFilterEnabled` and `IsMultiTenantFilterEnabled` are computed on each access from `DataFilter`:
+
+```csharp
+protected virtual bool IsSoftDeleteFilterEnabled => DataFilter?.IsEnabled<ISoftDelete>() ?? false;
+protected virtual bool IsMultiTenantFilterEnabled => DataFilter?.IsEnabled<IMultiTenant>() ?? false;
+```
+
+Both are *captured by closure* inside the per-entity filter expression. Because the closures call into the property each time the filter is evaluated, changing `IDataFilter.Disable<ISoftDelete>()` for a scope immediately affects new queries on the same DbContext.
+
+### OnModelCreating: per-entity reflection loop
+
+`OnModelCreating` reflectively invokes three generic methods over every entity type in the model:
+
+```csharp
+foreach (var entityType in modelBuilder.Model.GetEntityTypes())
+{
+    ConfigureBasePropertiesMethodInfo.MakeGenericMethod(entityType.ClrType)
+        .Invoke(this, new object[] { modelBuilder, entityType });
+
+    ConfigureValueConverterMethodInfo.MakeGenericMethod(entityType.ClrType)
+        .Invoke(this, new object[] { modelBuilder, entityType });
+
+    ConfigureValueGeneratedMethodInfo.MakeGenericMethod(entityType.ClrType)
+        .Invoke(this, new object[] { modelBuilder, entityType });
+}
+```
+
+The three methods do:
+
+* `ConfigureBaseProperties<TEntity>` skips owned/non-entity types, calls `modelBuilder.Entity<TEntity>().ConfigureByConvention()` (configures concurrency stamp, extra-properties JSON, audit/deletion columns, multi-tenant `TenantId` column) and then delegates to `ConfigureGlobalFilters<TEntity>` to attach `IsDeleted`/`TenantId` filters.
+* `ConfigureValueConverter<TEntity>` looks for every `DateTime`/`DateTime?` property without `[DisableDateTimeNormalization]` and applies `AbpDateTimeValueConverter`/`AbpNullableDateTimeValueConverter` so persisted timestamps follow `IClock.Kind` (UTC by default).
+* `ConfigureValueGenerated<TEntity>` is the small but important fix that forces `ValueGeneratedNever()` on every `IEntity<Guid>.Id` that does not carry an explicit `[DatabaseGenerated]` attribute. Without this, EF Core 7 would treat `Guid` keys as `ValueGeneratedOnAdd` on SQL Server, defeating ABP's `IGuidGenerator`.
+
+Before the loop runs, `TrySetDatabaseProvider(modelBuilder)` translates the EF provider name (`Microsoft.EntityFrameworkCore.SqlServer`, `Npgsql.EntityFrameworkCore.PostgreSQL`, `Pomelo.EntityFrameworkCore.MySql`, `Oracle.EntityFrameworkCore`, `Devart.Data.Oracle.Entity.EFCore`, `Microsoft.EntityFrameworkCore.Sqlite`, `Microsoft.EntityFrameworkCore.InMemory`, `FirebirdSql.EntityFrameworkCore.Firebird`, `Microsoft.EntityFrameworkCore.Cosmos`) into the `EfCoreDatabaseProvider` enum and stores it on the model so convention helpers can branch on it.
+
+### ConfigureGlobalFilters: how `ISoftDelete` and `IMultiTenant` are wired
+
+For each root entity, `ConfigureGlobalFilters<TEntity>` checks `ShouldFilterEntity<TEntity>`:
+
+```csharp
+protected virtual bool ShouldFilterEntity<TEntity>(IMutableEntityType entityType) where TEntity : class
+{
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity))) return true;
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity))) return true;
+    return false;
+}
+```
+
+If true, it calls `CreateFilterExpression<TEntity>()`:
+
+```csharp
+protected virtual Expression<Func<TEntity, bool>> CreateFilterExpression<TEntity>()
+    where TEntity : class
+{
+    Expression<Func<TEntity, bool>> expression = null;
+
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity)))
+    {
+        expression = e => !IsSoftDeleteFilterEnabled || !EF.Property<bool>(e, "IsDeleted");
+    }
+
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity)))
+    {
+        Expression<Func<TEntity, bool>> multiTenantFilter =
+            e => !IsMultiTenantFilterEnabled || EF.Property<Guid>(e, "TenantId") == CurrentTenantId;
+        expression = expression == null
+            ? multiTenantFilter
+            : QueryFilterExpressionHelper.CombineExpressions(expression, multiTenantFilter);
+    }
+
+    return expression;
+}
+```
+
+`QueryFilterExpressionHelper.CombineExpressions` produces a single `expr1 && expr2` lambda so EF Core only sees one filter (you cannot stack two `HasQueryFilter` calls in EF Core 7 — the second one silently overrides the first). The combined expression is then attached via `modelBuilder.Entity<TEntity>().HasAbpQueryFilter(filterExpression)`.
+
+Two important consequences:
+
+* Disabling the filter at runtime through `IDataFilter.Disable<ISoftDelete>()` flips the boolean inside the closure on the next query, so soft-deleted rows resurface without re-creating the DbContext.
+* `EF.Property<Guid>(e, "TenantId")` is used so the filter compiles even for entities whose CLR property is `Guid?` — the shadow column `TenantId` is configured by `ConfigureByConvention()`.
+
+### SaveChangesAsync: the full pipeline
+
+The override does five things in order:
+
+```csharp
+public override async Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+{
+    try
+    {
+        var auditLog = AuditingManager?.Current?.Log;
+        List<EntityChangeInfo> entityChangeList = null;
+        if (auditLog != null)
+        {
+            entityChangeList = EntityHistoryHelper.CreateChangeList(ChangeTracker.Entries().ToList());
+        }
+
+        HandlePropertiesBeforeSave();
+
+        var eventReport = CreateEventReport();
+
+        var result = await base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+
+        PublishEntityEvents(eventReport);
+
+        if (entityChangeList != null)
+        {
+            EntityHistoryHelper.UpdateChangeList(entityChangeList);
+            auditLog.EntityChanges.AddRange(entityChangeList);
+            Logger.LogDebug($"Added {entityChangeList.Count} entity changes to the current audit log");
+        }
+
+        return result;
+    }
+    catch (DbUpdateConcurrencyException ex)
+    {
+        // ... build diagnostic message, then ...
+        throw new AbpDbConcurrencyException(ex.Message, ex);
+    }
+    finally
+    {
+        ChangeTracker.AutoDetectChangesEnabled = true;
+    }
+}
+```
+
+Step by step:
+
+1. **Snapshot the audit log.** If the `IAuditingManager` has a `Current` log scope, `EntityHistoryHelper.CreateChangeList(...)` captures original values for every tracked entry so the diff can be appended after the database round-trip. The `IEntityHistoryHelper` defaults to `NullEntityHistoryHelper.Instance` when the auditing module is not enabled.
+2. **`HandlePropertiesBeforeSave()`** walks `ChangeTracker.Entries()` and, for each entry, copies extra-property values from the `IHasExtraProperties` bag into mapped EF columns (`HandleExtraPropertiesOnSave`) and rotates the concurrency stamp (`UpdateConcurrencyStamp`) when the entry state is `Modified` or `Deleted`.
+3. **`CreateEventReport()`** drains every `IGeneratesDomainEvents` entity: it copies local and distributed events into an `EntityEventReport` then calls `ClearLocalEvents()` / `ClearDistributedEvents()` on the entity so the same domain event never fires twice.
+4. **`base.SaveChangesAsync(...)`** executes the actual INSERT/UPDATE/DELETE SQL. If it throws `DbUpdateConcurrencyException`, the catch rethrows as `AbpDbConcurrencyException` after logging the offending entries.
+5. **`PublishEntityEvents(eventReport)`** queues both local and distributed events on the current `IUnitOfWork` via `AddOrReplaceLocalEvent` / `AddOrReplaceDistributedEvent`. The events are *not* fired here — they are fired later, when `IUnitOfWork.CompleteAsync()` runs after the transaction commits (or never, if the UoW rolls back).
+6. The `finally` block restores `ChangeTracker.AutoDetectChangesEnabled = true` in case a derived class disabled it for performance during the save.
+
+`SaveChangesOnDbContextAsync(...)` is a public escape hatch that calls `base.SaveChangesAsync` directly without applying any ABP concept handler. Use it sparingly for raw maintenance scripts.
+
+### Change-tracker triggers
+
+`Initialize(...)` (called by `UnitOfWorkDbContextProvider` immediately after the DbContext is materialised) hooks into two EF Core events:
+
+```csharp
+ChangeTracker.CascadeDeleteTiming = CascadeTiming.OnSaveChanges;
+ChangeTracker.Tracked += ChangeTracker_Tracked;
+ChangeTracker.StateChanged += ChangeTracker_StateChanged;
+```
+
+* `ChangeTracker_Tracked` runs whenever the change tracker first sees an entity (queried-from-database **or** `AddAsync`-ed). It calls `FillExtraPropertiesForTrackedEntities` to hoist EF-mapped extra-property fields into the `IHasExtraProperties.ExtraProperties` dictionary (only `FromQuery == true` entries, so freshly added entities are not touched) and then `PublishEventsForTrackedEntity`.
+* `ChangeTracker_StateChanged` runs whenever an attached entity transitions between `Unchanged → Modified`, `Modified → Deleted`, etc. It re-invokes `PublishEventsForTrackedEntity`.
+
+`PublishEventsForTrackedEntity(entry)` is the single switchboard that decides what ABP concept handler to run depending on `EntityState`:
+
+```csharp
+switch (entry.State)
+{
+    case EntityState.Added:
+        ApplyAbpConceptsForAddedEntity(entry);           // CheckAndSetId, SetConcurrencyStamp, SetCreationAuditProperties
+        EntityChangeEventHelper.PublishEntityCreatedEvent(entry.Entity);
+        break;
+    case EntityState.Modified:
+        ApplyAbpConceptsForModifiedEntity(entry);        // IncrementEntityVersion, SetModificationAuditProperties (and SetDeletion when soft-deleting)
+        if (entry.Properties.Any(x => x.IsModified && x.Metadata.ValueGenerated == ValueGenerated.Never))
+        {
+            if (entry.Entity is ISoftDelete && entry.Entity.As<ISoftDelete>().IsDeleted)
+                EntityChangeEventHelper.PublishEntityDeletedEvent(entry.Entity);
+            else
+                EntityChangeEventHelper.PublishEntityUpdatedEvent(entry.Entity);
+        }
+        break;
+    case EntityState.Deleted:
+        ApplyAbpConceptsForDeletedEntity(entry);         // converts a hard delete into a soft delete when applicable
+        EntityChangeEventHelper.PublishEntityDeletedEvent(entry.Entity);
+        break;
+}
+```
+
+Notes:
+
+* `ApplyAbpConceptsForAddedEntity` runs `CheckAndSetId` which calls `EntityHelper.TrySetId(entity, () => GuidGenerator.Create(), true)` only when the `Id` property is *not* marked `[DatabaseGenerated]` and is still the default `Guid.Empty`. This is how ABP avoids the SQL Server "INSERT into IDENTITY column" trap while still allowing developers to opt in to database-generated keys.
+* `ApplyAbpConceptsForModifiedEntity` only sets modification audit properties when at least one property with `ValueGenerated.Never` or `ValueGenerated.OnAdd` is modified, so EF's "shadow concurrency tokens" do not trigger spurious `LastModificationTime` updates.
+* `ApplyAbpConceptsForDeletedEntity` first checks `IsHardDeleted(entry)` (looks up the entity in `UnitOfWorkManager.Current.Items[UnitOfWorkItemNames.HardDeletedEntities]`). If the entity is not in that set, it calls `entry.Reload()` to throw away any in-memory edits, sets `IsDeleted = true` via `ObjectHelper.TrySetProperty`, and sets the deletion audit properties. The entity is *not* deleted from the database — EF's `Modified` state is the natural result of `entry.Reload()` + `IsDeleted = true`.
+
+### Domain-event collection (`AddDomainEvents` queue)
+
+`CreateEventReport()` is the moment at which entity-bound domain events become unit-of-work events:
+
+```csharp
+foreach (var entry in ChangeTracker.Entries().ToList())
+{
+    var generatesDomainEventsEntity = entry.Entity as IGeneratesDomainEvents;
+    if (generatesDomainEventsEntity == null) continue;
+
+    var localEvents = generatesDomainEventsEntity.GetLocalEvents()?.ToArray();
+    if (localEvents != null && localEvents.Any())
+    {
+        eventReport.DomainEvents.AddRange(localEvents.Select(e =>
+            new DomainEventEntry(entry.Entity, e.EventData, e.EventOrder)));
+        generatesDomainEventsEntity.ClearLocalEvents();
+    }
+
+    var distributedEvents = generatesDomainEventsEntity.GetDistributedEvents()?.ToArray();
+    if (distributedEvents != null && distributedEvents.Any())
+    {
+        eventReport.DistributedEvents.AddRange(distributedEvents.Select(e =>
+            new DomainEventEntry(entry.Entity, e.EventData, e.EventOrder)));
+        generatesDomainEventsEntity.ClearDistributedEvents();
+    }
+}
+```
+
+`PublishEntityEvents` then forwards each entry to the unit of work:
+
+```csharp
+foreach (var localEvent in changeReport.DomainEvents)
+{
+    UnitOfWorkManager.Current?.AddOrReplaceLocalEvent(
+        new UnitOfWorkEventRecord(localEvent.EventData.GetType(), localEvent.EventData, localEvent.EventOrder));
+}
+
+foreach (var distributedEvent in changeReport.DistributedEvents)
+{
+    UnitOfWorkManager.Current?.AddOrReplaceDistributedEvent(
+        new UnitOfWorkEventRecord(distributedEvent.EventData.GetType(), distributedEvent.EventData, distributedEvent.EventOrder));
+}
+```
+
+Because `AddOrReplace*` is used (not `Add`), an aggregate that publishes the same `EventData` instance twice in the same UoW is only fired once at commit-time. The events are then sorted by `EventOrder` before they are pumped to the local/distributed bus inside `IUnitOfWork.CompleteAsync`.
+
+### Interceptors and event triggers in summary
+
+ABP does not register custom EF Core `IInterceptor`s; the framework hooks happen via:
+
+| Hook | Trigger | Code path |
+| --- | --- | --- |
+| `ChangeTracker.Tracked` | First time EF sees an entity | `ChangeTracker_Tracked` → `FillExtraPropertiesForTrackedEntities`, `PublishEventsForTrackedEntity` |
+| `ChangeTracker.StateChanged` | Tracked entity transitions | `ChangeTracker_StateChanged` → `PublishEventsForTrackedEntity` |
+| `SaveChangesAsync` override | Final flush | `HandlePropertiesBeforeSave` → `CreateEventReport` → `base.SaveChangesAsync` → `PublishEntityEvents` |
+| `ConfigureWarnings` | DbContext build | `AbpEntityFrameworkCoreModule` configures `warnings.Ignore(CoreEventId.LazyLoadOnDisposedContextWarning)` |
+| Cascade timing | DbContext init | `ChangeTracker.CascadeDeleteTiming = CascadeTiming.OnSaveChanges` |
+| Transaction behaviour | DbContext init | `Database.AutoTransactionBehavior = AutoTransactionBehavior.Never` when `AlwaysDisableTransactionsUnitOfWorkManager` is in use (typical in HTTP middleware that doesn't span transactions). |
+
+## EfCoreRepository<TDbContext, TEntity, TKey>
+
+`Volo/Abp/Domain/Repositories/EntityFrameworkCore/EfCoreRepository.cs` declares two repository classes. The non-keyed base:
+
+```csharp
+public class EfCoreRepository<TDbContext, TEntity> : RepositoryBase<TEntity>, IEfCoreRepository<TEntity>
+    where TDbContext : IEfCoreDbContext
+    where TEntity : class, IEntity
+{
+    public EfCoreRepository(IDbContextProvider<TDbContext> dbContextProvider) { ... }
+}
+```
+
+…and the keyed derivation:
+
+```csharp
+public class EfCoreRepository<TDbContext, TEntity, TKey>
+    : EfCoreRepository<TDbContext, TEntity>, IEfCoreRepository<TEntity, TKey>, ISupportsExplicitLoading<TEntity, TKey>
+    where TDbContext : IEfCoreDbContext
+    where TEntity : class, IEntity<TKey>
+```
+
+### DbContext access — async by default
+
+Two methods sit at the centre of every repository operation:
+
+```csharp
+protected virtual Task<TDbContext> GetDbContextAsync()
+{
+    if (!EntityHelper.IsMultiTenant<TEntity>())
+    {
+        using (CurrentTenant.Change(null))
+        {
+            return _dbContextProvider.GetDbContextAsync();
+        }
+    }
+    return _dbContextProvider.GetDbContextAsync();
+}
+
+protected async Task<DbSet<TEntity>> GetDbSetAsync()
+    => (await GetDbContextAsync()).Set<TEntity>();
+```
+
+The crucial detail is `EntityHelper.IsMultiTenant<TEntity>()`. For entities that do **not** implement `IMultiTenant`, the repository explicitly switches to the host tenant (`CurrentTenant.Change(null)`) before asking the provider for a DbContext. Otherwise the per-tenant connection-string resolver would route requests for shared (host-only) tables — settings, features, audit logs — through the tenant's database, which usually does not contain those tables.
+
+Two more accessors expose the underlying `DbConnection` and ambient `DbTransaction` for repositories that need raw ADO.NET, used by the Dapper integration covered on a separate page:
+
+```csharp
+protected async Task<IDbConnection> GetDbConnectionAsync()
+    => (await GetDbContextAsync()).Database.GetDbConnection();
+
+protected async Task<IDbTransaction> GetDbTransactionAsync()
+    => (await GetDbContextAsync()).Database.CurrentTransaction?.GetDbTransaction();
+```
+
+### Insert / update / delete
+
+`InsertAsync` is the simplest override:
+
+```csharp
+public async override Task<TEntity> InsertAsync(TEntity entity, bool autoSave = false, CancellationToken cancellationToken = default)
+{
+    CheckAndSetId(entity);
+
+    var dbContext = await GetDbContextAsync();
+    var savedEntity = (await dbContext.Set<TEntity>().AddAsync(entity, GetCancellationToken(cancellationToken))).Entity;
+
+    if (autoSave)
+        await dbContext.SaveChangesAsync(GetCancellationToken(cancellationToken));
+
+    return savedEntity;
+}
+```
+
+* `CheckAndSetId(entity)` mirrors what `AbpDbContext.CheckAndSetId` does on the DbContext side, but it runs *before* `AddAsync`, so the GUID is available to whoever inspects the entity between `InsertAsync` and the eventual `CompleteAsync`.
+* `autoSave: false` (the default) defers the flush until the unit of work commits. Setting `autoSave: true` flushes immediately so subsequent reads inside the same UoW see the row — handy for tests and integration jobs.
+
+`UpdateAsync` calls `dbContext.Attach(entity)` followed by `dbContext.Update(entity)`. EF Core will mark every property as `Modified`, which is intentional: ABP repositories are stateless and the caller is responsible for providing a fully-hydrated aggregate root.
+
+`InsertManyAsync`/`UpdateManyAsync`/`DeleteManyAsync` all delegate to the optional `IEfCoreBulkOperationProvider`:
+
+```csharp
+if (BulkOperationProvider != null)
+{
+    await BulkOperationProvider.InsertManyAsync<TDbContext, TEntity>(this, entityArray, autoSave, cancellationToken);
+    return;
+}
+```
+
+When the bulk provider is missing (which is the default — there is no out-of-the-box implementation), the repository falls back to `dbContext.Set<TEntity>().AddRangeAsync`. Packages such as `EFCore.BulkExtensions` ship third-party `IEfCoreBulkOperationProvider`s.
+
+### Bulk hard-delete via EF Core 7 `ExecuteDeleteAsync`
+
+`DeleteDirectAsync` uses EF Core 7's bulk delete:
+
+```csharp
+public override async Task DeleteDirectAsync(Expression<Func<TEntity, bool>> predicate, CancellationToken cancellationToken = default)
+{
+    var dbContext = await GetDbContextAsync();
+    var dbSet = dbContext.Set<TEntity>();
+    await dbSet.Where(predicate).ExecuteDeleteAsync(GetCancellationToken(cancellationToken));
+}
+```
+
+`ExecuteDeleteAsync` bypasses the change tracker entirely, so **no soft-delete conversion, no audit-property setting, no entity-deleted event fires.** This is the intended escape hatch for purge scripts. The regular `DeleteAsync` overloads materialise entities first and route them through `DeleteManyAsync` so ABP concepts still apply.
+
+### `WithDetailsAsync` and `AbpEntityOptions`
+
+`WithDetailsAsync()` (no arguments) delegates to `AbpEntityOptions<TEntity>.DefaultWithDetailsFunc`, which is set via `AddAbpDbContext<TDbContext>` (see below). The keyed overload `WithDetailsAsync(params Expression<Func<TEntity, object>>[] propertySelectors)` simply calls `query.Include(selector)` for each selector.
+
+`AbpEntityOptions<TEntity>` is resolved lazily from `IOptions<AbpEntityOptions>` — one bag per entity, shared between all repositories that close over that type.
+
+## AbpDbContextOptions: PreConfigure and Configure
+
+`AbpDbContextOptions` is the options bag every provider extension method (`UseSqlServer`, `UseNpgsql`, `UseMySQL`, `UseSqlite`, `UseOracle`) writes into. The class exposes four configuration APIs:
+
+```csharp
+public void PreConfigure([NotNull] Action<AbpDbContextConfigurationContext> action);
+public void PreConfigure<TDbContext>([NotNull] Action<AbpDbContextConfigurationContext<TDbContext>> action)
+    where TDbContext : AbpDbContext<TDbContext>;
+public void Configure([NotNull] Action<AbpDbContextConfigurationContext> action);
+public void Configure<TDbContext>([NotNull] Action<AbpDbContextConfigurationContext<TDbContext>> action)
+    where TDbContext : AbpDbContext<TDbContext>;
+```
+
+Semantics:
+
+* `PreConfigure(...)` actions run *before* the matching `Configure(...)` action. They are typically used by infrastructure code that wants to opt into provider-agnostic options (logging, command timeouts, warning suppression).
+* `Configure(...)` is where the provider is selected. Only **one** default `Configure` action survives — assigning a new one overwrites the previous (`DefaultConfigureAction { get; set; }`). Per-`TDbContext` configures live in a dictionary and override the default.
+* The non-generic forms apply to every DbContext registered in the app. The generic forms apply only to the specified DbContext type.
+
+`AbpEntityFrameworkCoreModule` itself uses `PreConfigure` to silence the lazy-loading-on-disposed-context warning:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpDbContextOptions>(options =>
+    {
+        options.PreConfigure(abpDbContextConfigurationContext =>
+        {
+            abpDbContextConfigurationContext.DbContextOptions
+                .ConfigureWarnings(warnings => warnings.Ignore(CoreEventId.LazyLoadOnDisposedContextWarning));
+        });
+    });
+
+    context.Services.TryAddTransient(typeof(IDbContextProvider<>), typeof(UnitOfWorkDbContextProvider<>));
+    context.Services.AddTransient(typeof(IDbContextEventOutbox<>), typeof(DbContextEventOutbox<>));
+    context.Services.AddTransient(typeof(IDbContextEventInbox<>), typeof(DbContextEventInbox<>));
+}
+```
+
+A typical application then writes:
+
+```csharp
+Configure<AbpDbContextOptions>(options =>
+{
+    options.UseSqlServer();                          // default for every DbContext
+    options.Configure<MyTenantDbContext>(ctx =>      // override just for tenant data
+    {
+        ctx.UseNpgsql();
+    });
+});
+```
+
+### `AbpDbContextConfigurationContext`
+
+Passed into every `Configure` / `PreConfigure` action, this context carries:
+
+```csharp
+public class AbpDbContextConfigurationContext : IServiceProviderAccessor
+{
+    public IServiceProvider ServiceProvider { get; }
+    public string ConnectionString { get; }
+    public string ConnectionStringName { get; }
+    public DbConnection ExistingConnection { get; }
+    public DbContextOptionsBuilder DbContextOptions { get; protected set; }
+}
+```
+
+`ExistingConnection` is non-null when the caller is sharing a `DbConnection` across multiple DbContexts (for example in `WebApplicationFactory<T>` integration tests). All built-in provider extensions branch on it:
+
+```csharp
+if (context.ExistingConnection != null)
+    return context.DbContextOptions.UseSqlServer(context.ExistingConnection, ...);
+else
+    return context.DbContextOptions.UseSqlServer(context.ConnectionString, ...);
+```
+
+Each provider also sets `optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery)` by default to dodge the well-known cartesian-explosion problem when projecting collections.
+
+## AbpDbContextRegistrationOptions: AddAbpDbContext entry point
+
+The entry point most projects know is `services.AddAbpDbContext<TDbContext>(...)` (`Microsoft/Extensions/DependencyInjection/AbpEfCoreServiceCollectionExtensions.cs`):
+
+```csharp
+public static IServiceCollection AddAbpDbContext<TDbContext>(
+    this IServiceCollection services,
+    Action<IAbpDbContextRegistrationOptionsBuilder> optionsBuilder = null)
+    where TDbContext : AbpDbContext<TDbContext>
+{
+    services.AddMemoryCache();
+    var options = new AbpDbContextRegistrationOptions(typeof(TDbContext), services);
+
+    // Apply [ReplaceDbContext] attributes on the type
+    var replacedMultiTenantDbContextTypes = typeof(TDbContext)
+        .GetCustomAttributes<ReplaceDbContextAttribute>(true)
+        .SelectMany(x => x.ReplacedDbContextTypes).ToList();
+
+    foreach (var dbContextType in replacedMultiTenantDbContextTypes)
+        options.ReplaceDbContext(dbContextType.Type, multiTenancySides: dbContextType.MultiTenancySide);
+
+    optionsBuilder?.Invoke(options);
+
+    services.TryAddTransient(DbContextOptionsFactory.Create<TDbContext>);
+
+    foreach (var entry in options.ReplacedDbContextTypes)
+    {
+        // ... register transient factory that resolves the replacement at runtime ...
+        services.Configure<AbpDbContextOptions>(opts =>
+        {
+            var multiTenantDbContextType = new MultiTenantDbContextType(entry.Key.Type, entry.Key.MultiTenancySide);
+            opts.DbContextReplacements[multiTenantDbContextType] = entry.Value ?? typeof(TDbContext);
+        });
+    }
+
+    new EfCoreRepositoryRegistrar(options).AddRepositories();
+    return services;
+}
+```
+
+### The builder API
+
+`AbpDbContextRegistrationOptions` (which inherits from `AbpCommonDbContextRegistrationOptions` so MongoDB and MemoryDB can share the same surface) exposes:
+
+| Method | Purpose |
+| --- | --- |
+| `AddDefaultRepositories(bool includeAllEntities = false)` | Scans the DbContext for `DbSet<>` properties and registers `EfCoreRepository<TDbContext, TEntity, TKey>` for each. When `includeAllEntities` is true, also includes types reachable via model traversal that are not exposed as `DbSet`. |
+| `AddDefaultRepositories<TDefaultRepositoryDbContext>(bool includeAllEntities = false)` | Same, but registers the repositories against the supplied DbContext interface (typically an `IModuleNameDbContext`) so other modules can resolve `IRepository<Entity>` without depending on the concrete DbContext class. |
+| `AddDefaultRepository<TEntity>()` | Forces a default-repository registration for a specific entity even when `includeAllEntities = false`. |
+| `AddRepository<TEntity, TRepository>()` | Registers a *custom* repository implementation. Both `TRepository` and its base contracts are registered against `IReadOnlyRepository<TEntity>`, `IRepository<TEntity>`, `IRepository<TEntity, TKey>` so calling code can inject any of them. |
+| `Entity<TEntity>(Action<AbpEntityOptions<TEntity>> optionsAction)` | Configures per-entity options. The most useful field is `DefaultWithDetailsFunc` (see below). |
+| `ReplaceDbContext(...)` | Replaces a base DbContext interface (declared by a depended-on module) with this concrete DbContext, optionally split by `MultiTenancySides.Host` / `MultiTenancySides.Tenant`. |
+| `SetDefaultRepositoryClasses(repositoryImplementationType, repositoryImplementationTypeWithoutKey)` | Lets a downstream package swap in its own subclass of `EfCoreRepository<>` as the default for every entity in the DbContext. |
+
+### Configuring per-entity `DefaultWithDetailsFunc`
+
+```csharp
+services.AddAbpDbContext<MyDbContext>(options =>
+{
+    options.AddDefaultRepositories(includeAllEntities: true);
+
+    options.Entity<Order>(e =>
+    {
+        e.DefaultWithDetailsFunc = q => q.Include(x => x.Lines).ThenInclude(l => l.Product);
+    });
+});
+```
+
+Whenever a consumer calls `await orderRepository.WithDetailsAsync()` (or `await orderRepository.GetAsync(id)` with the default `includeDetails: true`), the configured projector runs. This is the canonical way to keep eager-loading shape in the data layer rather than scattered across application services.
+
+### Replacing module DbContexts
+
+ABP's commercial modules (Identity, Tenant Management, Setting Management, etc.) declare interfaces like `IIdentityDbContext`. When you want all of those modules to share a single physical DbContext, you decorate your application DbContext:
+
+```csharp
+[ConnectionStringName("Default")]
+[ReplaceDbContext(typeof(IIdentityDbContext))]
+[ReplaceDbContext(typeof(ITenantManagementDbContext))]
+public class MyAppDbContext : AbpDbContext<MyAppDbContext>, IIdentityDbContext, ITenantManagementDbContext
+{
+    // DbSet<>s for both modules
+}
+```
+
+`AddAbpDbContext<MyAppDbContext>` reflects on the `ReplaceDbContextAttribute` instances and calls `options.ReplaceDbContext(...)` so the DI container will resolve `IIdentityDbContext` and `ITenantManagementDbContext` requests to the same `MyAppDbContext` instance. The replacement is multi-tenancy-aware: `[ReplaceDbContext(typeof(ITenantDbContext), MultiTenancySide = MultiTenancySides.Tenant)]` would only kick in inside a tenant scope.
+
+## UnitOfWorkDbContextProvider: when is the DbContext created?
+
+`UnitOfWorkDbContextProvider<TDbContext>` (registered via `TryAddTransient(typeof(IDbContextProvider<>), typeof(UnitOfWorkDbContextProvider<>))` in the module's `ConfigureServices`) is the only public way to obtain a DbContext from a repository:
+
+```csharp
+var unitOfWork = UnitOfWorkManager.Current;
+if (unitOfWork == null)
+    throw new AbpException("A DbContext can only be created inside a unit of work!");
+
+var targetDbContextType = EfCoreDbContextTypeProvider.GetDbContextType(typeof(TDbContext));
+var connectionStringName = ConnectionStringNameAttribute.GetConnStringName(targetDbContextType);
+var connectionString = await ResolveConnectionStringAsync(connectionStringName);
+var dbContextKey = $"{targetDbContextType.FullName}_{connectionString}";
+
+var databaseApi = unitOfWork.GetOrAddDatabaseApi(
+    dbContextKey,
+    () => new EfCoreDatabaseApi(CreateDbContext(unitOfWork, connectionStringName, connectionString)));
+
+return (TDbContext)((EfCoreDatabaseApi)databaseApi).DbContext;
+```
+
+Key takeaways:
+
+* The DbContext is *per-UoW, per-connection-string, per-replaced-type*. Two repositories that target the same DbContext type and resolve to the same connection string share one DbContext instance — meaning they also share one change tracker — even across application service boundaries.
+* `ConnectionStringNameAttribute` on the DbContext drives the connection-string lookup. The default name is `"Default"`. Modules use specific names (`AbpAuditLogging`, `AbpIdentity`, etc.) so administrators can split databases.
+* Replacements are resolved through `IEfCoreDbContextTypeProvider` which consults `AbpDbContextOptions.DbContextReplacements`.
+
+After the DbContext is materialised, the provider calls `dbContext.Initialize(new AbpEfCoreDbContextInitializationContext(unitOfWork))` which wires up the change-tracker handlers, applies the `IUnitOfWorkOptions.Timeout` value via `Database.SetCommandTimeout`, and toggles `AutoTransactionBehavior` based on the UoW manager.
+
+## Migration scaffolding: the `DbMigrator` template
+
+The startup templates ship a console worker `*.DbMigrator` that hosts the same modules as the web project but with `MigrateAsync` workflows. The shape is:
+
+1. The console host loads the application module which transitively depends on `AbpEntityFrameworkCoreSqlServerModule` (or the chosen provider module). All standard `AbpDbContextOptions` configurations are reused.
+2. A class implementing `IDataSeedContributor` runs initial data seeding for the host tenant (admin user, default roles, default permissions).
+3. The migrator iterates every active tenant resolved through `ITenantRepository.GetListAsync()`, swaps `CurrentTenant` for each tenant via `using (CurrentTenant.Change(tenantId))`, asks each registered DbContext for its `Database.MigrateAsync()` and reruns the data seeder.
+4. The DbContext used for migrations carries `[ConnectionStringName("Default")]`. The connection-string resolver looks up the tenant's override before falling back to the host string, so per-tenant databases get migrated transparently.
+
+EF Core CLI commands (`dotnet ef migrations add`, `dotnet ef database update`) target the `*.EntityFrameworkCore` project. Because `AbpDbContext<TDbContext>` requires `IAbpLazyServiceProvider` to be populated, the project provides a design-time `IDbContextFactory<>` (often named `MyAppDbContextFactory`) that constructs the DbContext with a `null` lazy provider — sufficient for the migration scaffolder which only inspects the model and does not run `SaveChangesAsync`.
+
+## Common gotchas
+
+* **You cannot stack two `HasQueryFilter` calls.** ABP combines `ISoftDelete` and `IMultiTenant` into one expression for exactly this reason. If you add `entity.HasQueryFilter(x => …)` in a derived `OnModelCreating`, you will *replace* the combined ABP filter and lose both soft-delete and multi-tenant filtering. Use `entity.HasAbpQueryFilter(...)` (defined in `AbpEntityTypeBuilderExtensions`) which composes with the existing filter expression.
+* **Adding a `DbSet<>` is not enough to get a repository.** You must also call `options.AddDefaultRepositories(includeAllEntities: true)` (or `options.AddDefaultRepository<MyEntity>()`) inside `AddAbpDbContext<TDbContext>`. The repository registrar inspects the registration options, not the DbContext type.
+* **Lazy loading proxies need an extra `UseLazyLoadingProxies()` call.** Configure it inside `options.Configure<TDbContext>(ctx => ctx.DbContextOptions.UseLazyLoadingProxies())`. Be aware that ABP suppresses the `LazyLoadOnDisposedContextWarning` because the DbContext's lifetime is tied to the UoW, not the entity instance.
+* **`SaveChangesAsync` runs ABP concepts; `SaveChangesOnDbContextAsync` does not.** Reach for the second variant only when you explicitly need to bypass audit-property setting, soft-delete handling and domain-event collection.
+* **`DeleteDirectAsync` does not soft-delete.** It uses EF Core 7's `ExecuteDeleteAsync` which translates to a single `DELETE FROM ...` statement and skips the change tracker entirely. The same applies to `ExecuteUpdateAsync` if you compose it manually.
+* **Multi-tenancy unaware entities switch tenant scope inside the repository.** The repository calls `CurrentTenant.Change(null)` so host tables (settings, audit logs, etc.) resolve through the host connection string even when the request runs inside a tenant scope. If you bypass the repository and call the DbContext directly, you must wrap the call yourself.
+* **EF Core warnings.** The framework only suppresses `CoreEventId.LazyLoadOnDisposedContextWarning`. `RelationalEventId.MultipleCollectionIncludeWarning` is *not* suppressed; ABP forces `QuerySplittingBehavior.SplitQuery` instead so you do not need to.
+* **`Database.AutoTransactionBehavior = AutoTransactionBehavior.Never` is set for `AlwaysDisableTransactionsUnitOfWorkManager`.** This is the in-memory / SQLite test path. In real applications the default UoW manager opens an explicit transaction whose lifetime aligns with `IUnitOfWork.CompleteAsync`.
+* **`ChangeTracker.AutoDetectChangesEnabled` is reset in `finally`.** If you disabled it inside a custom handler, you must restore it yourself before `SaveChangesAsync` returns; otherwise the next request might bypass change detection.
+* **Avoid blocking on `GetDbContextAsync`.** The `DbContext`/`DbSet` synchronous getters are marked `[Obsolete]`. They log a `Warning` from `UnitOfWorkDbContextProvider` and dump the calling stack truncated to 2048 chars to help you find offenders.
+
+## Putting it together: a minimal module
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCoreSqlServerModule))]
+public class MyEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<MyDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+            options.Entity<Order>(e =>
+            {
+                e.DefaultWithDetailsFunc = q => q.Include(x => x.Lines);
+            });
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseSqlServer();
+        });
+    }
+}
+```
+
+`MyDbContext` is a sub-class of `AbpDbContext<MyDbContext>`. The `[ConnectionStringName("Default")]` attribute on the class (inherited from a base interface if you replace module DbContexts) controls which connection string the runtime resolves, and the configured `UseSqlServer()` extension wires `SqlServerDbContextOptionsBuilder` against it. Every application service that injects `IRepository<Order, Guid>` will get an `EfCoreRepository<MyDbContext, Order, Guid>` whose change tracker shares the active UoW.

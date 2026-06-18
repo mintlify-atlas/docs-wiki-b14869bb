@@ -1,0 +1,314 @@
+---
+title: "Volo.Abp.RemoteServices: remote-service configuration model"
+sidebarTitle: "Remote Services"
+description: "RemoteServiceConfiguration, RemoteServiceConfigurationDictionary, AbpRemoteServiceOptions — the contract every ABP HTTP client reads to find a back-end."
+---
+
+`Volo.Abp.RemoteServices` is the package that defines **where the
+back-end is**, in a way every flavour of ABP client agrees on: dynamic
+HTTP clients, generated TypeScript proxies, Blazor WebAssembly auth,
+and the application-configuration controller all read from the same
+`AbpRemoteServiceOptions` shape.
+
+It is intentionally tiny. The package is named after the configuration
+contract — not the dynamic proxy machinery, which lives in
+`Volo.Abp.Http.Client`. Think of it as the address book.
+
+<CardGroup cols={2}>
+  <Card title="Http Abstractions" icon="cube" href="/framework/aspnetcore/http-abstractions">
+    The module marker this one transitively sits above.
+  </Card>
+  <Card title="AspNetCore Mvc" icon="route" href="/framework/aspnetcore/aspnetcore-mvc">
+    Where `RemoteServiceAttribute.Name` becomes the lookup key.
+  </Card>
+</CardGroup>
+
+## File inventory
+
+```text framework/src/Volo.Abp.RemoteServices
+Volo/Abp/Http/Client/
+├── AbpRemoteServiceOptions.cs
+├── IRemoteServiceConfigurationProvider.cs
+├── RemoteServiceConfiguration.cs
+├── RemoteServiceConfigurationDictionary.cs
+├── RemoteServiceConfigurationProvider.cs
+└── RemoteServiceConfigurationProviderExtensions.cs
+Volo/Abp/RemoteServices/
+└── AbpRemoteServicesModule.cs
+```
+
+## The module
+
+```csharp framework/src/Volo.Abp.RemoteServices/Volo/Abp/RemoteServices/AbpRemoteServicesModule.cs
+public class AbpRemoteServicesModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpRemoteServiceOptions>(configuration);
+    }
+}
+```
+
+A single line of meaningful behaviour: bind the entire
+`IConfiguration` root to `AbpRemoteServiceOptions`. That means the
+JSON shape applications write in `appsettings.json` is exactly what
+shows up at run time:
+
+```json
+{
+  "RemoteServices": {
+    "Default": { "BaseUrl": "https://api.example.com" },
+    "Identity": { "BaseUrl": "https://identity.example.com", "Version": "v1" },
+    "AdminPortal": { "BaseUrl": "https://admin-api.example.com" }
+  }
+}
+```
+
+The configuration binder maps the `"RemoteServices"` section into
+`AbpRemoteServiceOptions.RemoteServices` (a
+`RemoteServiceConfigurationDictionary`).
+
+## Abstractions table
+
+| Type | Kind | Purpose |
+| ---- | ---- | ------- |
+| `AbpRemoteServicesModule` | `AbpModule` | Binds the `RemoteServices` configuration section. |
+| `AbpRemoteServiceOptions` | options | One property, `RemoteServices : RemoteServiceConfigurationDictionary`. |
+| `RemoteServiceConfigurationDictionary` | `Dictionary<string, RemoteServiceConfiguration?>` | Map of named back-ends with a `Default` fallback. |
+| `RemoteServiceConfiguration` | `Dictionary<string, string?>` | `BaseUrl`, `Version` and any extra string property a client wants to read. |
+| `IRemoteServiceConfigurationProvider` | abstraction | Async provider over the dictionary. |
+| `RemoteServiceConfigurationProvider` | default impl | Wraps `IOptions<AbpRemoteServiceOptions>`. |
+| `RemoteServiceConfigurationProviderExtensions` | sync helpers | `GetConfigurationOrDefault(name)` non-async. |
+
+## `RemoteServiceConfiguration`
+
+The configuration is a **string dictionary** with two named properties.
+This is intentional — it lets you carry arbitrary extra metadata
+(things like a `BasicAuth` username, or a custom `UserAgent`) without
+extending the framework type.
+
+```csharp framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfiguration.cs
+public class RemoteServiceConfiguration : Dictionary<string, string?>
+{
+    /// <summary>Base Url.</summary>
+    public string BaseUrl {
+        get => this.GetOrDefault(nameof(BaseUrl))!;
+        set => this[nameof(BaseUrl)] = value;
+    }
+
+    /// <summary>Version.</summary>
+    public string? Version {
+        get => this.GetOrDefault(nameof(Version));
+        set => this[nameof(Version)] = value;
+    }
+
+    public RemoteServiceConfiguration() { }
+
+    public RemoteServiceConfiguration(string baseUrl, string? version = null)
+    {
+        this[nameof(BaseUrl)] = baseUrl;
+        this[nameof(Version)] = version;
+    }
+}
+```
+
+| Property | Required | Read by |
+| -------- | -------- | ------- |
+| `BaseUrl` | yes | Every HTTP client proxy when constructing the request URL. |
+| `Version` | optional | Dynamic proxies that ship an `Asp.Versioning`-style version header / query string. |
+| any other `["key"]` | optional | Custom code via `config["UserAgent"]` etc. |
+
+Because it inherits from `Dictionary<string, string?>`, you can write
+custom string fields in `appsettings.json` and read them right back:
+
+```json
+{
+  "RemoteServices": {
+    "Default": {
+      "BaseUrl": "https://api.example.com",
+      "BasicAuthUserName": "frontend",
+      "BasicAuthPassword": "redacted"
+    }
+  }
+}
+```
+
+```csharp
+var config = await provider.GetConfigurationOrDefaultAsync("Default");
+var user = config["BasicAuthUserName"];
+```
+
+## `RemoteServiceConfigurationDictionary`
+
+The dictionary supports a logical "Default" entry that is the
+fallback for any name that isn't explicitly configured:
+
+```csharp framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfigurationDictionary.cs
+public class RemoteServiceConfigurationDictionary : Dictionary<string, RemoteServiceConfiguration?>
+{
+    public const string DefaultName = "Default";
+
+    public RemoteServiceConfiguration? Default {
+        get => this.GetOrDefault(DefaultName);
+        set => this[DefaultName] = value;
+    }
+
+    [NotNull]
+    public RemoteServiceConfiguration GetConfigurationOrDefault(string name)
+    {
+        return this.GetOrDefault(name)
+               ?? Default
+               ?? throw new AbpException($"Remote service '{name}' was not found and there is no default configuration.");
+    }
+
+    public RemoteServiceConfiguration? GetConfigurationOrDefaultOrNull(string name)
+    {
+        return this.GetOrDefault(name)
+               ?? Default;
+    }
+}
+```
+
+Lookup rules:
+
+1. If there is an explicit entry with the given `name`, return it.
+2. Otherwise, if there is a `Default` entry, return that.
+3. `GetConfigurationOrDefault` throws when both are missing;
+   `GetConfigurationOrDefaultOrNull` returns null.
+
+The lookup *name* is the value of `RemoteServiceAttribute.Name` from
+the controller / app-service interface — that's how dynamic proxies
+decide which back-end to hit:
+
+```csharp
+[RemoteService(Name = "Identity")]
+public interface IIdentityUserAppService : IApplicationService { … }
+```
+
+…hits the configuration entry called `"Identity"`, falling back to
+`"Default"`.
+
+## `AbpRemoteServiceOptions`
+
+```csharp framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/AbpRemoteServiceOptions.cs
+public class AbpRemoteServiceOptions
+{
+    public RemoteServiceConfigurationDictionary RemoteServices { get; set; }
+
+    public AbpRemoteServiceOptions()
+    {
+        RemoteServices = new RemoteServiceConfigurationDictionary();
+    }
+}
+```
+
+A single property of the dictionary type above. Application code
+typically never constructs this directly — the module binds it from
+`IConfiguration`. You can layer manual configuration on top:
+
+```csharp
+Configure<AbpRemoteServiceOptions>(options =>
+{
+    options.RemoteServices["AdminPortal"] = new RemoteServiceConfiguration("https://admin-api.example.com");
+});
+```
+
+This is the idiomatic way for an integration test to override a single
+endpoint without rewriting `appsettings.json`.
+
+## The provider
+
+```csharp framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/IRemoteServiceConfigurationProvider.cs
+public interface IRemoteServiceConfigurationProvider
+{
+    [ItemNotNull]
+    Task<RemoteServiceConfiguration> GetConfigurationOrDefaultAsync(string name);
+
+    Task<RemoteServiceConfiguration?> GetConfigurationOrDefaultOrNullAsync(string name);
+}
+```
+
+Async by contract — that's important because Blazor WebAssembly and
+MAUI clients sometimes need to *load* the configuration before they can
+read it (e.g. from a remote `appsettings.json` over HTTP). The default
+implementation, `RemoteServiceConfigurationProvider`, is a synchronous
+wrapper that returns `Task.FromResult(...)` over the in-memory
+`IOptions<AbpRemoteServiceOptions>` snapshot. Replace it in DI to plug
+in a dynamic source (e.g. configuration from a secrets-manager).
+
+```csharp framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfigurationProviderExtensions.cs
+public static class RemoteServiceConfigurationProviderExtensions
+{
+    public static RemoteServiceConfiguration GetConfigurationOrDefault(this IRemoteServiceConfigurationProvider provider, string name)
+        => AsyncHelper.RunSync(() => provider.GetConfigurationOrDefaultAsync(name));
+
+    public static RemoteServiceConfiguration? GetConfigurationOrDefaultOrNull(this IRemoteServiceConfigurationProvider provider, string name)
+        => AsyncHelper.RunSync(() => provider.GetConfigurationOrDefaultOrNullAsync(name));
+}
+```
+
+`AsyncHelper.RunSync` is the framework-blessed sync-over-async wrapper —
+fine for the in-memory provider, fine for anything else that completes
+synchronously, but you should think twice before calling these from a
+synchronous code path that's hitting a network-bound provider.
+
+## Control flow at a call site
+
+```mermaid
+sequenceDiagram
+  participant C as Generated client / Dynamic proxy
+  participant P as IRemoteServiceConfigurationProvider
+  participant D as RemoteServiceConfigurationDictionary
+  participant O as IOptions&lt;AbpRemoteServiceOptions&gt;
+  participant H as HttpClient (named)
+
+  C->>P: GetConfigurationOrDefaultAsync("Identity")
+  P->>O: Value.RemoteServices
+  O-->>P: dictionary snapshot
+  P->>D: GetConfigurationOrDefault("Identity")
+  alt match
+    D-->>P: RemoteServiceConfiguration(Identity)
+  else fallback
+    D-->>P: RemoteServiceConfiguration(Default)
+  end
+  P-->>C: configuration
+  C->>H: Send(BaseUrl + "/api/identity/users")
+  H-->>C: response
+```
+
+## Configuration tips
+
+- **Trailing slash on `BaseUrl`** doesn't matter — the dynamic proxy
+  normalises with `EnsureEndsWith('/')` before composing the action
+  path.
+- **`Version` precedence.** If both a `RemoteServiceConfiguration.Version`
+  and an `IRequestedApiVersion.Current` are present, the dynamic proxy
+  prefers `IRequestedApiVersion` (request-scoped) so that per-call
+  versioning still works against a single back-end.
+- **Per-environment overrides.** The module binds the whole
+  `IConfiguration` root, so environment-specific files
+  (`appsettings.Production.json`, environment variables prefixed
+  `RemoteServices__Identity__BaseUrl`) merge naturally.
+
+## Options surface
+
+| Options | Knob | Wire-up |
+| ------- | ---- | ------- |
+| `AbpRemoteServiceOptions.RemoteServices` | dictionary keyed by `RemoteServiceAttribute.Name` | Bound from configuration by `AbpRemoteServicesModule`. |
+| `RemoteServiceConfiguration["..."]` | arbitrary string entries | Read by your own code through the dictionary surface. |
+
+There are no other options classes in this package — that's the whole
+public surface.
+
+## See also
+
+- [Dynamic C# HTTP client](/framework/http-client/dynamic-proxy) — the
+  consumer that turns `BaseUrl + RemoteServiceAttribute.Name` into a
+  real `HttpClient` call.
+- [`Api Versioning`](/framework/aspnetcore/api-versioning) — how
+  request-scoped versioning interacts with
+  `RemoteServiceConfiguration.Version`.
+- [Distributed services](/framework/microservice/integration-services)
+  — the multi-service host pattern that makes the dictionary worth
+  having.

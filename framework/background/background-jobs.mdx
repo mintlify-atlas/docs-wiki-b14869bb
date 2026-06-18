@@ -1,0 +1,567 @@
+---
+title: "Background Jobs default engine: polling, retry, in-memory store"
+sidebarTitle: "Jobs · Default Engine"
+description: "DefaultBackgroundJobManager, BackgroundJobWorker, InMemoryBackgroundJobStore, JsonBackgroundJobSerializer, and the polling retry loop that backs Volo.Abp.BackgroundJobs out of the box."
+---
+
+`Volo.Abp.BackgroundJobs` ships the **default** in‑process engine: a
+polling worker that pulls waiting jobs from an `IBackgroundJobStore`,
+runs them through the executer documented on the
+[abstractions page](/framework/background/background-jobs-abstractions),
+and applies exponential‑backoff retry. The store registered out of the
+box is `InMemoryBackgroundJobStore` — a `ConcurrentDictionary` keyed by
+job id — which is fine for tests and single‑node demos but is replaced
+by an EF Core / MongoDB store in production. The module also pulls in
+the background‑workers pipeline so the polling loop is itself a
+background worker.
+
+This page walks every file in the package and the timing math in the
+worker.
+
+<CardGroup cols={2}>
+  <Card title="Abstractions" icon="cube" href="/framework/background/background-jobs-abstractions">
+    The contracts the manager and worker implement.
+  </Card>
+  <Card title="Background workers" icon="repeat" href="/framework/background/background-workers">
+    AsyncPeriodicBackgroundWorkerBase, which BackgroundJobWorker inherits from.
+  </Card>
+  <Card title="Hangfire adapter" icon="fire" href="/framework/background/background-jobs-hangfire">
+    Swap to Hangfire by depending on AbpBackgroundJobsHangfireModule.
+  </Card>
+  <Card title="Quartz adapter" icon="clock" href="/framework/background/background-jobs-quartz">
+    Swap to Quartz instead.
+  </Card>
+</CardGroup>
+
+## File inventory
+
+Source path: `framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/`.
+
+| File | Purpose |
+| --- | --- |
+| `AbpBackgroundJobsModule.cs` | Module — `DependsOn` graph, conditional worker registration |
+| `DefaultBackgroundJobManager.cs` | `IBackgroundJobManager` implementation that writes to the store |
+| `BackgroundJobInfo.cs` | The mutable record persisted per job |
+| `IBackgroundJobStore.cs` | CRUD contract for waiting / in‑flight / abandoned jobs |
+| `InMemoryBackgroundJobStore.cs` | In‑memory `ConcurrentDictionary` store |
+| `IBackgroundJobSerializer.cs` | Serialize / deserialize args interface |
+| `JsonBackgroundJobSerializer.cs` | Default implementation over `IJsonSerializer` |
+| `IBackgroundJobWorker.cs` | Marker interface — the running worker |
+| `BackgroundJobWorker.cs` | The polling loop, retry timing, distributed lock |
+| `AbpBackgroundJobWorkerOptions.cs` | Periods, retry timing, fetch counts |
+
+## Module wire‑up
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/AbpBackgroundJobsModule.cs
+[DependsOn(
+    typeof(AbpBackgroundJobsAbstractionsModule),
+    typeof(AbpBackgroundWorkersModule),
+    typeof(AbpTimingModule),
+    typeof(AbpGuidsModule),
+    typeof(AbpDistributedLockingAbstractionsModule),
+    typeof(AbpMultiTenancyModule)
+    )]
+public class AbpBackgroundJobsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        if (context.Services.IsDataMigrationEnvironment())
+        {
+            Configure<AbpBackgroundJobOptions>(options =>
+            {
+                options.IsJobExecutionEnabled = false;
+            });
+        }
+    }
+
+    public override async Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        if (context.ServiceProvider.GetRequiredService<IOptions<AbpBackgroundJobOptions>>().Value.IsJobExecutionEnabled)
+        {
+            await context.AddBackgroundWorkerAsync<IBackgroundJobWorker>();
+        }
+    }
+    // …
+}
+```
+
+The two interesting lines:
+
+1. During EF migrations the worker is **not** registered. This avoids
+   the migration host trying to drain the queue against a half‑migrated
+   schema.
+2. The worker is added by interface (`IBackgroundJobWorker`), so a
+   downstream module replacing the implementation only needs
+   `[Dependency(ReplaceServices = true)]` on its own class.
+
+## `DefaultBackgroundJobManager`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/DefaultBackgroundJobManager.cs
+[Dependency(ReplaceServices = true)]
+public class DefaultBackgroundJobManager : IBackgroundJobManager, ITransientDependency
+{
+    public virtual async Task<string> EnqueueAsync<TArgs>(TArgs args, BackgroundJobPriority priority = BackgroundJobPriority.Normal, TimeSpan? delay = null)
+    {
+        var jobName = BackgroundJobNameAttribute.GetName<TArgs>();
+        var jobId = await EnqueueAsync(jobName, args!, priority, delay);
+        return jobId.ToString();
+    }
+
+    protected virtual async Task<Guid> EnqueueAsync(string jobName, object args, BackgroundJobPriority priority = BackgroundJobPriority.Normal, TimeSpan? delay = null)
+    {
+        var jobInfo = new BackgroundJobInfo
+        {
+            Id = GuidGenerator.Create(),
+            JobName = jobName,
+            JobArgs = Serializer.Serialize(args),
+            Priority = priority,
+            CreationTime = Clock.Now,
+            NextTryTime = Clock.Now
+        };
+
+        if (delay.HasValue)
+        {
+            jobInfo.NextTryTime = Clock.Now.Add(delay.Value);
+        }
+
+        await Store.InsertAsync(jobInfo);
+
+        return jobInfo.Id;
+    }
+}
+```
+
+The manager is *only* a writer — it never reads or executes anything.
+Five injected services do the real work:
+
+| Service | Provides |
+| --- | --- |
+| `IClock` | The "now" timestamp — `Clock.Now` honours `AbpClockOptions.Kind` (UTC vs. local) |
+| `IGuidGenerator` | Sequential GUIDs friendly to database indexes |
+| `IBackgroundJobSerializer` | `JsonBackgroundJobSerializer` by default |
+| `IBackgroundJobStore` | Persistence — replaced by EF/Mongo modules in production |
+
+The returned identifier is the GUID's `.ToString()` — application code
+can use it to look up the row later via `Store.FindAsync(Guid)`.
+
+## `BackgroundJobInfo`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/BackgroundJobInfo.cs
+public class BackgroundJobInfo
+{
+    public Guid Id { get; set; }
+    public virtual string JobName { get; set; } = default!;
+    public virtual string JobArgs { get; set; } = default!;
+    public virtual short TryCount { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+    public virtual DateTime NextTryTime { get; set; }
+    public virtual DateTime? LastTryTime { get; set; }
+    public virtual bool IsAbandoned { get; set; }
+    public virtual BackgroundJobPriority Priority { get; set; }
+
+    public BackgroundJobInfo()
+    {
+        Priority = BackgroundJobPriority.Normal;
+    }
+}
+```
+
+| Field | Mutated by | Notes |
+| --- | --- | --- |
+| `Id` | Manager (insert) | GUID, primary key |
+| `JobName` | Manager | The result of `BackgroundJobNameAttribute.GetName<TArgs>()` |
+| `JobArgs` | Manager | Serialized args (JSON by default) |
+| `TryCount` | Worker | Incremented **before** each attempt |
+| `CreationTime` | Manager | Used as the timeout anchor |
+| `NextTryTime` | Manager + Worker | Initial value = now or now+delay; bumped after failure |
+| `LastTryTime` | Worker | Stamped before each attempt |
+| `IsAbandoned` | Worker | True once retries exhausted; the store may delete on update |
+| `Priority` | Manager | Drives the polling `OrderByDescending` |
+
+The class is intentionally a plain POCO with `virtual` setters so EF
+Core proxies and MongoDB serializers can subclass without surprises.
+
+## `IBackgroundJobStore`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/IBackgroundJobStore.cs
+public interface IBackgroundJobStore
+{
+    Task<BackgroundJobInfo> FindAsync(Guid jobId);
+    Task InsertAsync(BackgroundJobInfo jobInfo);
+    Task<List<BackgroundJobInfo>> GetWaitingJobsAsync(int maxResultCount);
+    Task DeleteAsync(Guid jobId);
+    Task UpdateAsync(BackgroundJobInfo jobInfo);
+}
+```
+
+The docstring on `GetWaitingJobsAsync` is the load‑bearing contract
+every implementation must honour:
+
+> Conditions: `!IsAbandoned And NextTryTime <= Clock.Now`.
+> Order by: `Priority DESC, TryCount ASC, NextTryTime ASC`.
+> Maximum result: `maxResultCount`.
+
+That ordering is what gives priority its meaning and what makes the
+default engine "fair" within a priority — fewer attempts first, oldest
+first within the same try count.
+
+### `InMemoryBackgroundJobStore`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/InMemoryBackgroundJobStore.cs
+public class InMemoryBackgroundJobStore : IBackgroundJobStore, ISingletonDependency
+{
+    private readonly ConcurrentDictionary<Guid, BackgroundJobInfo> _jobs;
+
+    public virtual Task<List<BackgroundJobInfo>> GetWaitingJobsAsync(int maxResultCount)
+    {
+        var waitingJobs = _jobs.Values
+            .Where(t => !t.IsAbandoned && t.NextTryTime <= Clock.Now)
+            .OrderByDescending(t => t.Priority)
+            .ThenBy(t => t.TryCount)
+            .ThenBy(t => t.NextTryTime)
+            .Take(maxResultCount)
+            .ToList();
+
+        return Task.FromResult(waitingJobs);
+    }
+
+    public virtual Task UpdateAsync(BackgroundJobInfo jobInfo)
+    {
+        if (jobInfo.IsAbandoned)
+        {
+            return DeleteAsync(jobInfo.Id);
+        }
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Three things worth noting:
+
+- It is a **singleton**. Process restart drops the queue. Anything
+  durable runs the EF / Mongo store from the
+  `Volo.Abp.BackgroundJobs.EntityFrameworkCore` /
+  `…MongoDB` modules.
+- `UpdateAsync` is a no‑op for non‑abandoned jobs — the dictionary
+  already holds the same reference the worker just mutated.
+- Concurrency control on the dictionary is good enough for one process,
+  but `GetWaitingJobsAsync` does a snapshot read; two threads can pick
+  the same job. In the default setup there is exactly one
+  `BackgroundJobWorker` per process so this is fine. The
+  `IAbpDistributedLock` documented below guards across processes.
+
+## Serialization: `JsonBackgroundJobSerializer`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/JsonBackgroundJobSerializer.cs
+public class JsonBackgroundJobSerializer : IBackgroundJobSerializer, ITransientDependency
+{
+    private readonly IJsonSerializer _jsonSerializer;
+    public string Serialize(object obj)               => _jsonSerializer.Serialize(obj);
+    public object Deserialize(string value, Type type) => _jsonSerializer.Deserialize(type, value);
+    public T      Deserialize<T>(string value)         => _jsonSerializer.Deserialize<T>(value);
+}
+```
+
+`IJsonSerializer` comes from `Volo.Abp.Json` — by default it's the
+System.Text.Json wrapper, so anything serializable by STJ is fair game
+for a job. Replace this service to switch encodings (CBOR, MessagePack,
+protobuf) without touching the manager or worker.
+
+## The polling worker: `BackgroundJobWorker`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/BackgroundJobWorker.cs
+public class BackgroundJobWorker : AsyncPeriodicBackgroundWorkerBase, IBackgroundJobWorker
+{
+    protected const string DistributedLockName = "AbpBackgroundJobWorker";
+
+    public BackgroundJobWorker(
+        AbpAsyncTimer timer,
+        IOptions<AbpBackgroundJobOptions> jobOptions,
+        IOptions<AbpBackgroundJobWorkerOptions> workerOptions,
+        IServiceScopeFactory serviceScopeFactory,
+        IAbpDistributedLock distributedLock)
+        : base(timer, serviceScopeFactory)
+    {
+        DistributedLock = distributedLock;
+        WorkerOptions = workerOptions.Value;
+        JobOptions = jobOptions.Value;
+        Timer.Period = WorkerOptions.JobPollPeriod;
+    }
+}
+```
+
+The constructor sets the timer period from `JobPollPeriod` (default
+5,000 ms). Because it inherits from
+[`AsyncPeriodicBackgroundWorkerBase`](/framework/background/background-workers),
+the worker manager auto‑starts the timer at app start and auto‑stops it
+at shutdown.
+
+### One tick
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/BackgroundJobWorker.cs
+protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)
+{
+    await using (var handler = await DistributedLock.TryAcquireAsync(DistributedLockName, cancellationToken: StoppingToken))
+    {
+        if (handler != null)
+        {
+            var store = workerContext.ServiceProvider.GetRequiredService<IBackgroundJobStore>();
+
+            var waitingJobs = await store.GetWaitingJobsAsync(WorkerOptions.MaxJobFetchCount);
+
+            if (!waitingJobs.Any())
+            {
+                return;
+            }
+
+            var jobExecuter = workerContext.ServiceProvider.GetRequiredService<IBackgroundJobExecuter>();
+            var clock = workerContext.ServiceProvider.GetRequiredService<IClock>();
+            var serializer = workerContext.ServiceProvider.GetRequiredService<IBackgroundJobSerializer>();
+
+            foreach (var jobInfo in waitingJobs)
+            {
+                jobInfo.TryCount++;
+                jobInfo.LastTryTime = clock.Now;
+
+                try
+                {
+                    var jobConfiguration = JobOptions.GetJob(jobInfo.JobName);
+                    var jobArgs = serializer.Deserialize(jobInfo.JobArgs, jobConfiguration.ArgsType);
+                    var context = new JobExecutionContext(
+                        workerContext.ServiceProvider,
+                        jobConfiguration.JobType,
+                        jobArgs,
+                        workerContext.CancellationToken);
+
+                    try
+                    {
+                        await jobExecuter.ExecuteAsync(context);
+                        await store.DeleteAsync(jobInfo.Id);
+                    }
+                    catch (BackgroundJobExecutionException)
+                    {
+                        var nextTryTime = CalculateNextTryTime(jobInfo, clock);
+
+                        if (nextTryTime.HasValue)
+                        {
+                            jobInfo.NextTryTime = nextTryTime.Value;
+                        }
+                        else
+                        {
+                            jobInfo.IsAbandoned = true;
+                        }
+
+                        await TryUpdateAsync(store, jobInfo);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogException(ex);
+                    jobInfo.IsAbandoned = true;
+                    await TryUpdateAsync(store, jobInfo);
+                }
+            }
+        }
+        else
+        {
+            try
+            {
+                await Task.Delay(WorkerOptions.JobPollPeriod * 12, StoppingToken);
+            }
+            catch (TaskCanceledException) { }
+        }
+    }
+}
+```
+
+Reading this tick one bullet at a time:
+
+- The distributed lock `AbpBackgroundJobWorker` is the *cluster lease*.
+  In a one‑node deployment `IAbpDistributedLock` is the local fallback
+  and `TryAcquire` always succeeds.
+- If another instance already holds the lock, this worker sleeps **12 ×
+  `JobPollPeriod`** before retrying. That converts a tight 5 s poll
+  into a 60 s back‑off when someone else is leading. The catch on
+  `TaskCanceledException` keeps shutdown clean.
+- Jobs that throw a non‑`BackgroundJobExecutionException` (e.g. a
+  config error in `JobOptions.GetJob`) are immediately abandoned —
+  there is no value in retrying a deserialization or DI lookup failure.
+- `TryUpdateAsync` swallows update failures so a flaky store does not
+  crash the worker mid‑batch.
+
+### Retry math: `CalculateNextTryTime`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/BackgroundJobWorker.cs
+protected virtual DateTime? CalculateNextTryTime(BackgroundJobInfo jobInfo, IClock clock)
+{
+    var nextWaitDuration = WorkerOptions.DefaultFirstWaitDuration *
+                           (Math.Pow(WorkerOptions.DefaultWaitFactor, jobInfo.TryCount - 1));
+    var nextTryDate = jobInfo.LastTryTime?.AddSeconds(nextWaitDuration) ??
+                      clock.Now.AddSeconds(nextWaitDuration);
+
+    if (nextTryDate.Subtract(jobInfo.CreationTime).TotalSeconds > WorkerOptions.DefaultTimeout)
+    {
+        return null;
+    }
+
+    return nextTryDate;
+}
+```
+
+Exponential back‑off: `wait_n = FirstWait × WaitFactor^(TryCount−1)`.
+With defaults (`FirstWait = 60 s`, `WaitFactor = 2.0`):
+
+| `TryCount` | `nextWait` | Cumulative time from creation |
+| --- | --- | --- |
+| 1 | 60 s | 60 s |
+| 2 | 120 s | 180 s |
+| 3 | 240 s | 420 s |
+| 4 | 480 s | 900 s |
+| 5 | 960 s | 1,860 s |
+| 6 | 1,920 s | 3,780 s |
+| 7 | 3,840 s | 7,620 s |
+| … | … | … |
+| 12 | 122,880 s | 245,700 s ≈ 2 d 20 h |
+
+When the next try would land later than
+`CreationTime + DefaultTimeout` (172,800 s = 2 days), the worker
+returns `null` and stamps `IsAbandoned = true`. The
+`InMemoryBackgroundJobStore` deletes abandoned rows in `UpdateAsync`;
+persistent stores typically keep them for inspection.
+
+## `AbpBackgroundJobWorkerOptions`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs/Volo/Abp/BackgroundJobs/AbpBackgroundJobWorkerOptions.cs
+public class AbpBackgroundJobWorkerOptions
+{
+    public int JobPollPeriod { get; set; }
+    public int MaxJobFetchCount { get; set; }
+    public int DefaultFirstWaitDuration { get; set; }
+    public int DefaultTimeout { get; set; }
+    public double DefaultWaitFactor { get; set; }
+
+    public AbpBackgroundJobWorkerOptions()
+    {
+        MaxJobFetchCount = 1000;
+        JobPollPeriod = 5000;
+        DefaultFirstWaitDuration = 60;
+        DefaultTimeout = 172800;
+        DefaultWaitFactor = 2.0;
+    }
+}
+```
+
+| Property | Default | Unit | Effect |
+| --- | --- | --- | --- |
+| `JobPollPeriod` | 5000 | ms | `Timer.Period` — how often the worker ticks |
+| `MaxJobFetchCount` | 1000 | jobs | Upper bound passed to `GetWaitingJobsAsync` |
+| `DefaultFirstWaitDuration` | 60 | s | First retry delay |
+| `DefaultTimeout` | 172,800 | s (2 days) | After this many seconds since `CreationTime` retries stop |
+| `DefaultWaitFactor` | 2.0 | — | Multiplier between consecutive retries |
+
+Override them in your application module:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpBackgroundJobWorkerOptions>(o =>
+    {
+        o.JobPollPeriod = 2_000;          // poll every 2 s
+        o.DefaultFirstWaitDuration = 30;  // first retry after 30 s
+        o.DefaultTimeout = 24 * 3600;     // give up after 1 day
+    });
+}
+```
+
+## Full enqueue → execute → retry flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant Mgr as DefaultBackgroundJobManager
+    participant Store as IBackgroundJobStore
+    participant Worker as BackgroundJobWorker
+    participant Lock as IAbpDistributedLock
+    participant Exec as BackgroundJobExecuter
+    participant Job as IAsyncBackgroundJob&lt;TArgs&gt;
+
+    App->>Mgr: EnqueueAsync(args, priority, delay)
+    Mgr->>Store: InsertAsync(BackgroundJobInfo{NextTryTime = now+delay})
+    Note over Worker: Timer ticks every JobPollPeriod
+    Worker->>Lock: TryAcquireAsync("AbpBackgroundJobWorker")
+    Lock-->>Worker: handler
+    Worker->>Store: GetWaitingJobsAsync(MaxJobFetchCount)
+    Store-->>Worker: List&lt;BackgroundJobInfo&gt;
+    loop each jobInfo
+        Worker->>Worker: TryCount++, LastTryTime = now
+        Worker->>Exec: ExecuteAsync(JobExecutionContext)
+        Exec->>Job: ExecuteAsync(args)
+        alt success
+            Worker->>Store: DeleteAsync(id)
+        else BackgroundJobExecutionException
+            Worker->>Worker: CalculateNextTryTime
+            alt next ≤ Creation+Timeout
+                Worker->>Store: UpdateAsync(NextTryTime = …)
+            else timeout exceeded
+                Worker->>Store: UpdateAsync(IsAbandoned = true)
+            end
+        end
+    end
+```
+
+## Replacing the manager or worker
+
+The four [Dependency(ReplaceServices = true)] hooks in this package are
+the explicit extension points:
+
+| Type | Marker | Replace if you want to… |
+| --- | --- | --- |
+| `DefaultBackgroundJobManager` | `[Dependency(ReplaceServices = true)]` | Send the job somewhere besides the local store (e.g. an outbox) |
+| `JsonBackgroundJobSerializer` | `ITransientDependency` (replace by `[Dependency(ReplaceServices = true)]`) | Use a different wire format |
+| `InMemoryBackgroundJobStore` | `ISingletonDependency` (replaced by the EF/Mongo modules) | Add durable storage |
+| `BackgroundJobWorker` | `[Dependency(ReplaceServices = true)]` is **not** present — replace by registering a different implementation of `IBackgroundJobWorker` in your module | Swap the polling strategy |
+
+A typical persistent‑store override looks like:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MyEfBackgroundJobStore : IBackgroundJobStore, ITransientDependency
+{
+    // implement IBackgroundJobStore against your DbContext
+}
+```
+
+The worker has no static reference to `InMemoryBackgroundJobStore`, so
+swapping the store does not touch the polling loop.
+
+## Gotchas
+
+- **`IsJobExecutionEnabled = false` stops execution but not the
+  manager.** Callers can still write `BackgroundJobInfo` rows that no
+  one will pick up until the flag flips. Useful as a "drain mode" but
+  surprising if you forget.
+- **The distributed lock key is hard‑coded.** Two ABP applications
+  sharing the same Redis lock provider but different `IBackgroundJobStore`s
+  will starve each other because they fight for `AbpBackgroundJobWorker`.
+  If you run multiple unrelated workloads in one cluster, replace
+  `BackgroundJobWorker` with one that uses a per‑application lock name.
+- **`Math.Pow(double, double)` is used for the retry factor.** Very
+  large `TryCount` values overflow `double` precision (~`TryCount >
+  1024` with `WaitFactor = 2.0`), but the `DefaultTimeout` check fires
+  long before that.
+- **`InMemoryBackgroundJobStore.UpdateAsync` is a no‑op unless the job
+  is abandoned.** Other implementations must persist the new
+  `TryCount`, `NextTryTime`, and `LastTryTime`. Forgetting this in a
+  custom store creates an infinite retry loop because the worker re‑reads
+  the same stale row.
+- **The worker fetches up to `MaxJobFetchCount = 1000` per tick and
+  processes them sequentially in one task.** A long synchronous job
+  blocks all later jobs in the batch. Use small batches and lots of
+  small jobs, not one large `MaxJobFetchCount` and slow `ExecuteAsync`
+  implementations.
+- **`BackgroundJobExecutionException` is the only signal for a
+  *retryable* failure.** The executer raises it; anything else bubbles
+  through the *outer* `catch (Exception ex)` in the worker and the row
+  is abandoned. Custom executers must preserve this convention.

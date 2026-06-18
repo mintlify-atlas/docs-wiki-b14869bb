@@ -1,0 +1,367 @@
+---
+title: "ABP coding conventions: naming, DI, options"
+sidebarTitle: "Conventions"
+description: "Naming, marker interfaces, conventional DI registration, options pre/post pipeline, async suffixes and ConfigureAwait policy enforced across the ABP v7.4.0 codebase."
+---
+
+The ABP repository is large but consistent — every file follows a small set of conventions that the framework relies on for reflection, conventional DI registration, and proxy generation. This page lists those conventions, names the source files that implement them, and shows the canonical examples directly from `framework/src/Volo.Abp.Core/`.
+
+## Conventional service registration
+
+ABP scans every module's assemblies through *conventional registrars*. The default `DefaultConventionalRegistrar` reads marker interfaces, attributes, and base classes:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DefaultConventionalRegistrar.cs
+public override void AddType(IServiceCollection services, Type type)
+{
+    if (IsConventionalRegistrationDisabled(type)) return;
+
+    var dependencyAttribute = GetDependencyAttributeOrNull(type);
+    var lifeTime = GetLifeTimeOrNull(type, dependencyAttribute);
+    if (lifeTime == null) return;
+
+    var exposedServiceTypes = GetExposedServiceTypes(type);
+    TriggerServiceExposing(services, type, exposedServiceTypes);
+
+    foreach (var exposedServiceType in exposedServiceTypes)
+    {
+        var serviceDescriptor = CreateServiceDescriptor(
+            type, exposedServiceType, exposedServiceTypes, lifeTime.Value);
+        if (dependencyAttribute?.ReplaceServices == true)
+        {
+            services.Replace(serviceDescriptor);
+            /* ... */
+```
+
+The decision lives in `ConventionalRegistrarBase.GetServiceLifetimeFromClassHierarchy`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ConventionalRegistrarBase.cs
+protected virtual ServiceLifetime? GetServiceLifetimeFromClassHierarchy(Type type)
+{
+    if (typeof(ITransientDependency).GetTypeInfo().IsAssignableFrom(type))
+        return ServiceLifetime.Transient;
+    if (typeof(ISingletonDependency).GetTypeInfo().IsAssignableFrom(type))
+        return ServiceLifetime.Singleton;
+    if (typeof(IScopedDependency).GetTypeInfo().IsAssignableFrom(type))
+        return ServiceLifetime.Scoped;
+    return null;
+}
+```
+
+### Marker interfaces
+
+| Interface | Lifetime | File |
+| --- | --- | --- |
+| `ITransientDependency` | Transient | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ITransientDependency.cs` |
+| `IScopedDependency` | Scoped | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/IScopedDependency.cs` |
+| `ISingletonDependency` | Singleton | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ISingletonDependency.cs` |
+
+All three are empty contract types — implementing one is enough to opt in to conventional registration:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ITransientDependency.cs
+namespace Volo.Abp.DependencyInjection;
+
+public interface ITransientDependency { }
+```
+
+The base class lookup is recursive, so a derived class inherits the lifetime of its parent.
+
+### Attributes
+
+| Attribute | Effect | File |
+| --- | --- | --- |
+| `[Dependency(ServiceLifetime)]` | Overrides marker interfaces, controls `TryRegister`/`ReplaceServices`. | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DependencyAttribute.cs` |
+| `[ExposeServices(typeof(IFoo))]` | Lists the *exact* service types to register against. Supports `IncludeDefaults` and `IncludeSelf`. | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposeServicesAttribute.cs` |
+| `[DisableConventionalRegistration]` | Skip the type entirely. | `framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DisableConventionalRegistrationAttribute.cs` |
+| `[DependsOn(typeof(AbpXxxModule))]` | Declares a module-level dependency for `ModuleLoader`'s topological sort. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/DependsOnAttribute.cs` |
+| `[AdditionalAssembly(typeof(SomeTypeInAssembly))]` | Declares satellite assemblies for the conventional registrars. | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AdditionalAssemblyAttribute.cs` |
+
+The `DependencyAttribute` carries three flags:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DependencyAttribute.cs
+public class DependencyAttribute : Attribute
+{
+    public virtual ServiceLifetime? Lifetime { get; set; }
+    public virtual bool TryRegister { get; set; }
+    public virtual bool ReplaceServices { get; set; }
+
+    public DependencyAttribute() { }
+    public DependencyAttribute(ServiceLifetime lifetime) { Lifetime = lifetime; }
+}
+```
+
+`DisableConventionalRegistration` is also empty — its presence alone is the signal:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/DependencyInjection/DisableConventionalRegistrationAttribute.cs
+namespace Volo.Abp.DependencyInjection;
+
+public class DisableConventionalRegistrationAttribute : Attribute { }
+```
+
+### `Services.AddAssembly` and registrar list
+
+Module discovery in `AbpApplicationBase.ConfigureServices` calls `Services.AddAssembly(assembly)` per module's `AllAssemblies`, which fans out to every registered `IConventionalRegistrar`:
+
+```csharp framework/src/Volo.Abp.Core/Microsoft/Extensions/DependencyInjection/ServiceCollectionConventionalRegistrationExtensions.cs
+public static IServiceCollection AddAssembly(this IServiceCollection services, Assembly assembly)
+{
+    foreach (var registrar in services.GetConventionalRegistrars())
+    {
+        registrar.AddAssembly(services, assembly);
+    }
+    return services;
+}
+```
+
+The default list always contains `DefaultConventionalRegistrar`; modules can append more (the DDD Domain module adds `AbpRepositoryConventionalRegistrar` via `PreConfigureServices`):
+
+```csharp framework/src/Volo.Abp.Core/Microsoft/Extensions/DependencyInjection/ServiceCollectionConventionalRegistrationExtensions.cs
+private static ConventionalRegistrarList GetOrCreateRegistrarList(IServiceCollection services)
+{
+    var conventionalRegistrars =
+        services.GetSingletonInstanceOrNull<IObjectAccessor<ConventionalRegistrarList>>()?.Value;
+    if (conventionalRegistrars == null)
+    {
+        conventionalRegistrars = new ConventionalRegistrarList { new DefaultConventionalRegistrar() };
+        services.AddObjectAccessor(conventionalRegistrars);
+    }
+    return conventionalRegistrars;
+}
+```
+
+<Note>
+Modules can suppress auto-assembly registration by setting `SkipAutoServiceRegistration = true` in their constructor. The conventional registrars then ignore that module's assemblies until you call `Services.AddAssembly(...)` yourself.
+</Note>
+
+## Options pattern: `PreConfigure → Configure → PostConfigure`
+
+ABP layers its own `PreConfigure<TOptions>` ahead of Microsoft's `IConfigureOptions<TOptions>` so a module can publish defaults that other modules consume during their `ConfigureServices`. The list lives in a `PreConfigureActionList<TOptions>`:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Options/PreConfigureActionList.cs
+public class PreConfigureActionList<TOptions> : List<Action<TOptions>>
+{
+    public void Configure(TOptions options)
+    {
+        foreach (var action in this) { action(options); }
+    }
+
+    public TOptions Configure()
+    {
+        var options = Activator.CreateInstance<TOptions>();
+        Configure(options);
+        return options;
+    }
+}
+```
+
+The `IServiceCollection` extensions wire it up via an `IObjectAccessor` so the same instance is shared across phases:
+
+```csharp framework/src/Volo.Abp.Core/Microsoft/Extensions/DependencyInjection/ServiceCollectionPreConfigureExtensions.cs
+public static IServiceCollection PreConfigure<TOptions>(this IServiceCollection services, Action<TOptions> optionsAction)
+{
+    services.GetPreConfigureActions<TOptions>().Add(optionsAction);
+    return services;
+}
+
+public static TOptions ExecutePreConfiguredActions<TOptions>(this IServiceCollection services)
+    where TOptions : new()
+{
+    return services.ExecutePreConfiguredActions(new TOptions());
+}
+
+public static TOptions ExecutePreConfiguredActions<TOptions>(this IServiceCollection services, TOptions options)
+{
+    services.GetPreConfigureActions<TOptions>().Configure(options);
+    return options;
+}
+```
+
+And `AbpModule` exposes the trio as protected helpers so module code stays terse:
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs
+protected void PreConfigure<TOptions>(Action<TOptions> configureOptions)
+    where TOptions : class
+{
+    ServiceConfigurationContext.Services.PreConfigure(configureOptions);
+}
+
+protected void Configure<TOptions>(Action<TOptions> configureOptions)
+    where TOptions : class
+{
+    ServiceConfigurationContext.Services.Configure(configureOptions);
+}
+
+protected void PostConfigure<TOptions>(Action<TOptions> configureOptions)
+    where TOptions : class
+{
+    ServiceConfigurationContext.Services.PostConfigure(configureOptions);
+}
+
+protected void PostConfigureAll<TOptions>(Action<TOptions> configureOptions)
+    where TOptions : class
+{
+    ServiceConfigurationContext.Services.PostConfigureAll(configureOptions);
+}
+```
+
+### Phase order in practice
+
+| Phase | Producer | Consumer | When | Goes into |
+| --- | --- | --- | --- | --- |
+| `PreConfigure<TOptions>` | A module's `PreConfigureServices` | Another module's `ConfigureServices`, via `services.ExecutePreConfiguredActions<TOptions>()` | Before `IConfigureOptions<TOptions>` runs | `PreConfigureActionList<TOptions>` |
+| `Configure<TOptions>` | A module's `ConfigureServices` | Anyone resolving `IOptions<TOptions>` | Standard MS Options registration | `IConfigureOptions<TOptions>` |
+| `PostConfigure<TOptions>` | A module's `PostConfigureServices` | Anyone resolving `IOptions<TOptions>` | After all `IConfigureOptions` run | `IPostConfigureOptions<TOptions>` |
+| `PostConfigureAll<TOptions>` | A module's `PostConfigureServices` | Anyone resolving any-named `IOptionsMonitor<TOptions>` | Final pass | `IPostConfigureOptions<TOptions>` with `null` name |
+
+The DDD application module uses `Configure<AbpApiDescriptionModelOptions>` to filter framework marker interfaces out of dynamic-controller routing:
+
+```csharp framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/AbpDddApplicationModule.cs
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpApiDescriptionModelOptions>(options =>
+    {
+        options.IgnoredInterfaces.AddIfNotContains(typeof(IRemoteService));
+        options.IgnoredInterfaces.AddIfNotContains(typeof(IApplicationService));
+        options.IgnoredInterfaces.AddIfNotContains(typeof(IUnitOfWorkEnabled));
+        options.IgnoredInterfaces.AddIfNotContains(typeof(IAuditingEnabled));
+        options.IgnoredInterfaces.AddIfNotContains(typeof(IValidationEnabled));
+        options.IgnoredInterfaces.AddIfNotContains(typeof(IGlobalFeatureCheckingEnabled));
+    });
+}
+```
+
+<Tip>
+If a downstream module needs to *read* defaults seeded by upstream `PreConfigure` calls, it calls `services.ExecutePreConfiguredActions<TOptions>()`. The framework uses this pattern for `AbpDbContextOptions` (so consumer modules can `Configure<AbpDbContextOptions>` to add their `DbContext`s before the EF Core module is configured).
+</Tip>
+
+## Naming conventions
+
+### Packages
+
+| Suffix | Meaning | Example |
+| --- | --- | --- |
+| `Volo.Abp.X.Abstractions` | Contracts-only, multi-target. | `Volo.Abp.EventBus.Abstractions` |
+| `Volo.Abp.X` | Implementation that depends on `*.Abstractions`. | `Volo.Abp.EventBus` |
+| `Volo.Abp.X.<Provider>` | Provider-specific implementation. | `Volo.Abp.EventBus.RabbitMQ`, `Volo.Abp.BlobStoring.Azure` |
+| `Volo.Abp.AspNetCore.X` | ASP.NET Core integration. | `Volo.Abp.AspNetCore.Mvc` |
+| `Volo.Abp.AspNetCore.Components.X` | Blazor integration. | `Volo.Abp.AspNetCore.Components.Server` |
+| `Volo.Abp.Http.X` | HTTP transport pieces. | `Volo.Abp.Http.Client.IdentityModel` |
+
+Application modules (under `modules/<name>/src/`) use the same tier suffixes (`Domain.Shared`, `Domain`, `Application.Contracts`, `Application`, `HttpApi`, `HttpApi.Client`, `Web`, `Blazor`, `EntityFrameworkCore`, `MongoDB`, `Installer`).
+
+### Types
+
+| Pattern | Role | Example file |
+| --- | --- | --- |
+| `Abp<Feature>Module` | The module's `AbpModule`. | `framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/AbpDddDomainModule.cs` |
+| `I<Feature>AppService` | Application-service interface, lives in `Application.Contracts`. | `modules/identity/src/Volo.Abp.Identity.Application.Contracts/Volo/Abp/Identity/IIdentityUserAppService.cs` |
+| `<Feature>AppService` | Implementation in `Application`. | `modules/identity/src/Volo.Abp.Identity.Application/Volo/Abp/Identity/IdentityUserAppService.cs` |
+| `<Aggregate>Manager` | Domain service that orchestrates an aggregate. | `modules/identity/src/Volo.Abp.Identity.Domain/Volo/Abp/Identity/IdentityUserManager.cs` |
+| `I<Aggregate>Repository` | Custom repository contract in `Domain`. | `modules/identity/src/Volo.Abp.Identity.Domain/Volo/Abp/Identity/IIdentityUserRepository.cs` |
+| `<Aggregate>EntityFrameworkCoreRepository` | EF Core implementation. | `modules/identity/src/Volo.Abp.Identity.EntityFrameworkCore/Volo/Abp/Identity/EntityFrameworkCore/EfCoreIdentityUserRepository.cs` |
+| `<Feature>Permissions` | Static class of permission name constants in `Application.Contracts`. | typical pattern |
+| `<Feature>PermissionDefinitionProvider` | Concrete `PermissionDefinitionProvider`. | typical pattern |
+| `<Feature>SettingDefinitionProvider` | Concrete `SettingDefinitionProvider`. | typical pattern |
+| `<Feature>DataSeedContributor` | `IDataSeedContributor` implementation. | typical pattern |
+| `<Feature>Hub` | SignalR hub (in `*.AspNetCore` or host). | typical pattern |
+| `<Feature>BackgroundWorker` | `IBackgroundWorker` implementation. | typical pattern |
+
+### Method-name conventions
+
+- All asynchronous methods end with `Async`. The framework's `AbpModule` virtual methods (`ConfigureServicesAsync`, `OnApplicationInitializationAsync`, `ShutdownAsync`) and the lifecycle contributors follow the same rule. Synchronous overloads exist for callers that cannot `await`.
+- Override the sync method when your work is synchronous; the async method on `AbpModule` defaults to delegating to the sync one and returning `Task.CompletedTask`.
+
+```csharp framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs
+public virtual Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+{
+    OnApplicationInitialization(context);
+    return Task.CompletedTask;
+}
+
+public virtual void OnApplicationInitialization(ApplicationInitializationContext context) { }
+```
+
+## `ConfigureAwait(false)` policy
+
+ABP enforces `ConfigureAwait(false)` on every `await` it ships via the `Fody.ConfigureAwait` weaver, applied in Release builds only. The MSBuild props file is at repo root:
+
+```xml configureawait.props
+<Project>
+  <ItemGroup Condition="'$(Configuration)' == 'Release'">
+      <PackageReference Include="ConfigureAwait.Fody" Version="3.3.1" PrivateAssets="All" />
+      <PackageReference Include="Fody" Version="6.6.1">
+        <PrivateAssets>All</PrivateAssets>
+        <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+      </PackageReference>
+  </ItemGroup>
+</Project>
+```
+
+Every framework csproj imports it at the top:
+
+```xml framework/src/Volo.Abp/Volo.Abp.csproj
+<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="..\..\..\configureawait.props" />
+  <Import Project="..\..\..\common.props" />
+  /* ... */
+</Project>
+```
+
+Each csproj that participates also ships a `FodyWeavers.xml` (visible in `framework/src/Volo.Abp.Core/`, `framework/src/Volo.Abp.Ddd.Domain.Shared/`, etc.) configured for `ConfigureAwait(false)`. Application code that does not import `configureawait.props` retains the default `.ConfigureAwait(true)` behaviour, which matches Microsoft's recommendation for ASP.NET Core endpoints.
+
+<Warning>
+The weaver only runs in Release. In Debug builds your `await` will keep the current `SynchronizationContext`; the moment you publish a Release build the same code will *not*. Don't rely on the absence of `ConfigureAwait(false)` to flow culture / scope explicitly — capture the value before awaiting.
+</Warning>
+
+## Common shape of an `AbpModule`
+
+Putting all the above together, an idiomatic ABP module looks like this:
+
+```csharp Example AbpXxxModule.cs
+[DependsOn(
+    typeof(AbpDddApplicationModule),
+    typeof(AbpAutoMapperModule)
+)]
+[AdditionalAssembly(typeof(MyResourceMarker))]
+public class AbpXxxModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        // Seed defaults consumed by downstream modules
+        context.Services.PreConfigure<AbpHttpClientBuilderOptions>(o =>
+        {
+            o.ProxyClientBuildActions.Add((_, b) => b.AddHttpMessageHandler<MyHandler>());
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpAutoMapperOptions>(options =>
+        {
+            options.AddProfile<MyProfile>(validate: true);
+        });
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        // Imperative startup work
+        context.ServiceProvider.GetRequiredService<IMyStartupRunner>().Run();
+    }
+}
+```
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Module system" icon="cube" href="/overview/module-system">
+    How `[DependsOn]` and `ServiceConfigurationContext` drive the pipeline.
+  </Card>
+  <Card title="Dependency injection flow" icon="diamond" href="/flows/dependency-injection">
+    What happens inside `Services.AddAssembly` and `IConventionalRegistrar`.
+  </Card>
+  <Card title="Layered architecture" icon="layer-group" href="/overview/layered-architecture">
+    Project naming and dependency rules across layers.
+  </Card>
+  <Card title="Versioning and targets" icon="tag" href="/overview/versioning-and-targets">
+    `common.props`, target frameworks, ConfigureAwait policy.
+  </Card>
+</CardGroup>

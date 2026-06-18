@@ -1,0 +1,240 @@
+---
+title: "Volo.Abp.EntityFrameworkCore.SqlServer — provider package"
+description: "How AbpDbContextOptionsSqlServerExtensions.UseSqlServer wires Microsoft.EntityFrameworkCore.SqlServer into AbpDbContextOptions, the AbpSqlServerModelBuilderExtensions marker, sequential-GUID defaults, the connection-string checker and version constraints in v7.4.0."
+---
+
+`Volo.Abp.EntityFrameworkCore.SqlServer` is a single-purpose package: it pulls in `Microsoft.EntityFrameworkCore.SqlServer`, exposes an `AbpDbContextOptions.UseSqlServer(...)` extension that every application module calls inside `ConfigureServices`, sets a SQL Server-friendly default for the framework's sequential-GUID generator, registers a `SqlServerConnectionStringChecker` and ships an `AbpSqlServerModelBuilderExtensions.UseSqlServer(modelBuilder)` helper that tags the model with `EfCoreDatabaseProvider.SqlServer` so convention helpers can branch on the provider.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/EntityFrameworkCore/SqlServer/AbpEntityFrameworkCoreSqlServerModule.cs` | Module that `DependsOn(typeof(AbpEntityFrameworkCoreModule))`. Sets `AbpSequentialGuidGeneratorOptions.DefaultSequentialGuidType = SequentialGuidType.SequentialAtEnd`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsSqlServerExtensions.cs` | `UseSqlServer(this AbpDbContextOptions ...)` and `UseSqlServer<TDbContext>(...)`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextConfigurationContextSqlServerExtensions.cs` | `UseSqlServer(this AbpDbContextConfigurationContext ...)` — the actual `optionsBuilder.UseSqlServer(...)` call with `QuerySplittingBehavior.SplitQuery`. |
+| `Volo/Abp/EntityFrameworkCore/ConnectionStrings/SqlServerConnectionStringChecker.cs` | `IConnectionStringChecker` replacement that opens a transient connection against the `master` database to verify both connectivity and database existence. |
+| `Microsoft/EntityFrameworkCore/AbpSqlServerModelBuilderExtensions.cs` | `modelBuilder.UseSqlServer()` shorthand that sets the model annotation `EfCoreDatabaseProvider.SqlServer`. |
+| `Volo.Abp.EntityFrameworkCore.SqlServer.csproj` | Targets `net7.0`; references `Microsoft.EntityFrameworkCore.SqlServer` via the shared `$(MicrosoftEntityFrameworkCorePackageVersion)` property (7.0.x in v7.4.0). |
+
+## The module
+
+```csharp
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCoreSqlServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAtEnd;
+            }
+        });
+    }
+}
+```
+
+The dependency on `AbpEntityFrameworkCoreModule` guarantees that `AbpDbContextOptions` is already in the service collection by the time `UseSqlServer` is invoked downstream. The `DefaultSequentialGuidType` is set to `SequentialAtEnd`, which is the right choice for SQL Server's clustered index on `uniqueidentifier`: SQL Server compares GUIDs byte-by-byte starting from the last 6 bytes (the so-called "node" portion), so placing the monotonic component at the end produces sequential inserts and avoids B-tree page splits. The null-check makes the default *non-clobbering* — if an earlier module (or your application) has already set the value, the SQL Server module respects it.
+
+## `AbpDbContextOptions.UseSqlServer`
+
+```csharp
+public static class AbpDbContextOptionsSqlServerExtensions
+{
+    public static void UseSqlServer(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<SqlServerDbContextOptionsBuilder> sqlServerOptionsAction = null)
+    {
+        options.Configure(context => context.UseSqlServer(sqlServerOptionsAction));
+    }
+
+    public static void UseSqlServer<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<SqlServerDbContextOptionsBuilder> sqlServerOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+    {
+        options.Configure<TDbContext>(context => context.UseSqlServer(sqlServerOptionsAction));
+    }
+}
+```
+
+The extension hands a closure to `AbpDbContextOptions.Configure(...)` (the default form) or `Configure<TDbContext>(...)` (per-DbContext). Inside the closure, `context.UseSqlServer(sqlServerOptionsAction)` is the *other* extension method below.
+
+The forwarded `Action<SqlServerDbContextOptionsBuilder>` is where you set SQL Server-specific options: `EnableRetryOnFailure(...)`, `MigrationsAssembly("MyApp.EntityFrameworkCore")`, `CommandTimeout(60)`, `UseHierarchyId()`. Example:
+
+```csharp
+Configure<AbpDbContextOptions>(options =>
+{
+    options.UseSqlServer(sql =>
+    {
+        sql.EnableRetryOnFailure(maxRetryCount: 3);
+        sql.MigrationsAssembly("MyApp.EntityFrameworkCore");
+        sql.MinBatchSize(2);
+    });
+});
+```
+
+## `AbpDbContextConfigurationContext.UseSqlServer`
+
+The inner extension actually configures EF's options builder:
+
+```csharp
+public static DbContextOptionsBuilder UseSqlServer(
+    [NotNull] this AbpDbContextConfigurationContext context,
+    [CanBeNull] Action<SqlServerDbContextOptionsBuilder> sqlServerOptionsAction = null)
+{
+    if (context.ExistingConnection != null)
+    {
+        return context.DbContextOptions.UseSqlServer(context.ExistingConnection, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            sqlServerOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+    else
+    {
+        return context.DbContextOptions.UseSqlServer(context.ConnectionString, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            sqlServerOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+}
+```
+
+Two points worth highlighting:
+
+* **`QuerySplittingBehavior.SplitQuery` is forced** before the user's callback runs. The user can still call `optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SingleQuery)` to opt out — EF Core uses the *last* registration. This default avoids the cartesian-explosion problem when an `.Include` brings collections.
+* **`ExistingConnection` is used when present.** Integration tests typically create one shared `SqlConnection` (or `Microsoft.Data.Sqlite.SqliteConnection` against LocalDb in CI) and pass it through `AbpDbContextConfigurationContext` so every DbContext under test reuses the same physical connection.
+
+## Model-builder marker
+
+`Microsoft/EntityFrameworkCore/AbpSqlServerModelBuilderExtensions.cs`:
+
+```csharp
+public static class AbpSqlServerModelBuilderExtensions
+{
+    public static void UseSqlServer(this ModelBuilder modelBuilder)
+    {
+        modelBuilder.SetDatabaseProvider(EfCoreDatabaseProvider.SqlServer);
+    }
+}
+```
+
+`SetDatabaseProvider` (declared on `Microsoft/EntityFrameworkCore/AbpModelBuilderExtensions.cs`) stores the enum value on the model so that ABP convention helpers — for example the JSON column converter for `ExtraProperties` — can branch on the provider in shared modules. `AbpDbContext.OnModelCreating` already auto-detects the provider from `Database.ProviderName`; calling `modelBuilder.UseSqlServer()` manually is only useful when you build the model outside of an `AbpDbContext` (e.g. design-time scaffolding, `IModelCustomizer` overrides) and still want the convention helpers to see the right `EfCoreDatabaseProvider`.
+
+## Connection-string checker
+
+`SqlServerConnectionStringChecker`:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class SqlServerConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        var connString = new SqlConnectionStringBuilder(connectionString) { ConnectTimeout = 1 };
+
+        var oldDatabaseName = connString.InitialCatalog;
+        connString.InitialCatalog = "master";
+
+        try
+        {
+            await using var conn = new SqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception)
+        {
+            return result;
+        }
+    }
+}
+```
+
+`AbpConnectionStringCheckResult` exposes `Connected` and `DatabaseExists` booleans. The checker:
+
+1. Forces `ConnectTimeout = 1` so probe calls do not block tenant administration UIs for the default 30 seconds.
+2. Connects to `master` first to confirm reachability (`Connected = true`).
+3. Issues `ChangeDatabaseAsync(oldDatabaseName)` to verify the target database actually exists. Failure here leaves `DatabaseExists = false`.
+
+The `[Dependency(ReplaceServices = true)]` attribute swaps the default `NullConnectionStringChecker` registered by the data module. Other provider packages do the same.
+
+## Sequential GUID rationale
+
+`SequentialGuidType.SequentialAtEnd` instructs `SequentialGuidGenerator` (in `Volo.Abp.Guids`) to place the monotonic timestamp at the end of the GUID's byte array, matching SQL Server's `NEWSEQUENTIALID()` semantics. Each provider sets a different default:
+
+| Provider module | Default `SequentialGuidType` |
+| --- | --- |
+| `AbpEntityFrameworkCoreSqlServerModule` | `SequentialAtEnd` |
+| `AbpEntityFrameworkCorePostgreSqlModule` | `SequentialAsString` |
+| `AbpEntityFrameworkCoreMySQLModule` | `SequentialAsString` |
+| `AbpEntityFrameworkCoreOracleModule` | `SequentialAsBinary` |
+| `AbpEntityFrameworkCoreSqliteModule` | (no override, sticks with framework default) |
+| `AbpMongoDbModule` | (no override) |
+
+When the application takes a dependency on more than one provider module (rare but happens in multi-database test rigs), the order in which modules call `Configure<AbpSequentialGuidGeneratorOptions>(...)` becomes significant. The null-check inside each module means the *first* module to set the value wins.
+
+## Version constraints
+
+`Volo.Abp.EntityFrameworkCore.SqlServer.csproj`:
+
+```xml
+<TargetFramework>net7.0</TargetFramework>
+<PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer"
+                  Version="$(MicrosoftEntityFrameworkCorePackageVersion)" />
+```
+
+The shared `$(MicrosoftEntityFrameworkCorePackageVersion)` MSBuild property is defined in `framework/common.props` (7.0.x in the v7.4.0 release). Microsoft.Data.SqlClient is pulled transitively via `Microsoft.EntityFrameworkCore.SqlServer`. The package targets `net7.0` exclusively — there is no `netstandard2.x` fallback because EF Core 7 dropped support for it.
+
+## Registration pattern in your module
+
+A typical SQL Server application looks like:
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCoreSqlServerModule),
+    /* other modules */)]
+public class MyApplicationEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseSqlServer(sql =>
+            {
+                sql.MigrationsAssembly(typeof(MyApplicationEntityFrameworkCoreModule).Assembly.FullName);
+                sql.EnableRetryOnFailure();
+            });
+        });
+    }
+}
+```
+
+Three knobs to remember:
+
+* The order between `AddAbpDbContext<>` and `Configure<AbpDbContextOptions>` does not matter; both are wired during the same `ConfigureServices` phase and only run during `IDbContextProvider.GetDbContextAsync`.
+* If you call `options.UseSqlServer<MyAppDbContext>(...)`, the configuration is scoped to that specific DbContext; other DbContexts can use a different provider (PostgreSQL for tenant data, SQL Server for host).
+* `MigrationsAssembly` is usually required when your migrations live in a separate project from the DbContext, e.g. an `*.EntityFrameworkCore.DbMigrations` project.
+
+## Gotchas
+
+* **Connection strings need `MultipleActiveResultSets=true` or `EnableRetryOnFailure`.** Without MARS, a streaming `IAsyncEnumerable<TEntity>` followed by a second async call in the same scope throws `InvalidOperationException`. ABP does not set MARS for you.
+* **`SequentialAtEnd` does *not* prevent index fragmentation forever.** GUIDs still have entropy; if you really need an `INT IDENTITY`-style clustered key, declare the entity with `[DatabaseGenerated(DatabaseGeneratedOption.Identity)]` on `Id`. `AbpDbContext.TrySetGuidId` respects the attribute and skips GUID generation.
+* **Open `master` connection during connection-string check.** Some restricted SQL accounts cannot read `master`. The checker simply reports `Connected = false`; supply a custom `IConnectionStringChecker` if your security policy forbids master access.
+* **EF Core 7 `Date` types map to `date`/`datetime2(7)`.** ABP forces UTC conversion for `DateTime` through `AbpDateTimeValueConverter` — beware that `datetime2(7)` precision exceeds CLR `DateTime.Ticks` granularity, so round-tripping is fine but cross-database comparisons may differ.
+* **Per-tenant connection strings.** Tenants store overrides through `Volo.Abp.TenantManagement`. The connection-string resolver looks up the connection name (`"Default"` by default), so different tenants can transparently run against different SQL Server instances without re-registering the DbContext.
+* **EF Core warnings.** The base module suppresses `LazyLoadOnDisposedContextWarning` only. SQL Server-specific warnings such as `SqlServerEventId.SavepointsDisabledBecauseOfMARS` will still surface; if you enable MARS, also call `sql.EnableRetryOnFailure(...)` carefully because retries cannot be combined with savepoints.
+* **`UseQuerySplittingBehavior(SplitQuery)` is forced.** Override it inside your action if you want `SingleQuery`. The last `UseQuerySplittingBehavior` call wins.

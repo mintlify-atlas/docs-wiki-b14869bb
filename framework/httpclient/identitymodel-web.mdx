@@ -1,0 +1,315 @@
+---
+title: "Volo.Abp.Http.Client.IdentityModel.Web: forwarding the user's HttpContext token"
+sidebarTitle: "IdentityModel.Web"
+description: "How HttpContextAbpAccessTokenProvider pulls the OIDC access_token from the cookie session and HttpContextIdentityModelRemoteServiceHttpClientAuthenticator forwards it, falling back to client_credentials when there is no signed-in user."
+---
+
+`Volo.Abp.Http.Client.IdentityModel.Web` is the package an ASP.NET Core
+host references when it wants outgoing proxy calls to **carry the
+signed‑in user's access token**. It replaces two services that
+`Volo.Abp.Http.Client.IdentityModel` registered:
+
+- `IAbpAccessTokenProvider` → `HttpContextAbpAccessTokenProvider`
+- `IRemoteServiceHttpClientAuthenticator` →
+  `HttpContextIdentityModelRemoteServiceHttpClientAuthenticator`
+
+Together they implement *“if a user is signed in, propagate that
+user's bearer token to the downstream service; otherwise fall back to
+client‑credentials.”*
+
+## Package layout
+
+```
+framework/src/Volo.Abp.Http.Client.IdentityModel.Web/Volo/Abp/Http/Client/IdentityModel/Web/
+├── AbpHttpClientIdentityModelWebModule.cs
+├── HttpContextAbpAccessTokenProvider.cs
+└── HttpContextIdentityModelRemoteServiceHttpClientAuthenticator.cs
+```
+
+Three files — every line of the package matters.
+
+## The module
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.Web/Volo/Abp/Http/Client/IdentityModel/Web/AbpHttpClientIdentityModelWebModule.cs
+[DependsOn(
+    typeof(AbpHttpClientIdentityModelModule)
+    )]
+public class AbpHttpClientIdentityModelWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpContextAccessor();
+    }
+}
+```
+
+The only explicit DI registration is `AddHttpContextAccessor()` — the
+two real services (`HttpContextAbpAccessTokenProvider`,
+`HttpContextIdentityModelRemoteServiceHttpClientAuthenticator`) are
+conventionally registered through `ITransientDependency` /
+`[Dependency(ReplaceServices = true)]`.
+
+## The access‑token provider
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.Web/Volo/Abp/Http/Client/IdentityModel/Web/HttpContextAbpAccessTokenProvider.cs
+[Dependency(ReplaceServices = true)]
+public class HttpContextAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    protected IHttpContextAccessor HttpContextAccessor { get; }
+
+    public HttpContextAbpAccessTokenProvider(IHttpContextAccessor httpContextAccessor)
+    {
+        HttpContextAccessor = httpContextAccessor;
+    }
+
+    public virtual async Task<string> GetTokenAsync()
+    {
+        var httpContext = HttpContextAccessor?.HttpContext;
+        if (httpContext == null)
+        {
+            return null;
+        }
+
+        return await httpContext.GetTokenAsync("access_token");
+    }
+}
+```
+
+Three pieces, in order:
+
+1. **`[Dependency(ReplaceServices = true)]`** swaps the
+   `NullAbpAccessTokenProvider` registered by
+   `Volo.Abp.Http.Client`. Any caller of `IAbpAccessTokenProvider`
+   inside the request scope now gets the cookie‑based provider
+   automatically.
+
+2. **`IHttpContextAccessor.HttpContext == null`** path. The provider
+   is also resolved from background services, hosted services, and
+   from the dynamic‑proxy descriptor fetch which runs from a hosted
+   `HttpClient` outside a request. Returning `null` gracefully cedes
+   to the OIDC fallback in the authenticator.
+
+3. **`httpContext.GetTokenAsync("access_token")`** is the
+   `AuthenticationHttpContextExtensions` method that walks the
+   authentication handler registered for the user's scheme and
+   retrieves the stored `access_token`. With ABP's standard
+   OpenIdConnect setup, the `access_token` is saved during the
+   sign‑in callback by the OpenIdConnect handler with
+   `SaveTokens = true`, which serialises it into the auth cookie.
+
+The same cookie‑stored `id_token` and `refresh_token` are reachable
+the same way (`"id_token"`, `"refresh_token"`) but the proxy pipeline
+only needs the access token.
+
+## The authenticator
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel.Web/Volo/Abp/Http/Client/IdentityModel/Web/HttpContextIdentityModelRemoteServiceHttpClientAuthenticator.cs
+[Dependency(ReplaceServices = true)]
+public class HttpContextIdentityModelRemoteServiceHttpClientAuthenticator : IdentityModelRemoteServiceHttpClientAuthenticator
+{
+    protected IAbpAccessTokenProvider AccessTokenProvider { get; }
+
+    public HttpContextIdentityModelRemoteServiceHttpClientAuthenticator(
+        IIdentityModelAuthenticationService identityModelAuthenticationService,
+        IAbpAccessTokenProvider accessTokenProvider)
+        : base(identityModelAuthenticationService)
+    {
+        AccessTokenProvider = accessTokenProvider;
+    }
+
+    public async override Task Authenticate(RemoteServiceHttpClientAuthenticateContext context)
+    {
+        if (context.RemoteService.GetUseCurrentAccessToken() != false)
+        {
+            var accessToken = await AccessTokenProvider.GetTokenAsync();
+            if (accessToken != null)
+            {
+                context.Request.SetBearerToken(accessToken);
+                return;
+            }
+        }
+
+        await base.Authenticate(context);
+    }
+}
+```
+
+This is the authentication decision the rest of the package exists to
+make:
+
+| Condition | Action |
+| --- | --- |
+| `RemoteService["UseCurrentAccessToken"]` is `"false"` | Skip the cookie token entirely. Always go straight to client‑credentials. |
+| `AccessTokenProvider.GetTokenAsync()` returns a non‑null token | Attach it as a bearer token to the **request** (not the client), return. |
+| Otherwise | Fall back to `IdentityModelRemoteServiceHttpClientAuthenticator.Authenticate` (the base class), which sets the bearer on the **client** using `IIdentityModelAuthenticationService.TryAuthenticateAsync`. |
+
+Two subtleties:
+
+- **`SetBearerToken` on the request, not the client.** Compare with
+  the base class, which writes to `client.DefaultRequestHeaders`. The
+  cookie‑sourced token is per‑user, per‑request; if it were written
+  to `DefaultRequestHeaders` the next user using the same named
+  `HttpClient` would inherit the stale bearer. Writing to
+  `requestMessage.Headers` ensures the token lives only as long as
+  this one request.
+- **`SetBearerToken` is an extension from `IdentityModel.Client`.**
+  It writes `Authorization: Bearer <token>` directly to the
+  request — including escaping subtleties such as omitting the
+  scheme prefix if the caller already provided one.
+
+The `UseCurrentAccessToken` flag is the explicit opt‑out:
+
+```csharp framework/src/Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/RemoteServiceConfigurationExtensions.cs
+[CanBeNull]
+public static bool? GetUseCurrentAccessToken([NotNull] this RemoteServiceConfiguration configuration)
+{
+    Check.NotNullOrEmpty(configuration, nameof(configuration));
+
+    var value = configuration.GetOrDefault(UseCurrentAccessTokenName);
+    if (value == null)
+    {
+        return null;
+    }
+
+    return bool.Parse(value);
+}
+```
+
+Set it from `appsettings.json` when you want server‑to‑server calls to
+use the host's own client credentials even when the request is
+on‑behalf‑of a user:
+
+```json
+{
+  "RemoteServices": {
+    "BackgroundJobs": {
+      "BaseUrl": "https://jobs.example.com",
+      "UseCurrentAccessToken": "false",
+      "IdentityClient": "JobsServiceClient"
+    }
+  }
+}
+```
+
+## End‑to‑end flow
+
+```
+[Request enters MVC / Razor pages]
+        │
+        ▼
+HttpContext built; the OpenIdConnect cookie carries access_token (SaveTokens = true)
+        │
+        ▼
+Application code calls _userAppService.GetAsync(id) (a proxy)
+        │
+        ▼
+ClientProxyBase<T>.RequestAsync
+        builds HttpRequestMessage
+        │
+        ▼
+if Action.AllowAnonymous != true:
+    ClientAuthenticator.Authenticate(context)
+        │
+        ▼
+HttpContextIdentityModelRemoteServiceHttpClientAuthenticator
+    if GetUseCurrentAccessToken() == false → skip cookie token
+    else
+        token = HttpContextAccessor.HttpContext?.GetTokenAsync("access_token")
+        if token != null
+            requestMessage.SetBearerToken(token)   ◄── per-request
+            return
+    base.Authenticate(...)
+        │
+        ▼
+IdentityModelRemoteServiceHttpClientAuthenticator (the fallback)
+    TryAuthenticateAsync(client, GetIdentityClient() ?? RemoteServiceName)
+        │
+        ▼
+IIdentityModelAuthenticationService
+    discovery doc → token endpoint → IDistributedCache<...>
+    client.DefaultRequestHeaders.Authorization = "Bearer <token>"  ◄── shared
+```
+
+The combined behaviour is the canonical "BFF" pattern: a logged‑in
+user's call is delegated downstream with their own identity; a
+background job's call (no HttpContext) automatically falls back to a
+client credentials token negotiated with the configured `IdentityClient`.
+
+## Why is `HttpContextAccessor` important?
+
+Without `IHttpContextAccessor`, `HttpContextAbpAccessTokenProvider`
+cannot reach the cookie. The module registers the accessor explicitly
+because `Volo.Abp.Http.Client.IdentityModel` does not depend on
+ASP.NET Core MVC — it has no reason to add the accessor itself. The
+addition is idempotent: `AddHttpContextAccessor` uses
+`TryAddSingleton`, so even if the host or another module already added
+it, the call is harmless.
+
+## Composition with the [Web package](/framework/httpclient/http-client-web)
+
+`Volo.Abp.Http.Client.Web` and `Volo.Abp.Http.Client.IdentityModel.Web`
+are independent. A typical BFF host depends on both:
+
+| Package | Job |
+| --- | --- |
+| `Volo.Abp.Http.Client.Web` | Re‑exposes the static client proxies as MVC controllers (so the BFF speaks the same API surface as the downstream service). |
+| `Volo.Abp.Http.Client.IdentityModel.Web` | Makes outgoing proxy calls carry the cookie‑signed user's token. |
+
+Together they implement a thin pass‑through host:
+
+```
+Browser ──cookie──▶ BFF host
+                      │
+                      ├── Proxy class is also a real MVC controller
+                      │   (Volo.Abp.Http.Client.Web)
+                      │
+                      ▼
+                   Action body delegates to the same proxy class
+                   (no separate "controller" code)
+                      │
+                      ▼
+                   ClientProxyBase<T>.RequestAsync
+                      │
+                      ▼
+                   HttpContextIdentityModelRemoteService...Authenticator
+                      │  forwards the cookie access_token
+                      ▼
+                   Downstream API
+```
+
+## Caveats
+
+- **`SaveTokens` must be `true`.** If the OpenIdConnect handler is
+  configured without `options.SaveTokens = true`, the access token is
+  thrown away after the sign‑in callback. `GetTokenAsync("access_token")`
+  then returns `null` and the authenticator falls back to client
+  credentials.
+- **Token expiration is the user's problem.** This package does not
+  refresh the cookie token. When the cookie's `access_token`
+  expires, downstream services will reject the request with `401`
+  and `ClientProxyBase<T>` will throw `AbpRemoteCallException`. ABP's
+  separate token‑management infrastructure (for example, the OIDC
+  refresh helpers in the Identity / OpenIddict packages) is what
+  refreshes the cookie before this expires.
+- **Scheme name.** `GetTokenAsync("access_token")` reads from the
+  *default* authentication scheme. Hosts using multiple schemes must
+  either set the default to the OpenIdConnect scheme or override
+  `HttpContextAbpAccessTokenProvider.GetTokenAsync` to read from a
+  specific scheme.
+- **Header name.** `SetBearerToken(token)` writes the literal
+  `Authorization: Bearer <token>`. If your downstream service expects
+  a different header or scheme, you will need a different
+  authenticator.
+
+## Related pages
+
+- [identitymodel](/framework/httpclient/identitymodel) — the
+  `IdentityModelRemoteServiceHttpClientAuthenticator` base class and
+  the `TryAuthenticateAsync` fallback.
+- [http-client-web](/framework/httpclient/http-client-web) — the
+  complementary package that makes the proxy classes appear as
+  controllers on the server side.
+- [identitymodel-webassembly](/framework/httpclient/identitymodel-webassembly) —
+  the Blazor WebAssembly counterpart.
+- [identitymodel-mauiblazor](/framework/httpclient/identitymodel-mauiblazor) —
+  the MAUI Blazor counterpart.

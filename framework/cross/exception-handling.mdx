@@ -1,0 +1,339 @@
+---
+title: "Volo.Abp.ExceptionHandling: exception → RemoteServiceErrorInfo"
+sidebarTitle: "Exception Handling"
+description: "How AbpExceptionHandlingOptions, DefaultExceptionToErrorInfoConverter, and the localization mapping turn an exception into a 4xx/5xx JSON payload — with sensitive details gated by SendExceptionsDetailsToClients."
+---
+
+`Volo.Abp.ExceptionHandling` is the framework's *conversion* layer, not its catch-everything layer. ASP.NET Core's `AbpExceptionHandlingMiddleware` (in `Volo.Abp.AspNetCore`) and the MVC exception filters call into `IExceptionToErrorInfoConverter` to turn whatever was thrown into a `RemoteServiceErrorInfo` — the wire-format payload that ABP's JavaScript and C# HTTP clients know how to deserialize back into `AbpRemoteCallException`. The default converter looks at the exception's marker interfaces (`IUserFriendlyException`, `IHasErrorCode`, `IHasValidationErrors`, `EntityNotFoundException`, `AbpDbConcurrencyException`, etc.), localizes the message via the error-code namespace mapping, and decides how much detail (stack traces, inner exceptions) is safe to emit based on `AbpExceptionHandlingOptions.SendExceptionsDetailsToClients`.
+
+This page covers the runtime in `framework/src/Volo.Abp.ExceptionHandling/`. The notifier/subscriber side (`IExceptionNotifier`, `IExceptionSubscriber`) lives in `Volo.Abp.Core` and is documented separately — they are *callbacks* that the middleware fires *in addition to* the conversion, not the conversion itself.
+
+## File inventory
+
+| Path under `framework/src/Volo.Abp.ExceptionHandling/` | Role |
+| --- | --- |
+| `Volo/Abp/ExceptionHandling/AbpExceptionHandlingModule.cs` | Module — registers virtual JSON localization for the error resource. |
+| `Volo/Abp/ExceptionHandling/Localization/AbpExceptionHandlingResource.cs` | Resource type carrying the error-message strings. |
+| `Volo/Abp/AspNetCore/ExceptionHandling/AbpExceptionHandlingOptions.cs` | `SendExceptionsDetailsToClients`, `SendStackTraceToClients`. |
+| `Volo/Abp/AspNetCore/ExceptionHandling/IExceptionToErrorInfoConverter.cs` | The conversion seam. |
+| `Volo/Abp/AspNetCore/ExceptionHandling/DefaultExceptionToErrorInfoConverter.cs` | Default implementation — 323 lines of decision tree. |
+| `Volo/Abp/Domain/Entities/EntityNotFoundException.cs` | Re-exported here so the converter can format the message without circular dependencies. |
+| `Volo/Abp/Http/Client/AbpRemoteCallException.cs` | The exception type the C# HTTP client throws after re-reading a `RemoteServiceErrorInfo`. |
+| `Volo/Abp/Http/RemoteServiceErrorInfo.cs` | Wire shape — `Code`, `Message`, `Details`, `Data`, `ValidationErrors`. |
+| `Volo/Abp/Http/RemoteServiceErrorResponse.cs` | `{ "error": RemoteServiceErrorInfo }` envelope. |
+| `Volo/Abp/Http/RemoteServiceValidationErrorInfo.cs` | Per-field validation error (`Message`, `Members[]`). |
+
+The notifier/subscriber pair that lives elsewhere:
+
+| Path | Role |
+| --- | --- |
+| `framework/src/Volo.Abp.Core/Volo/Abp/ExceptionHandling/IExceptionNotifier.cs` | `NotifyAsync(ExceptionNotificationContext)`. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/ExceptionHandling/ExceptionNotifier.cs` | Fan-out — invokes every registered `IExceptionSubscriber`. |
+| `framework/src/Volo.Abp.Core/Volo/Abp/ExceptionHandling/IExceptionSubscriber.cs` | User hook for side-effects (telemetry, alerts). |
+
+## Key abstractions
+
+| Member | Signature | Purpose |
+| --- | --- | --- |
+| `AbpExceptionHandlingOptions.SendExceptionsDetailsToClients` | `bool` (default `false`) | When true, the converter emits exception type names, inner exception chains, and raw messages — for diagnostic environments only. |
+| `AbpExceptionHandlingOptions.SendStackTraceToClients` | `bool` (default `true`) | Adds a `STACK TRACE: ...` block to `Details` when details are being sent. |
+| `IExceptionToErrorInfoConverter.Convert(Exception, Action<AbpExceptionHandlingOptions>?)` | `RemoteServiceErrorInfo` | The current API; callers pass an options mutator. |
+| `IExceptionToErrorInfoConverter.Convert(Exception, bool includeSensitiveDetails)` | `RemoteServiceErrorInfo` | `[Obsolete]` legacy overload — wraps the new one. |
+| `RemoteServiceErrorInfo.Code` | `string?` | Pulled from `IHasErrorCode.Code` when present. |
+| `RemoteServiceErrorInfo.Message` | `string?` | Localized via `MapCodeNamespace` table when possible. |
+| `RemoteServiceErrorInfo.Details` | `string?` | Either `IHasErrorDetails.Details`, a validation narrative, or (in detail mode) a stack-trace dump. |
+| `RemoteServiceErrorInfo.Data` | `IDictionary?` | Mirror of `Exception.Data` — used by message-template substitution. |
+| `RemoteServiceErrorInfo.ValidationErrors` | `RemoteServiceValidationErrorInfo[]?` | One per `ValidationResult`; member names are camelCased. |
+| `IExceptionNotifier.NotifyAsync(ctx)` | `Task` | Fan-out to subscribers. Independent of conversion. |
+| `IUserFriendlyException` | marker | Indicates the message is safe to show to end users. |
+| `IHasErrorCode` | `string? Code { get; }` | Drives localization namespace lookup (the prefix before `:`). |
+| `IHasErrorDetails` | `string? Details { get; }` | Free-text detail block (e.g. multi-line copy). |
+| `IHasValidationErrors` | `IList<ValidationResult> ValidationErrors` | Marker the converter keys on to emit the `ValidationErrors` array. |
+| `ILocalizeErrorMessage.LocalizeMessage(LocalizationContext)` | `string` | Hand-rolled localization escape hatch for exceptions that can't use `Code:` notation. |
+
+## Decision tree — `DefaultExceptionToErrorInfoConverter`
+
+```mermaid
+flowchart TD
+    Start([exception]) --> Detailed{options.SendExceptionsDetailsToClients?}
+    Detailed -- yes --> Detailed1[CreateDetailedErrorInfoFromException]
+    Detailed -- no  --> Actual[TryToGetActualException unwrap AggregateException]
+    Actual --> RemoteCall{AbpRemoteCallException with Error?}
+    RemoteCall -- yes --> Pass[Return exception.Error verbatim]
+    RemoteCall -- no  --> DbConc{AbpDbConcurrencyException?}
+    DbConc -- yes --> DbMsg[L\"AbpDbConcurrencyErrorMessage\"]
+    DbConc -- no  --> NotFound{EntityNotFoundException?}
+    NotFound -- yes --> NfMsg[CreateEntityNotFoundError]
+    NotFound -- no  --> Friendly{IUserFriendlyException OR AbpRemoteCallException?}
+    Friendly -- yes --> FriendlyMsg[Use exception.Message + IHasErrorDetails.Details]
+    Friendly -- no  --> NoMessage[Leave Message empty]
+    NoMessage --> ValMark{IHasValidationErrors?}
+    FriendlyMsg --> ValMark
+    ValMark -- yes --> ValPath[Set Message=L\"ValidationErrorMessage\", Details=narrative, ValidationErrors[]]
+    ValMark -- no  --> Locale[TryToLocalizeExceptionMessage]
+    ValPath --> Locale
+    Locale --> Empty{Message empty?}
+    Empty -- yes --> Internal[Set L\"InternalServerErrorMessage\"]
+    Empty -- no  --> Done
+    Internal --> Done
+    Done([RemoteServiceErrorInfo])
+    Detailed1 --> Done
+    Pass --> SetCode
+    DbMsg --> SetCode
+    NfMsg --> SetCode
+    Done --> SetCode[If IHasErrorCode, copy Code]
+```
+
+### The two top-level entry points
+
+```csharp
+public RemoteServiceErrorInfo Convert(Exception exception, Action<AbpExceptionHandlingOptions>? options = null)
+{
+    var exceptionHandlingOptions = CreateDefaultOptions();   // SendExceptionsDetailsToClients=false, SendStackTraceToClients=true
+    options?.Invoke(exceptionHandlingOptions);
+
+    var errorInfo = CreateErrorInfoWithoutCode(exception, exceptionHandlingOptions);
+
+    if (exception is IHasErrorCode hasErrorCodeException)
+        errorInfo.Code = hasErrorCodeException.Code;
+
+    return errorInfo;
+}
+```
+
+The `Code` is **applied last** — *after* localization — so message-template substitution is keyed on the *original* exception code, but the `Code` returned to the client is preserved verbatim. The middleware uses the code to drive HTTP status:
+
+- `IBusinessException` / `IHasErrorCode` with a 4xx-mapped code → 400.
+- `AbpAuthorizationException` → 401 (anonymous) or 403 (authenticated).
+- `EntityNotFoundException` → 404.
+- `AbpValidationException` → 400.
+- otherwise → 500.
+
+The mapping itself lives in `AbpAspNetCoreModule`, not in the converter.
+
+### `CreateErrorInfoWithoutCode` — the non-detailed branch
+
+When `SendExceptionsDetailsToClients == false` (the default — what production should run with), the converter walks the type tree top-down:
+
+```csharp
+if (options.SendExceptionsDetailsToClients)
+    return CreateDetailedErrorInfoFromException(exception, options.SendStackTraceToClients);
+
+exception = TryToGetActualException(exception);  // unwrap AggregateException -> Abp* inside
+
+if (exception is AbpRemoteCallException remoteCallException && remoteCallException.Error != null)
+    return remoteCallException.Error;            // pass-through from upstream service
+
+if (exception is AbpDbConcurrencyException)
+    return new RemoteServiceErrorInfo(L["AbpDbConcurrencyErrorMessage"]);
+
+if (exception is EntityNotFoundException)
+    return CreateEntityNotFoundError(...);       // L["EntityNotFoundErrorMessage"] with EntityType.Name + Id
+
+var errorInfo = new RemoteServiceErrorInfo();
+
+if (exception is IUserFriendlyException || exception is AbpRemoteCallException)
+{
+    errorInfo.Message = exception.Message;
+    errorInfo.Details = (exception as IHasErrorDetails)?.Details;
+}
+
+if (exception is IHasValidationErrors)
+{
+    if (errorInfo.Message.IsNullOrEmpty()) errorInfo.Message = L["ValidationErrorMessage"];
+    if (errorInfo.Details.IsNullOrEmpty()) errorInfo.Details = GetValidationErrorNarrative(...);
+    errorInfo.ValidationErrors = GetValidationErrorInfos(...);
+}
+
+TryToLocalizeExceptionMessage(exception, errorInfo);
+
+if (errorInfo.Message.IsNullOrEmpty())
+    errorInfo.Message = L["InternalServerErrorMessage"];
+
+errorInfo.Data = exception.Data;
+return errorInfo;
+```
+
+Three observations:
+
+- `IUserFriendlyException` is the **only** way to leak an exception's raw `.Message` to the client in the default configuration. Throwing `new InvalidOperationException("DB password expired")` will surface as `"An internal error occurred during your request!"` — the diagnostic detail is logged but not transmitted.
+- `AbpRemoteCallException` whose `Error` is non-null is passed through verbatim. This is the C# HTTP client returning a downstream error to its own caller without re-encoding.
+- `Exception.Data` is *always* attached. The framework relies on this for placeholder substitution.
+
+### `TryToLocalizeExceptionMessage` and the namespace map
+
+Exceptions implementing `IHasErrorCode` get a localization pass:
+
+```csharp
+var codeNamespace = exceptionWithErrorCode.Code.Split(':')[0];
+var localizationResourceType = LocalizationOptions.ErrorCodeNamespaceMappings.GetOrDefault(codeNamespace);
+if (localizationResourceType == null) return;
+
+var stringLocalizer = StringLocalizerFactory.Create(localizationResourceType);
+var localizedString = stringLocalizer[exceptionWithErrorCode.Code];
+if (localizedString.ResourceNotFound) return;
+
+var localizedValue = localizedString.Value;
+
+if (exception.Data != null && exception.Data.Count > 0)
+{
+    foreach (var key in exception.Data.Keys)
+        localizedValue = localizedValue.Replace("{" + key + "}", exception.Data[key]?.ToString());
+}
+
+errorInfo.Message = localizedValue;
+```
+
+So if `AbpFeatureErrorCodes.FeatureIsNotEnabled = "Volo.Feature:010001"` and the `Volo.Feature` namespace is mapped (it is — by `AbpFeaturesModule`) to `AbpFeatureResource`, the localizer resolves `"Volo.Feature:010001"` to *"Feature is not enabled: {FeatureName}"* and `.WithData("FeatureName", "Sms")` substitutes the placeholder.
+
+Modules declare their mappings via:
+
+```csharp
+Configure<AbpExceptionLocalizationOptions>(options =>
+{
+    options.MapCodeNamespace("MyApp", typeof(MyAppErrorResource));
+});
+```
+
+If no mapping exists, the exception falls through to whatever `errorInfo.Message` was set to earlier in the tree — typically `null`, which lands on `L["InternalServerErrorMessage"]`.
+
+`ILocalizeErrorMessage` is the manual escape hatch: implement it on a custom exception and supply your own `LocalizeMessage(LocalizationContext)` body. The converter calls it *before* the namespace lookup and returns early.
+
+### The detailed branch
+
+```csharp
+protected virtual RemoteServiceErrorInfo CreateDetailedErrorInfoFromException(Exception exception, bool sendStackTraceToClients)
+{
+    var detailBuilder = new StringBuilder();
+    AddExceptionToDetails(exception, detailBuilder, sendStackTraceToClients);
+    var errorInfo = new RemoteServiceErrorInfo(exception.Message, detailBuilder.ToString(), data: exception.Data);
+
+    if (exception is AbpValidationException)
+        errorInfo.ValidationErrors = GetValidationErrorInfos((exception as AbpValidationException)!);
+
+    return errorInfo;
+}
+```
+
+`AddExceptionToDetails` walks `InnerException` and `AggregateException.InnerExceptions` recursively, optionally appending `STACK TRACE:` blocks per frame. The output is one giant string that the React/Angular dev tools can pretty-print.
+
+### Validation error mapping
+
+```csharp
+protected virtual RemoteServiceValidationErrorInfo[] GetValidationErrorInfos(IHasValidationErrors validationException)
+{
+    var validationErrorInfos = new List<RemoteServiceValidationErrorInfo>();
+
+    foreach (var validationResult in validationException.ValidationErrors)
+    {
+        var validationError = new RemoteServiceValidationErrorInfo(validationResult.ErrorMessage!);
+
+        if (validationResult.MemberNames != null && validationResult.MemberNames.Any())
+            validationError.Members = validationResult.MemberNames.Select(m => m.ToCamelCase()).ToArray();
+
+        validationErrorInfos.Add(validationError);
+    }
+
+    return validationErrorInfos.ToArray();
+}
+```
+
+Two things: member names are **camelCased** before being shipped (so JS-side form binding works), and the narrative version (`GetValidationErrorNarrative`) is *also* dumped into `Details` so users without a structured validation UI still see meaningful text.
+
+### `AggregateException` unwrapping
+
+```csharp
+protected virtual Exception TryToGetActualException(Exception exception)
+{
+    if (exception is AggregateException aggException && aggException.InnerException != null)
+    {
+        if (aggException.InnerException is AbpValidationException ||
+            aggException.InnerException is AbpAuthorizationException ||
+            aggException.InnerException is EntityNotFoundException ||
+            aggException.InnerException is IBusinessException)
+        {
+            return aggException.InnerException;
+        }
+    }
+    return exception;
+}
+```
+
+Only four exception types are unwrapped from `AggregateException`. Any other inner exception is left wrapped — the converter sees `AggregateException` and treats it as a generic internal error. This is intentional: a `Task.WhenAll(...)` that throws four `SqlException`s should not silently surface only the first one to the client.
+
+## Notifier vs. converter — different responsibilities
+
+`IExceptionToErrorInfoConverter` is *synchronous, deterministic, and side-effect free*. `IExceptionNotifier` is the async fan-out that the middleware and filters fire *in addition*:
+
+```csharp
+public virtual async Task NotifyAsync([NotNull] ExceptionNotificationContext context)
+{
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var exceptionSubscribers = scope.ServiceProvider.GetServices<IExceptionSubscriber>();
+        foreach (var exceptionSubscriber in exceptionSubscribers)
+        {
+            try { await exceptionSubscriber.HandleAsync(context); }
+            catch (Exception e)
+            {
+                Logger.LogWarning($"Exception subscriber of type {exceptionSubscriber.GetType().AssemblyQualifiedName} has thrown an exception!");
+                Logger.LogException(e, LogLevel.Warning);
+            }
+        }
+    }
+}
+```
+
+Subscribers are registered like any other DI service:
+
+```csharp
+services.AddTransient<IExceptionSubscriber, SentryExceptionSubscriber>();
+```
+
+Subscribers run inside a *new* DI scope (so they can resolve scoped services even when fired from `BackgroundJobExecuter`), and exceptions thrown by a subscriber are logged at `Warning` and swallowed — one telemetry pipeline failing must not prevent the next from running. The notifier is called by:
+
+- `AbpExceptionHandlingMiddleware` (one call per unhandled request exception).
+- `AbpExceptionFilter` / `AbpExceptionPageFilter` (per MVC action exception).
+- `BackgroundJobExecuter` (per job retry).
+- `AsyncPeriodicBackgroundWorkerBase` (per worker iteration failure).
+
+The notifier does not convert — it just observes.
+
+## Configuration
+
+```csharp
+Configure<AbpExceptionHandlingOptions>(options =>
+{
+    // Production safety:
+    options.SendExceptionsDetailsToClients = false;
+    options.SendStackTraceToClients = true;       // ignored when SendExceptionsDetailsToClients=false
+
+    // Development:
+    if (env.IsDevelopment())
+    {
+        options.SendExceptionsDetailsToClients = true;
+        options.SendStackTraceToClients = true;
+    }
+});
+
+Configure<AbpExceptionLocalizationOptions>(options =>
+{
+    options.MapCodeNamespace("BookStore", typeof(BookStoreResource));
+});
+```
+
+The two options are independent — `SendStackTraceToClients` is only consulted when `SendExceptionsDetailsToClients` is true; otherwise it has no effect.
+
+## Gotchas
+
+- **`SendExceptionsDetailsToClients = true` is dangerous.** It returns raw exception types, messages, *and* the inner-exception chain — including SQL exceptions with database names. Never enable in production.
+- **`IUserFriendlyException` is the only message-passthrough.** A custom `BusinessException` *with* `[Code]` localizes via the namespace map; without `[Code]` it surfaces as "Internal Server Error". If you want the message verbatim, also implement `IUserFriendlyException`.
+- **Placeholder substitution is `string.Replace`, not formatting.** Keys in `Exception.Data` are matched as `{Key}` literal — no `:`, no format specifiers. Numeric formatting must happen *before* you call `.WithData`.
+- **`AggregateException` of unknown inner type is opaque.** Wrap your own `Task.WhenAll` with `try/catch (AggregateException) { throw aggEx.Flatten().InnerExceptions[0]; }` if you want the first inner to surface.
+- **`EntityNotFoundException` without `EntityType` becomes a plain message.** The convenience branch uses `EntityType.Name` and `Id` to format `"BookEntity with id 5 was not found"`; if neither is set, only the raw message is used.
+- **`IExceptionNotifier` is not called by the converter.** The middleware/filter call it *separately*. A custom converter that wants to *also* fire the notifier must do it explicitly.
+- **camelCase member names break .NET binding round-trips.** `RemoteServiceValidationErrorInfo.Members` is camelCased server-side. If you write a custom client that re-binds to a .NET DTO via PascalCase, you must convert back.
+- **`Volo.Abp.Http.Client` re-throws `AbpRemoteCallException`.** When the C# HTTP client receives a `{ error: ... }` envelope, it materializes an `AbpRemoteCallException` whose `.Error == RemoteServiceErrorInfo`. The converter passes that through verbatim if a host re-throws it — so error codes and validation arrays survive a hop.
+- **Localization happens once.** The converter calls the localizer with the *server's* current `CurrentUICulture`. If a Blazor client wants its own language, it must perform a second translation pass — or set the `Accept-Language` header so the middleware switches culture before invoking the converter.
+- **Subscriber failures are swallowed.** `ExceptionNotifier` logs and continues. Bug in a subscriber stays hidden unless you read the warning logs. Treat subscribers as observability hooks, never as authoritative side-effects.
+- **`Exception.Data` may carry non-string values.** The placeholder substitution calls `.ToString()` — DateTime and decimal use the *server's* culture, not the client's. Format yourself if you need consistency.

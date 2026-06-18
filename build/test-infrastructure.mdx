@@ -1,0 +1,650 @@
+---
+title: "Test infrastructure: AbpTestBase and xUnit harness"
+sidebarTitle: "Test Infrastructure"
+description: "AbpIntegratedTest / AbpAsyncIntegratedTest, AbpAspNetCoreIntegratedTestBase, common.test.props, test-all.ps1, the .Tests project convention with Shouldly/xUnit/NSubstitute, codecov.yml, and the localization-key-synchronizer + github-changelog-generator tools."
+---
+
+ABP's testing story is built on xUnit, Shouldly, NSubstitute and the `Volo.Abp.TestBase` / `Volo.Abp.AspNetCore.TestBase` packages. Every `.Tests` project follows the same pattern: import `common.test.props`, reference `AbpTestBase`, derive from one of the integrated-test base classes, and let the framework's modularity boot a real `IAbpApplication` per test class.
+
+This page documents the harness, the project conventions, the coverage pipeline and the two CLI tools under `tools/` that interact with tests and changelogs.
+
+## What lives where
+
+| Path | Role |
+|------|------|
+| `framework/src/Volo.Abp.TestBase/` | The `Volo.Abp.TestBase` NuGet package — `AbpIntegratedTest`, `AbpAsyncIntegratedTest`, `AbpTestBaseModule`, `AbpTestBaseWithServiceProvider` |
+| `framework/src/Volo.Abp.AspNetCore.TestBase/` | The `Volo.Abp.AspNetCore.TestBase` NuGet package — `AbpAspNetCoreIntegratedTestBase`, `TestStartup<TModule>`, `TestServerAccessor` |
+| `framework/test/AbpTestBase/` | An *internal* test-helpers project — bundles xUnit + Shouldly + NSubstitute references for every `.Tests` project under `framework/test/` |
+| `framework/test/<X>.Tests/` | Per-namespace test projects |
+| `modules/<m>/test/Volo.Abp.<m>.TestBase/` | Module-specific test base (data seeding, fake users, etc.) |
+| `modules/<m>/test/Volo.Abp.<m>.<Layer>.Tests/` | Per-layer module tests |
+| `common.test.props` | Shared MSBuild properties for every `.Tests` and `.TestBase` project |
+| `build/test-all.ps1` | `dotnet test` loop with coverage collection |
+| `nupkg/unit_test.ps1` | Legacy TRX-only `dotnet test` loop |
+| `codecov.yml` | Codecov gating |
+| `tools/localization-key-synchronizer/` | Console tool to keep localization JSON in sync |
+| `tools/github-changelog-generator/` | CLI to render `changelog.md` from GitHub issues/PRs |
+
+## `framework/src/Volo.Abp.TestBase/`
+
+This is the core test-base that ships as `Volo.Abp.TestBase` on nuget.org. Folder layout:
+
+```text
+Volo.Abp.TestBase/
+├── FodyWeavers.xml
+├── FodyWeavers.xsd
+├── Properties/AssemblyInfo.cs
+├── Volo.Abp.TestBase.csproj
+├── Volo.Abp.TestBase.abppkg.json
+├── Volo.Abp.TestBase.abppkg.analyze.json
+└── Volo/Abp/
+    ├── AbpTestBaseModule.cs
+    ├── AbpTestBaseWithServiceProvider.cs
+    └── Testing/
+        ├── AbpAsyncIntegratedTest.cs
+        ├── AbpIntegratedTest.cs
+        └── Utils/
+            ├── ITestCounter.cs
+            └── TestCounter.cs
+```
+
+### `Volo.Abp.TestBase.csproj`
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\..\..\configureawait.props" />
+  <Import Project="..\..\..\common.props" />
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net7.0</TargetFrameworks>
+    <Nullable>enable</Nullable>
+    <WarningsAsErrors>Nullable</WarningsAsErrors>
+    <AssemblyName>Volo.Abp.TestBase</AssemblyName>
+    <PackageId>Volo.Abp.TestBase</PackageId>
+    <AssetTargetFallback>$(AssetTargetFallback);portable-net45+win8+wp8+wpa81;</AssetTargetFallback>
+    <GenerateAssemblyConfigurationAttribute>false</GenerateAssemblyConfigurationAttribute>
+    <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+    <GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
+    <RootNamespace />
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Volo.Abp.Core\Volo.Abp.Core.csproj" />
+  </ItemGroup>
+
+</Project>
+```
+
+Multi-targeted to `netstandard2.0`, `netstandard2.1`, `net7.0`. The only project reference is `Volo.Abp.Core` — the harness is deliberately lightweight.
+
+### `AbpTestBaseModule`
+
+```csharp
+using Volo.Abp.Modularity;
+
+namespace Volo.Abp;
+
+public class AbpTestBaseModule : AbpModule
+{
+
+}
+```
+
+An empty module. It exists so other test bases can `[DependsOn(typeof(AbpTestBaseModule))]` and so that the harness has a deterministic "test base" entry point in the modularity graph.
+
+### `AbpIntegratedTest<TStartupModule>`
+
+```csharp
+public abstract class AbpIntegratedTest<TStartupModule> : AbpTestBaseWithServiceProvider, IDisposable
+    where TStartupModule : IAbpModule
+{
+    protected IAbpApplication Application { get; }
+
+    protected IServiceProvider RootServiceProvider { get; }
+
+    protected IServiceScope TestServiceScope { get; }
+
+    protected AbpIntegratedTest()
+    {
+        var services = CreateServiceCollection();
+
+        BeforeAddApplication(services);
+
+        var application = services.AddApplication<TStartupModule>(SetAbpApplicationCreationOptions);
+        Application = application;
+
+        AfterAddApplication(services);
+
+        RootServiceProvider = CreateServiceProvider(services);
+        TestServiceScope = RootServiceProvider.CreateScope();
+
+        application.Initialize(TestServiceScope.ServiceProvider);
+        ServiceProvider = Application.ServiceProvider;
+    }
+
+    protected virtual IServiceCollection CreateServiceCollection() => new ServiceCollection();
+    protected virtual void BeforeAddApplication(IServiceCollection services) { }
+    protected virtual void SetAbpApplicationCreationOptions(AbpApplicationCreationOptions options) { }
+    protected virtual void AfterAddApplication(IServiceCollection services) { }
+    protected virtual IServiceProvider CreateServiceProvider(IServiceCollection services)
+        => services.BuildServiceProviderFromFactory();
+
+    public virtual void Dispose()
+    {
+        Application.Shutdown();
+        TestServiceScope.Dispose();
+        Application.Dispose();
+    }
+}
+```
+
+What this gives every test class that derives from it:
+
+| Member | Purpose |
+|--------|---------|
+| `Application` | The live `IAbpApplication` — modules are initialised, services are registered, options are bound |
+| `RootServiceProvider` | The application's root `IServiceProvider` (singletons + scopes) |
+| `TestServiceScope` | A single `IServiceScope` per test class — every resolution in the test uses this scope |
+| `ServiceProvider` (inherited) | Defaults to `Application.ServiceProvider`; `AbpTestBaseWithServiceProvider` exposes `GetService<T>` / `GetRequiredService<T>` helpers |
+
+The four virtual hooks (`CreateServiceCollection`, `BeforeAddApplication`, `SetAbpApplicationCreationOptions`, `AfterAddApplication`) are how downstream tests inject mocks, plugin sources or test doubles before the application boots.
+
+### `AbpAsyncIntegratedTest<TStartupModule>`
+
+```csharp
+public class AbpAsyncIntegratedTest<TStartupModule> : AbpTestBaseWithServiceProvider
+    where TStartupModule : IAbpModule
+{
+    protected IAbpApplication Application { get; set; } = default!;
+    protected IServiceProvider RootServiceProvider { get; set; } = default!;
+    protected IServiceScope TestServiceScope { get; set; } = default!;
+
+    public virtual async Task InitializeAsync()
+    {
+        var services = await CreateServiceCollectionAsync();
+
+        await BeforeAddApplicationAsync(services);
+        var application = await services.AddApplicationAsync<TStartupModule>(await SetAbpApplicationCreationOptionsAsync());
+        await AfterAddApplicationAsync(services);
+
+        RootServiceProvider = await CreateServiceProviderAsync(services);
+        TestServiceScope = RootServiceProvider.CreateScope();
+        await application.InitializeAsync(TestServiceScope.ServiceProvider);
+        ServiceProvider = application.ServiceProvider;
+        Application = application;
+
+        await InitializeServicesAsync();
+    }
+
+    public virtual async Task DisposeAsync()
+    {
+        await Application.ShutdownAsync();
+        TestServiceScope.Dispose();
+        Application.Dispose();
+    }
+    ...
+}
+```
+
+The async counterpart implements `IAsyncLifetime` (xUnit's async setup interface) — `InitializeAsync` runs before the first `[Fact]` and `DisposeAsync` after the last. This matters because real ABP modules can have asynchronous `OnApplicationInitializationAsync` / `OnApplicationShutdownAsync` hooks; using the sync `AbpIntegratedTest` with a module that performs async work in those hooks would dispatch over `AsyncHelper.RunSync` and deadlock under some sync contexts.
+
+The `InitializeServicesAsync()` hook is the canonical place for data seeding — module test bases (see CmsKit below) override it to populate their in-memory DB.
+
+### Utility classes
+
+* `TestCounter : ITestCounter` — thread-safe counter typically registered as singleton to verify "X was called N times" inside tests.
+
+## `framework/src/Volo.Abp.AspNetCore.TestBase/`
+
+The ASP.NET Core counterpart, packaged as `Volo.Abp.AspNetCore.TestBase`.
+
+### `Volo.Abp.AspNetCore.TestBase.csproj`
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <Import Project="..\..\..\configureawait.props" />
+  <Import Project="..\..\..\common.props" />
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <WarningsAsErrors>Nullable</WarningsAsErrors>
+    <AssemblyName>Volo.Abp.AspNetCore.TestBase</AssemblyName>
+    <PackageId>Volo.Abp.AspNetCore.TestBase</PackageId>
+    ...
+    <NoDefaultLaunchSettingsFile>true</NoDefaultLaunchSettingsFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Volo.Abp.AspNetCore\Volo.Abp.AspNetCore.csproj" />
+    <ProjectReference Include="..\Volo.Abp.Http.Client\Volo.Abp.Http.Client.csproj" />
+    <ProjectReference Include="..\Volo.Abp.TestBase\Volo.Abp.TestBase.csproj" />
+    <ProjectReference Include="..\Volo.Abp.Autofac\Volo.Abp.Autofac.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="$(MicrosoftAspNetCorePackageVersion)" />
+  </ItemGroup>
+
+</Project>
+```
+
+Net7.0 only (no netstandard) because it pulls in `Microsoft.AspNetCore.TestHost`. References `Volo.Abp.TestBase`, `Volo.Abp.AspNetCore`, `Volo.Abp.Http.Client` and `Volo.Abp.Autofac`.
+
+### `AbpAspNetCoreTestBaseModule`
+
+```csharp
+[DependsOn(typeof(AbpHttpClientModule))]
+[DependsOn(typeof(AbpAspNetCoreModule))]
+[DependsOn(typeof(AbpTestBaseModule))]
+[DependsOn(typeof(AbpAutofacModule))]
+public class AbpAspNetCoreTestBaseModule : AbpModule
+{
+
+}
+```
+
+The dependency chain explains why `Volo.Abp.Autofac` is referenced — every ASP.NET Core integrated test runs on Autofac so that dynamic proxying, named registrations and complex constructor selection match production behaviour.
+
+### `AbpAspNetCoreIntegratedTestBase<TStartupModule>`
+
+```csharp
+public abstract class AbpAspNetCoreIntegratedTestBase<TStartupModule> : AbpTestBaseWithServiceProvider, IDisposable
+    where TStartupModule : class
+{
+    protected TestServer Server { get; }
+    protected HttpClient Client { get; }
+    private readonly IHost _host;
+
+    protected AbpAspNetCoreIntegratedTestBase()
+    {
+        var builder = CreateHostBuilder();
+
+        _host = builder.Build();
+        _host.Start();
+
+        Server = _host.GetTestServer();
+        Client = _host.GetTestClient();
+
+        ServiceProvider = Server.Services;
+
+        ServiceProvider.GetRequiredService<ITestServerAccessor>().Server = Server;
+    }
+
+    protected virtual IHostBuilder CreateHostBuilder()
+    {
+        return Host.CreateDefaultBuilder()
+            .ConfigureWebHostDefaults(webBuilder =>
+            {
+                if (typeof(TStartupModule).IsAssignableTo<IAbpModule>())
+                {
+                    webBuilder.UseStartup<TestStartup<TStartupModule>>();
+                }
+                else
+                {
+                    webBuilder.UseStartup<TStartupModule>();
+                }
+
+                webBuilder.UseAbpTestServer();
+            })
+            .UseAutofac()
+            .ConfigureServices(ConfigureServices);
+    }
+    ...
+}
+```
+
+Key surfaces:
+
+* **`Server`** — `Microsoft.AspNetCore.TestHost.TestServer` running the configured app.
+* **`Client`** — a pre-configured `HttpClient` pointed at the test server. Tests issue real HTTP requests against in-memory pipelines.
+* **`ITestServerAccessor`** — singleton populated post-boot so that other services (`AspNetCoreTestProxyHttpClientFactory`) can resolve the live `TestServer` when generating dynamic HTTP proxy clients.
+* **Dual `TStartupModule`** — the constraint is `class`, not `IAbpModule`, because tests can also hand in a legacy ASP.NET Core `Startup` class. When `TStartupModule` is an `IAbpModule`, the harness wraps it in `TestStartup<TStartupModule>`:
+
+```csharp
+internal class TestStartup<TStartupModule>
+{
+    public void ConfigureServices(IServiceCollection services)
+    {
+        AsyncHelper.RunSync(() => services.AddApplicationAsync(typeof(TStartupModule)));
+    }
+
+    public void Configure(IApplicationBuilder app)
+    {
+        AsyncHelper.RunSync(app.InitializeApplicationAsync);
+    }
+}
+```
+
+There is also an `AbpAspNetCoreAsyncIntegratedTestBase<TStartupModule>` mirroring `AbpAsyncIntegratedTest` for async lifecycles.
+
+## `common.test.props`
+
+```xml
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <NoWarn>$(NoWarn);CS1591;CS0436</NoWarn>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <GenerateAssemblyConfigurationAttribute>false</GenerateAssemblyConfigurationAttribute>
+    <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+    <GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
+  </PropertyGroup>
+</Project>
+```
+
+`common.test.props` is the *test* counterpart to `common.props`. It is imported by every `.Tests` and `.TestBase` project (look for `<Import Project="..\..\..\common.test.props" />` near the top of the `.csproj`).
+
+| Property | Effect |
+|----------|--------|
+| `LangVersion=latest` | Same as `common.props`; test code can use the latest C# |
+| `NoWarn=CS1591;CS0436` | Suppress missing-XML-doc and type-conflict noise |
+| `GenerateRuntimeConfigurationFiles=true` | Emit `<assembly>.runtimeconfig.json` so xUnit's test runner can spawn the test host |
+| `GenerateAssemblyConfigurationAttribute=false` / `Company` / `Product` | Skip MSBuild's auto-generated assembly attributes — tests do not need them and they would conflict with `AssemblyInfo.cs` in some projects |
+
+Crucially, `common.test.props` deliberately does **not** include `common.props`. Test projects are not packaged for nuget.org, so they skip the source-link / version / package-metadata machinery.
+
+## `build/test-all.ps1`
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Test all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"
+    if (-Not $?) {
+        Write-Host ("Test failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+Reuses `build/common.ps1` to enumerate solutions. The arguments:
+
+* `--no-build --no-restore` — depend on a preceding `build-all.ps1` / `build-all-release.ps1`. Saves significant CI time.
+* `--collect:"XPlat Code Coverage"` — activates the `coverlet.collector` package that `Directory.Build.props` automatically references for any project where `IsTestProject == true`:
+
+```xml
+<IsTestProject Condition="$(MSBuildProjectFullPath.Contains('test')) and ($(MSBuildProjectName.EndsWith('.Tests')) or $(MSBuildProjectName.EndsWith('.TestBase')))">true</IsTestProject>
+
+<ItemGroup>
+  <PackageReference Condition="'$(IsTestProject)' == 'true'" Include="coverlet.collector" Version="3.1.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+  </PackageReference>
+</ItemGroup>
+```
+
+The coverage data lands under each project's `TestResults/<guid>/coverage.cobertura.xml`.
+
+There is also a legacy `nupkg/unit_test.ps1` (TRX logger, no coverage) kept for historical CI configurations.
+
+## `.Tests` project convention
+
+Every test project follows the same shape. The shared dependencies live in `framework/test/AbpTestBase/`:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\..\..\common.test.props" />
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <AssemblyName>AbpTestBase</AssemblyName>
+    <PackageId>AbpTestBase</PackageId>
+    <RootNamespace />
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Volo.Abp.TestBase\Volo.Abp.TestBase.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="$(MicrosoftNETTestSdkPackageVersion)" />
+    <PackageReference Include="NSubstitute"            Version="$(NSubstitutePackageVersion)" />
+    <PackageReference Include="Shouldly"               Version="$(ShouldlyPackageVersion)" />
+    <PackageReference Include="xunit"                  Version="$(xUnitPackageVersion)" />
+    <PackageReference Include="xunit.extensibility.execution" Version="$(xUnitExtensibilityExecutionPackageVersion)" />
+    <PackageReference Include="xunit.runner.visualstudio"     Version="$(xUnitRunnerVisualStudioPackageVersion)" />
+  </ItemGroup>
+
+</Project>
+```
+
+The pinned versions resolve through `Directory.Build.props`:
+
+| Package | Version |
+|---------|---------|
+| `Microsoft.NET.Test.Sdk` | `17.2.0` |
+| `NSubstitute` | `4.3.0` |
+| `Shouldly` | `4.1.0` |
+| `xunit` | `2.4.1` |
+| `xunit.extensibility.execution` | `2.4.1` |
+| `xunit.runner.visualstudio` | `2.4.5` |
+| `coverlet.collector` | `3.1.2` (auto-injected by `Directory.Build.props`) |
+| `Mongo2Go` | `3.1.3` (for MongoDB integration tests) |
+
+Downstream projects just reference `AbpTestBase`:
+
+```xml
+<!-- framework/test/Volo.Abp.Core.Tests/Volo.Abp.Core.Tests.csproj -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\..\..\common.test.props" />
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <RootNamespace />
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AbpTestBase\AbpTestBase.csproj" />
+    <ProjectReference Include="..\..\src\Volo.Abp.Core\Volo.Abp.Core.csproj" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="$(MicrosoftNETTestSdkPackageVersion)" />
+  </ItemGroup>
+
+</Project>
+```
+
+Conventions in force:
+
+* **Naming** — `<SubjectAssembly>.Tests` (e.g. `Volo.Abp.Ddd.Tests`). Some legacy projects use `<Subject>_Tests` filenames (`StringExtensions_Tests.cs`) — both are accepted.
+* **`RootNamespace />`** — empty, because test files live across multiple namespaces matching the SUT (`System.*`, `Volo.Abp.*`).
+* **Frameworks** — net7.0 across the v7.4.0 line, no multi-targeting on test projects.
+* **`AbpTestBase` reference** — every project under `framework/test/` references it; module tests reference module-specific `*.TestBase` projects that themselves reference `AbpTestBase` transitively.
+* **xUnit collections** — test classes that share expensive setup (e.g. EF Core in-memory DBs) opt into xUnit collections via `[Collection("X")]`. The collection fixture itself derives from `AbpIntegratedTest<TModule>` and seeds data once per collection.
+* **Shouldly assertions** — `value.ShouldBe(...)`, `() => action().ShouldThrow<TException>()`. Fluent assertions are *not* used; Shouldly is the house style.
+
+## Representative test projects
+
+### `framework/test/` (excerpt)
+
+| Project | Tests |
+|---------|-------|
+| `AbpTestBase` | The shared bundle (not a test itself) — packages xunit + Shouldly + NSubstitute |
+| `Volo.Abp.Core.Tests` | `System.*` extensions: `AbpTypeExtensions`, `ComparableExtensions`, `StringExtensions`, `ObjectExtension`, `DayOfWeekExtensions` |
+| `Volo.Abp.Ddd.Tests` | Aggregate-root, repository contracts, value objects |
+| `Volo.Abp.Authorization.Tests` | Permission system, policies, claim providers |
+| `Volo.Abp.AspNetCore.Mvc.Tests` | Controllers, model binding, exception filters, anti-forgery |
+| `Volo.Abp.AspNetCore.MultiTenancy.Tests` | Tenant resolution, headers, current-tenant scoping |
+| `Volo.Abp.EntityFrameworkCore.Tests` | DbContext, repository, unit-of-work integration |
+| `Volo.Abp.MongoDB.Tests` | Uses Mongo2Go to spin up an in-memory MongoDB |
+| `Volo.Abp.BackgroundJobs.Tests` | Job manager, in-memory store, worker loop |
+| `Volo.Abp.EventBus.Tests` | Local + distributed event bus contracts |
+| `Volo.Abp.Validation.Tests` | DataAnnotations + fluent validation integration |
+| `Volo.Abp.TestApp` / `Volo.Abp.TestApp.Tests` | A shared "application" module that other framework tests reuse |
+| `Volo.Abp.BlobStoring.*.Tests` | One per storage provider — `FileSystem`, `Azure`, `Aws`, `Aliyun`, `Minio` |
+
+`framework/test/` contains around 70 test projects covering every shipped framework package.
+
+### Module tests
+
+| Module | Notable test projects | Notes |
+|--------|----------------------|-------|
+| `modules/identity/test/` | `Volo.Abp.Identity.Application.Tests`, `Volo.Abp.Identity.AspNetCore.Tests`, `Volo.Abp.Identity.Domain.Tests`, `Volo.Abp.Identity.EntityFrameworkCore.Tests`, `Volo.Abp.Identity.MongoDB.Tests`, `Volo.Abp.Identity.TestBase` | Application / AspNetCore / Domain / EFC / MongoDB layers each tested separately, with a shared `TestBase` |
+| `modules/cms-kit/test/` | `Volo.CmsKit.Application.Tests`, `Volo.CmsKit.Domain.Tests`, `Volo.CmsKit.EntityFrameworkCore.Tests`, `Volo.CmsKit.MongoDB.Tests`, `Volo.CmsKit.HttpApi.Client.ConsoleTestApp`, `Volo.CmsKit.TestBase` | The TestBase includes `CmsKitDataSeedContributor`, `CmsKitFakeCurrentUser`, `FakeBlobProvider` — typical of how modules wire up test doubles |
+| `modules/account/test/` | `Volo.Abp.Account.Application.Tests` | Application-only — Account's other layers are covered through framework + identity tests |
+
+A module test base typically looks like this (`CmsKitTestBase.cs`):
+
+```csharp
+public abstract class CmsKitTestBase<TStartupModule> : AbpIntegratedTest<TStartupModule>
+    where TStartupModule : IAbpModule
+{
+    // Per-test scope of helpers, fake users, seeded data, ...
+}
+```
+
+— derived classes (`Volo.CmsKit.Application.Tests.AbstractAppService_Tests`, etc.) just say `class FooTests : CmsKitApplicationTestBase` and write `[Fact]` methods.
+
+## `codecov.yml`
+
+```yaml
+codecov:
+  branch: dev
+  require_ci_to_pass: yes
+  allow_coverage_offsets: true
+  status:
+    project:
+      default:
+        threshold: 1%
+```
+
+| Setting | Meaning |
+|---------|---------|
+| `branch: dev` | The reference branch for coverage diffs |
+| `require_ci_to_pass: yes` | Codecov status check waits for CI to pass before posting |
+| `allow_coverage_offsets: true` | Tolerates small differences in line/branch numbering between commits (e.g. when an empty line shifts) |
+| `status.project.default.threshold: 1%` | A PR can lose up to 1 percentage point of project coverage before Codecov marks the status check as failing |
+
+The CI uploads coverage from `coverage.cobertura.xml` files produced by `--collect:"XPlat Code Coverage"`. The intentional 1% threshold reflects the framework's modular topology — refactors that move code between modules can shift apparent per-module coverage without changing the total meaningfully.
+
+## `tools/` — adjacent CLI utilities
+
+### `tools/localization-key-synchronizer/`
+
+```text
+tools/localization-key-synchronizer/
+├── README.md
+├── LocalizationKeySynchronizer.exe
+├── LocalizationKeySynchronizer.sln
+└── src/
+```
+
+A Windows console tool that operates on a folder of `*.json` localization files. Its three modes (from the README):
+
+1. **Find asynchronous keys** — keys whose argument counts diverge between default and translated files, or keys missing from translations.
+2. **Apply changes from an exported file** — import a previously exported diff and rewrite the JSONs.
+3. **Replace keys** — rename a key across selected JSONs.
+
+It is not invoked by CI; maintainers run it locally when reorganising localization. The tests in `framework/test/Volo.Abp.Localization.Tests` cover the runtime localization system, not the tool itself.
+
+### `tools/github-changelog-generator/`
+
+```text
+tools/github-changelog-generator/
+├── README.md
+├── config.yaml
+├── generator.exe
+└── src/
+```
+
+A Go-ish CLI that renders a markdown changelog from GitHub issues and PRs for a given milestone.
+
+```bash
+.\generator.exe generate -r abpframework/abp -m "0.19" > changelog.md
+```
+
+The full set of flags:
+
+```text
+Flags:
+  -h, --help               help for generate
+  -m, --milestone string   milestone title to get issues and pull requests for
+  -r, --repo string        repository name to generate the Changelog for, in the form user/repo
+      --since-tag string   issues and pull requests since tag
+  -s, --state string       state of the issues and pull requests to get (open,closed or all)
+  -t, --token string       personal access token
+      --until-tag string   issues and pull requests until tag
+
+Global Flags:
+      --config string   config file (default is config.yaml)
+```
+
+`config.yaml` defines label-based grouping:
+
+```yaml
+repo: abpframework/abp
+milestone: 0.18.1
+state: closed
+groups:
+  - labels:
+      - breaking change
+    title: "Breaking Changes"
+  - labels:
+      - feature
+    title: "Features"
+  - labels:
+      - enhancement
+    title: "Enhancements"
+  - labels:
+      - bug
+    title: "Bug Fixes"
+  - labels:
+    title: "Others"
+```
+
+The tool is the source of the release-notes section maintainers paste into GitHub Releases — `deploy/7-publish-github-release.ps1` creates the release with an empty body (`body = ''`), and the generated changelog is added manually or via the optional `New-GitHubRelease` module (see [Deploy Pipeline](/build/deploy-pipeline)).
+
+## Putting it together
+
+```text
+build/build-all-release.ps1
+    └─► binaries
+
+build/test-all.ps1
+    └─► dotnet test --no-build --no-restore --collect "XPlat Code Coverage"
+          └─► coverlet.collector (auto-injected when IsTestProject)
+                └─► coverage.cobertura.xml
+                      └─► Codecov (gated by codecov.yml, 1% threshold)
+```
+
+For test authors, the day-to-day pattern is:
+
+```csharp
+public class MyServiceTests : AbpIntegratedTest<MyTestModule>
+{
+    private readonly IMyService _service;
+
+    public MyServiceTests()
+    {
+        _service = GetRequiredService<IMyService>();
+    }
+
+    [Fact]
+    public async Task Should_Do_Something()
+    {
+        var result = await _service.DoSomethingAsync();
+        result.ShouldNotBeNull();
+        result.Value.ShouldBe(42);
+    }
+}
+```
+
+— with `MyTestModule` `[DependsOn(typeof(AbpTestBaseModule))]` and the SUT module. For ASP.NET Core tests, derive from `AbpAspNetCoreIntegratedTestBase<MyTestModule>` and use the inherited `Client` to hit endpoints.
+
+## Related pages
+
+* [Build Scripts](/build/build-scripts) — the build that precedes every test run.
+* [NuGet Packaging](/build/nuget-packaging) — `Volo.Abp.TestBase` and `Volo.Abp.AspNetCore.TestBase` ship through the same pipeline.
+* [Deploy Pipeline](/build/deploy-pipeline) — how the changelog tool feeds the GitHub release step.

@@ -1,0 +1,523 @@
+---
+title: "Volo.Abp.Ldap and Volo.Abp.Ldap.Abstractions modules"
+sidebarTitle: "LDAP"
+description: "ILdapManager, ILdapSettingProvider, LdapSettingNames, and the LdapForNet-backed bind flow — how ABP delegates username/password validation to a directory."
+---
+
+`Volo.Abp.Ldap` is a thin authentication adapter that lets ABP applications delegate username/password validation to an LDAP directory server (Active Directory, OpenLDAP, FreeIPA, …). It is split across two packages: `Volo.Abp.Ldap.Abstractions` declares the `ILdapManager` contract, the `ILdapSettingProvider` for reading connection parameters from the settings system, and the canonical `LdapSettingNames` constants; `Volo.Abp.Ldap` ships the default implementation on top of the `LdapForNet` library, plus a `SettingDefinitionProvider` that registers the six settings the provider reads.
+
+This page walks the contracts in `Volo.Abp.Ldap.Abstractions`, the `LdapManager` implementation, the setting definitions, and how an `IdentityServer`/`OpenIddict` host typically pipes LDAP credentials through `AddAuthentication` via a custom `IExternalLoginProvider` or a `Login` page hook.
+
+<CardGroup cols={2}>
+  <Card title="JWT Bearer" icon="ticket" href="/framework/auth/jwt-bearer">
+    LDAP is the *bind* step; the issued ABP session is still backed by the regular JWT/Cookie pipeline.
+  </Card>
+  <Card title="Security primitives" icon="user-shield" href="/framework/cross/security">
+    `AbpClaimTypes.TenantId` — how a tenant resolved during the LDAP bind reaches `ICurrentTenant`.
+  </Card>
+</CardGroup>
+
+## Package layout
+
+### `Volo.Abp.Ldap.Abstractions`
+
+Source: `framework/src/Volo.Abp.Ldap.Abstractions/`.
+
+| Path | Role |
+| --- | --- |
+| `Volo/Abp/Ldap/AbpLdapAbstractionsModule.cs` | Registers the `LdapResource` localization resource and adds the package's embedded JSON files to the virtual file system. |
+| `Volo/Abp/Ldap/ILdapManager.cs` | `Task<bool> AuthenticateAsync(string username, string password)` — the only contract method. |
+| `Volo/Abp/Ldap/ILdapSettingProvider.cs` | Six `GetXxxAsync` methods returning the connection parameters as `Task<string?>` / `Task<int>`. |
+| `Volo/Abp/Ldap/LdapSettingNames.cs` | Six `public const string` keys used as both setting names and resource lookup IDs. |
+| `Volo/Abp/Ldap/Localization/LdapResource.cs` | `[LocalizationResourceName("AbpLdap")]` empty class — localization anchor. |
+
+### `Volo.Abp.Ldap`
+
+Source: `framework/src/Volo.Abp.Ldap/`.
+
+| Path | Role |
+| --- | --- |
+| `Volo/Abp/Ldap/AbpLdapModule.cs` | `[DependsOn(typeof(AbpLdapAbstractionsModule), typeof(AbpSettingsModule))]`. No `ConfigureServices` body. |
+| `Volo/Abp/Ldap/LdapManager.cs` | Default `ILdapManager` using `LdapForNet.LdapConnection`. |
+| `Volo/Abp/Ldap/LdapSettingProvider.cs` | Default `ILdapSettingProvider` reading from `ISettingProvider`. |
+| `Volo/Abp/Ldap/LdapSettingDefinitionProvider.cs` | Defines the six settings with defaults: port `"389"`, password marked `isEncrypted: true`. |
+
+Both packages target `net7.0` and reference `LdapForNet` (a managed binding over the platform LDAP C library, fronted by a common abstraction over Windows and POSIX).
+
+## The contract: `ILdapManager`
+
+```csharp framework/src/Volo.Abp.Ldap.Abstractions/Volo/Abp/Ldap/ILdapManager.cs
+namespace Volo.Abp.Ldap;
+
+public interface ILdapManager
+{
+    Task<bool> AuthenticateAsync(string username, string password);
+}
+```
+
+A single method, intentionally minimal:
+
+* Returns `true` if the LDAP bind succeeded against the configured server.
+* Returns `false` for any failure: wrong credentials, server unreachable, malformed DN, expired account, anything thrown by `LdapForNet`. The implementation does **not** distinguish "bad credentials" from "server down" — that responsibility is left to whoever wants more granular reporting.
+* Does **not** return user attributes, groups, or any other directory metadata. Higher-level integrations (LDAP-aware external login providers, the commercial `Volo.Abp.Account.Pro` external-login support) wrap this call and perform a second search step if they need profile data.
+
+This is deliberate: ABP's LDAP integration is a **bind authenticator**, not a directory client.
+
+## Setting provider abstraction
+
+```csharp framework/src/Volo.Abp.Ldap.Abstractions/Volo/Abp/Ldap/ILdapSettingProvider.cs
+public interface ILdapSettingProvider
+{
+    public Task<string?> GetServerHostAsync();
+    public Task<int> GetServerPortAsync();
+    public Task<string?> GetBaseDcAsync();
+    public Task<string?> GetDomainAsync();
+    public Task<string?> GetUserNameAsync();
+    public Task<string?> GetPasswordAsync();
+}
+```
+
+Six pieces of configuration. Note that `GetServerPortAsync` returns `int` (not nullable) — the default implementation falls back to `default(int)` when the setting is missing, which would produce a `0` port and an immediate connection error. The setting definition provider mitigates this by registering the literal default `"389"`.
+
+`GetBaseDcAsync`, `GetDomainAsync`, `GetUserNameAsync`, and `GetPasswordAsync` are declared on the interface but **not** read by the in-box `LdapManager`. They exist so derived/override managers can perform LDAP *searches* (e.g. resolve a `sAMAccountName` to a full DN before binding, or run a service-account bind to look up group membership). The shipped `AuthenticateAsync` only needs host and port because it uses Simple bind with whatever username the caller passes.
+
+## Setting names
+
+```csharp framework/src/Volo.Abp.Ldap.Abstractions/Volo/Abp/Ldap/LdapSettingNames.cs
+public static class LdapSettingNames
+{
+    public const string ServerHost = "Abp.Ldap.ServerHost";
+    public const string ServerPort = "Abp.Ldap.ServerPort";
+    public const string BaseDc     = "Abp.Ldap.BaseDc";
+    public const string Domain     = "Abp.Ldap.Domain";
+    public const string UserName   = "Abp.Ldap.UserName";
+    public const string Password   = "Abp.Ldap.Password";
+}
+```
+
+These are the keys used in:
+
+* `ISettingProvider.GetOrNullAsync(...)` — runtime lookup.
+* The `LdapResource` localization JSON (`DisplayName:Abp.Ldap.ServerHost`, `Description:Abp.Ldap.ServerHost`, …).
+* Any host that pre-seeds settings via `IConfiguration` → `Volo.Abp.Settings`'s configuration-backed `ISettingValueProvider`.
+
+The `Abp.Ldap.*` prefix matches ABP's convention for module-scoped setting names.
+
+## The default implementation: `LdapManager`
+
+```csharp framework/src/Volo.Abp.Ldap/Volo/Abp/Ldap/LdapManager.cs
+public class LdapManager : ILdapManager, ITransientDependency
+{
+    public ILogger<LdapManager> Logger { get; set; }
+    protected ILdapSettingProvider LdapSettingProvider { get; }
+
+    public LdapManager(ILdapSettingProvider ldapSettingProvider)
+    {
+        LdapSettingProvider = ldapSettingProvider;
+        Logger = NullLogger<LdapManager>.Instance;
+    }
+
+    public virtual async Task<bool> AuthenticateAsync(string username, string password)
+    {
+        try
+        {
+            using (var conn = await CreateLdapConnectionAsync())
+            {
+                await AuthenticateLdapConnectionAsync(conn, username, password);
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogException(ex);
+            return false;
+        }
+    }
+
+    protected virtual async Task<ILdapConnection> CreateLdapConnectionAsync()
+    {
+        var ldapConnection = new LdapConnection();
+        await ConfigureLdapConnectionAsync(ldapConnection);
+        await ConnectAsync(ldapConnection);
+        return ldapConnection;
+    }
+
+    protected virtual Task ConfigureLdapConnectionAsync(ILdapConnection ldapConnection)
+    {
+        return Task.CompletedTask;
+    }
+
+    protected virtual async Task ConnectAsync(ILdapConnection ldapConnection)
+    {
+        ldapConnection.Connect(await LdapSettingProvider.GetServerHostAsync(), await LdapSettingProvider.GetServerPortAsync());
+    }
+
+    protected virtual async Task AuthenticateLdapConnectionAsync(ILdapConnection connection, string username, string password)
+    {
+        await connection.BindAsync(Native.LdapAuthType.Simple, new LdapCredential()
+        {
+            UserName = username,
+            Password = password
+        });
+    }
+}
+```
+
+Walking the method graph:
+
+### `AuthenticateAsync` — the entry point
+
+* Wraps the whole flow in `try`/`catch`. Any exception — including `LdapForNet`'s strongly-typed bind failures — is logged via the property-injected `ILogger<LdapManager>` and turned into `false`.
+* Uses a `using` block on the `ILdapConnection`, so a TLS or socket leak cannot survive a bind failure.
+
+### `CreateLdapConnectionAsync` — three protected hooks
+
+Constructs an `LdapConnection`, then calls two extensibility points before returning it:
+
+* `ConfigureLdapConnectionAsync` — default no-op. Override to set `connection.TrustAllCertificates()`, `SetOption(LdapOption.LDAP_OPT_PROTOCOL_VERSION, …)`, or enable referrals.
+* `ConnectAsync` — default calls `connection.Connect(host, port)` synchronously (the `Connect` method on `LdapForNet`'s `LdapConnection` is sync; the wrapper is just `Task`-returning for symmetry).
+
+### `AuthenticateLdapConnectionAsync` — Simple bind
+
+```csharp
+await connection.BindAsync(Native.LdapAuthType.Simple, new LdapCredential()
+{
+    UserName = username,
+    Password = password
+});
+```
+
+`LdapAuthType.Simple` is the lowest-common-denominator bind: send the username and password as cleartext in the LDAP frame. The caller is responsible for:
+
+1. **Passing the right username shape.** Active Directory accepts `user@domain.local` (UPN) or `DOMAIN\user`; OpenLDAP usually expects a full DN like `uid=alice,ou=people,dc=example,dc=com`. The `LdapSettingProvider.GetBaseDcAsync` and `GetDomainAsync` values are not auto-prepended by the in-box manager — override `AuthenticateLdapConnectionAsync` if you need that translation.
+2. **Putting the connection on TLS.** Simple bind over plain `:389` sends credentials in cleartext. Override `ConnectAsync` to call `connection.Connect(host, port, LdapSchema.LDAPS)` and use port `636`, or call `StartTransportLayerSecurity()` after `Connect`.
+
+### Overriding for AD UPN bind with TLS
+
+A typical Active-Directory override looks like:
+
+```csharp
+public class ActiveDirectoryLdapManager : LdapManager
+{
+    public ActiveDirectoryLdapManager(ILdapSettingProvider ldapSettingProvider)
+        : base(ldapSettingProvider) { }
+
+    protected override Task ConfigureLdapConnectionAsync(ILdapConnection conn)
+    {
+        conn.TrustAllCertificates(); // or load a CA cert
+        return Task.CompletedTask;
+    }
+
+    protected override async Task ConnectAsync(ILdapConnection conn)
+    {
+        var host = await LdapSettingProvider.GetServerHostAsync();
+        var port = await LdapSettingProvider.GetServerPortAsync();
+        conn.Connect(host, port, LdapSchema.LDAPS);
+    }
+
+    protected override async Task AuthenticateLdapConnectionAsync(ILdapConnection conn, string username, string password)
+    {
+        var domain = await LdapSettingProvider.GetDomainAsync();
+        var upn = username.Contains('@') ? username : $"{username}@{domain}";
+
+        await conn.BindAsync(Native.LdapAuthType.Simple, new LdapCredential
+        {
+            UserName = upn,
+            Password = password
+        });
+    }
+}
+```
+
+Register it with `services.AddSingleton<ILdapManager, ActiveDirectoryLdapManager>()` or by `[ExposeServices(typeof(ILdapManager))]` to let conventional registration pick it up.
+
+## Setting definitions
+
+```csharp framework/src/Volo.Abp.Ldap/Volo/Abp/Ldap/LdapSettingDefinitionProvider.cs
+public class LdapSettingDefinitionProvider : SettingDefinitionProvider
+{
+    public override void Define(ISettingDefinitionContext context)
+    {
+        context.Add(
+            new SettingDefinition(
+                LdapSettingNames.ServerHost,
+                "",
+                L("DisplayName:Abp.Ldap.ServerHost"),
+                L("Description:Abp.Ldap.ServerHost")),
+
+            new SettingDefinition(
+                LdapSettingNames.ServerPort,
+                "389",
+                L("DisplayName:Abp.Ldap.ServerPort"),
+                L("Description:Abp.Ldap.ServerPort")),
+
+            new SettingDefinition(
+                LdapSettingNames.BaseDc,
+                "",
+                L("DisplayName:Abp.Ldap.BaseDc"),
+                L("Description:Abp.Ldap.BaseDc")),
+
+            new SettingDefinition(
+                LdapSettingNames.Domain,
+                "",
+                L("DisplayName:Abp.Ldap.Domain"),
+                L("Description:Abp.Ldap.Domain")),
+
+            new SettingDefinition(
+                LdapSettingNames.UserName,
+                "",
+                L("DisplayName:Abp.Ldap.UserName"),
+                L("Description:Abp.Ldap.UserName")),
+
+            new SettingDefinition(
+                LdapSettingNames.Password,
+                "",
+                L("DisplayName:Abp.Ldap.Password"),
+                L("Description:Abp.Ldap.Password"),
+                isEncrypted: true)
+        );
+    }
+
+    private static LocalizableString L(string name) =>
+        LocalizableString.Create<LdapResource>(name);
+}
+```
+
+Three notes:
+
+* **Default port `"389"`** — the only non-empty default. `LdapManager.ConnectAsync` would fail with port `0` otherwise.
+* **`isEncrypted: true` for `Password`** — `Volo.Abp.Settings` runs the value through `IStringEncryptionService` (AES-256, `StringEncryption:DefaultPassPhrase` / `:Salt` from `IConfiguration`) so the persisted ciphertext is unreadable in the DB.
+* **Localization keys** — every `DisplayName:Abp.Ldap.X` and `Description:Abp.Ldap.X` resolves through `LdapResource`. Translations ship as embedded JSON via `AbpLdapAbstractionsModule`.
+
+## Setting provider implementation
+
+```csharp framework/src/Volo.Abp.Ldap/Volo/Abp/Ldap/LdapSettingProvider.cs
+public class LdapSettingProvider : ILdapSettingProvider, ITransientDependency
+{
+    protected ISettingProvider SettingProvider { get; }
+
+    public LdapSettingProvider(ISettingProvider settingProvider)
+    {
+        SettingProvider = settingProvider;
+    }
+
+    public async Task<string?> GetServerHostAsync()
+        => await SettingProvider.GetOrNullAsync(LdapSettingNames.ServerHost);
+
+    public async Task<int> GetServerPortAsync()
+        => (await SettingProvider.GetOrNullAsync(LdapSettingNames.ServerPort))?.To<int>() ?? default;
+
+    public async Task<string?> GetBaseDcAsync()
+        => await SettingProvider.GetOrNullAsync(LdapSettingNames.BaseDc);
+
+    public async Task<string?> GetDomainAsync()
+        => await SettingProvider.GetOrNullAsync(LdapSettingNames.Domain);
+
+    public async Task<string?> GetUserNameAsync()
+        => await SettingProvider.GetOrNullAsync(LdapSettingNames.UserName);
+
+    public async Task<string?> GetPasswordAsync()
+        => await SettingProvider.GetOrNullAsync(LdapSettingNames.Password);
+}
+```
+
+`ISettingProvider.GetOrNullAsync` is the standard ABP setting-resolution entry point — it walks `IConfiguration`, then global stored settings, then tenant-stored settings, then per-user settings, returning the first non-null hit. The `.To<int>()` call on the port uses ABP's generic conversion extension.
+
+`SettingProvider` is **scoped per-request** in ASP.NET Core (because tenant context is per-request), so settings can be different in a multi-tenant LDAP scenario (e.g. tenant A points to one AD, tenant B to another). That works without any change to `LdapManager` itself.
+
+## The modules
+
+### `AbpLdapAbstractionsModule`
+
+```csharp framework/src/Volo.Abp.Ldap.Abstractions/Volo/Abp/Ldap/AbpLdapAbstractionsModule.cs
+[DependsOn(
+    typeof(AbpVirtualFileSystemModule),
+    typeof(AbpLocalizationModule))]
+public class AbpLdapAbstractionsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpLdapAbstractionsModule>();
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Add<LdapResource>("en")
+                .AddVirtualJson("/Volo/Abp/Ldap/Localization");
+        });
+    }
+}
+```
+
+Two pieces of wiring:
+
+* Adds the abstractions assembly's embedded files (the localization JSON) to the virtual file system.
+* Registers `LdapResource` with English as the default language and points it at `/Volo/Abp/Ldap/Localization` inside the virtual file system, which is where the embedded JSON lives.
+
+The `LdapResource` class itself is empty — just a `[LocalizationResourceName("AbpLdap")]` anchor:
+
+```csharp framework/src/Volo.Abp.Ldap.Abstractions/Volo/Abp/Ldap/Localization/LdapResource.cs
+[LocalizationResourceName("AbpLdap")]
+public class LdapResource
+{
+
+}
+```
+
+### `AbpLdapModule`
+
+```csharp framework/src/Volo.Abp.Ldap/Volo/Abp/Ldap/AbpLdapModule.cs
+[DependsOn(
+    typeof(AbpLdapAbstractionsModule),
+    typeof(AbpSettingsModule))]
+public class AbpLdapModule : AbpModule
+{
+
+}
+```
+
+No `ConfigureServices` body. Both the manager and the setting provider are auto-registered by ABP's conventional registration because they implement `ITransientDependency`. The `SettingDefinitionProvider` is picked up by `AbpSettingsModule`'s assembly scan.
+
+## Composing with `AddAuthentication()`
+
+LDAP itself does not register an `AuthenticationScheme` — it is not an `IAuthenticationHandler`. The integration pattern is:
+
+1. The host (an MVC login page, a Razor page in the `Account` module, a custom `IExternalLoginProvider`, or a `ResourceOwnerPasswordValidator` on the OpenIddict auth-server) receives the username/password.
+2. It calls `ILdapManager.AuthenticateAsync` to validate the bind.
+3. On success, it issues an ABP principal via the regular cookie/JWT pipeline.
+
+A typical custom Razor page handler:
+
+```csharp
+public class LdapLoginModel : PageModel
+{
+    private readonly ILdapManager _ldap;
+    private readonly SignInManager<IdentityUser> _signIn;
+    private readonly IdentityUserManager _users;
+    private readonly ICurrentTenant _currentTenant;
+
+    public LdapLoginModel(ILdapManager ldap, SignInManager<IdentityUser> signIn,
+                          IdentityUserManager users, ICurrentTenant currentTenant)
+    {
+        _ldap = ldap; _signIn = signIn; _users = users; _currentTenant = currentTenant;
+    }
+
+    [BindProperty] public string UserName { get; set; } = "";
+    [BindProperty] public string Password { get; set; } = "";
+
+    public async Task<IActionResult> OnPostAsync()
+    {
+        var ok = await _ldap.AuthenticateAsync(UserName, Password);
+        if (!ok)
+        {
+            ModelState.AddModelError("", "Invalid LDAP credentials.");
+            return Page();
+        }
+
+        // Look up the mirrored local user; create if missing.
+        var user = await _users.FindByNameAsync(UserName)
+                   ?? await CreateLocalShadowAsync(UserName);
+
+        await _signIn.SignInAsync(user, isPersistent: false);
+        return LocalRedirect("/");
+    }
+
+    private async Task<IdentityUser> CreateLocalShadowAsync(string userName)
+    {
+        var user = new IdentityUser(GuidGenerator.Create(), userName,
+            email: $"{userName}@ldap.local", _currentTenant.Id);
+        (await _users.CreateAsync(user)).CheckErrors();
+        return user;
+    }
+}
+```
+
+Two things to notice. First, `ICurrentTenant.Id` is captured into the shadow user record at creation time — this is the only place where multi-tenancy explicitly enters the LDAP flow. Second, the LDAP manager has no knowledge of the local user store: the shadow record exists to satisfy ASP.NET Identity's `SignInManager` and to give downstream code a stable `UserId` claim.
+
+<Note>
+**Multi-tenancy claim mapping.** `ILdapManager.AuthenticateAsync` does not see, return, or carry a `tenantid` value. Tenant context arrives **before** the LDAP call via the normal `MultiTenancyMiddleware` (cookie, header, or domain). When the login flow above issues the cookie principal, ASP.NET Identity stores `AbpClaimTypes.TenantId` (default `"tenantid"`) populated from the shadow user's `TenantId` column, and the resulting cookie behaves identically to a non-LDAP login. If you need per-tenant LDAP servers, store `Abp.Ldap.ServerHost` and friends as **tenant-scoped settings** rather than global settings — `ISettingProvider` will resolve them under the active `ICurrentTenant.Id` automatically without changing any code.
+</Note>
+
+## Integrating with the OpenIddict password grant
+
+If the host runs an OpenIddict authorization server and wants to issue tokens to clients using `grant_type=password`, the bind happens inside the password handler:
+
+```csharp
+public class LdapPasswordGrantHandler : IOpenIddictServerHandler<HandleTokenRequestContext>
+{
+    private readonly ILdapManager _ldap;
+    private readonly IdentityUserManager _users;
+
+    public LdapPasswordGrantHandler(ILdapManager ldap, IdentityUserManager users)
+    {
+        _ldap = ldap; _users = users;
+    }
+
+    public async ValueTask HandleAsync(HandleTokenRequestContext context)
+    {
+        if (!context.Request.IsPasswordGrantType()) return;
+
+        var ok = await _ldap.AuthenticateAsync(
+            context.Request.Username!, context.Request.Password!);
+        if (!ok)
+        {
+            context.Reject(OpenIddictConstants.Errors.InvalidGrant, "Invalid credentials.");
+            return;
+        }
+
+        var user = await _users.FindByNameAsync(context.Request.Username!);
+        if (user == null)
+        {
+            context.Reject(OpenIddictConstants.Errors.InvalidGrant, "No local user.");
+            return;
+        }
+
+        var principal = await _users.CreateUserPrincipalAsync(user);
+        principal.SetScopes(context.Request.GetScopes());
+        principal.SetDestinations(static _ => new[] { OpenIddictConstants.Destinations.AccessToken });
+        context.Principal = principal;
+    }
+}
+```
+
+The `principal` produced by `IdentityUserManager.CreateUserPrincipalAsync` already carries `AbpClaimTypes.TenantId`, `AbpClaimTypes.UserId`, role claims, etc., because ABP's `IAbpClaimsPrincipalContributor` pipeline runs at sign-in.
+
+## Pitfall checklist
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Every bind returns `false` even with correct credentials | `Abp.Ldap.ServerPort` setting is missing and falls back to `default(int) = 0` | Set the port explicitly (`389` for LDAP, `636` for LDAPS) or rely on the in-box default registered by `LdapSettingDefinitionProvider` |
+| Active Directory rejects `alice` but accepts `alice@corp.local` | Default `LdapManager` does not prepend the domain | Override `AuthenticateLdapConnectionAsync` and append `GetDomainAsync()` to the username |
+| Credentials traverse the network in cleartext | Simple bind on port 389 with no TLS | Override `ConnectAsync` to use `LdapSchema.LDAPS` on port 636, or call `StartTransportLayerSecurity()` |
+| Setting `Abp.Ldap.Password` stored as plaintext in the DB | `isEncrypted: true` is honored only by the *Settings* module — make sure `Volo.Abp.Settings`'s `StringEncryption` is configured | Set `StringEncryption:DefaultPassPhrase` and `:Salt` in `appsettings.json` |
+| Per-tenant LDAP servers all hit tenant 0's settings | Settings cached at the wrong scope | Use `ISettingProvider.GetOrNullAsync` inside the request scope (the default `LdapSettingProvider` already does) — do **not** capture a host-scope setting in a singleton override |
+| `BindAsync` throws `LdapForNet.LdapException: 49 InvalidCredentials` | Bubbled to ABP's `try/catch` and turned into `false` — by design | If you need richer error reporting, override `AuthenticateAsync` and inspect the exception |
+| Localization keys (`DisplayName:Abp.Ldap.ServerHost`) show literally on the settings page | The `LdapResource` virtual JSON files are not being picked up | Ensure the host depends transitively on `AbpLdapAbstractionsModule` so `AddVirtualJson("/Volo/Abp/Ldap/Localization")` runs |
+
+## What the packages do **not** do
+
+* No `IAuthenticationHandler`. LDAP is a credential validator, not a scheme.
+* No directory search — `ILdapManager` does **not** read group memberships, attributes, or DN structure.
+* No local-user provisioning. The host owns the shadow user record.
+* No cache. Every `AuthenticateAsync` call opens, binds, and closes a fresh `LdapConnection`. If your IdP issues short-lived bearer tokens with frequent re-auth, layer your own cache on top.
+* No support for SASL mechanisms other than Simple in the in-box manager. `LdapForNet` does support GSSAPI/Kerberos; an override of `AuthenticateLdapConnectionAsync` can switch.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Settings" icon="gear" href="/framework/cross/settings">
+    How `Abp.Ldap.*` values are resolved through `ISettingProvider`, including tenant-scoped overrides.
+  </Card>
+  <Card title="Security primitives" icon="user-shield" href="/framework/cross/security">
+    `AbpClaimTypes`, `ICurrentUser` — what the post-LDAP principal feeds.
+  </Card>
+  <Card title="Multi-tenancy" icon="building" href="/framework/cross/multi-tenancy">
+    Per-tenant LDAP server configuration via tenant-scoped settings.
+  </Card>
+  <Card title="JWT Bearer" icon="ticket" href="/framework/auth/jwt-bearer">
+    The token-validation side of the same flow when LDAP bind happens at an OpenIddict password handler.
+  </Card>
+</CardGroup>

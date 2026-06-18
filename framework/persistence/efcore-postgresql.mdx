@@ -1,0 +1,210 @@
+---
+title: "Volo.Abp.EntityFrameworkCore.PostgreSql — Npgsql provider package"
+description: "How AbpDbContextOptionsPostgreSqlExtensions.UseNpgsql plugs Npgsql.EntityFrameworkCore.PostgreSQL 7.0 into AbpDbContextOptions, the AbpPostgreSqlModelBuilderExtensions marker, sequential-GUID default for Postgres, the Npgsql connection-string checker, and PostgreSQL case-sensitivity gotchas."
+---
+
+`Volo.Abp.EntityFrameworkCore.PostgreSql` is the bridge between `AbpDbContext` and Npgsql. It exposes `UseNpgsql(...)` (and the obsolete `UsePostgreSql(...)` alias kept for backwards compatibility), registers an Npgsql-specific `IConnectionStringChecker` and changes the framework's default sequential-GUID strategy to `SequentialAsString` — the value that minimises B-tree fragmentation on Postgres' `uuid` clustered index.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/EntityFrameworkCore/PostgreSql/AbpEntityFrameworkCorePostgreSqlModule.cs` | Module that `DependsOn(typeof(AbpEntityFrameworkCoreModule))`. Sets `AbpSequentialGuidGeneratorOptions.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString` when unset. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextOptionsPostgreSqlExtensions.cs` | `UseNpgsql(...)` (and obsolete `UsePostgreSql(...)`) extensions on `AbpDbContextOptions`. |
+| `Volo/Abp/EntityFrameworkCore/AbpDbContextConfigurationContextPostgreSqlExtensions.cs` | Inner `UseNpgsql(...)` extension that calls `optionsBuilder.UseNpgsql(...)` with `QuerySplittingBehavior.SplitQuery`. |
+| `Volo/Abp/EntityFrameworkCore/ConnectionStrings/NpgsqlConnectionStringChecker.cs` | `[Dependency(ReplaceServices = true)]` checker that connects to the `postgres` system database first to verify reachability. |
+| `Microsoft/EntityFrameworkCore/AbpPostgreSqlModelBuilderExtensions.cs` | `modelBuilder.UsePostgreSql()` shorthand tagging the model with `EfCoreDatabaseProvider.PostgreSql`. |
+| `Volo.Abp.EntityFrameworkCore.PostgreSql.csproj` | Targets `net7.0`; references `Npgsql.EntityFrameworkCore.PostgreSQL` pinned at version **7.0.0**. |
+
+## The module
+
+```csharp
+[DependsOn(typeof(AbpEntityFrameworkCoreModule))]
+public class AbpEntityFrameworkCorePostgreSqlModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpSequentialGuidGeneratorOptions>(options =>
+        {
+            if (options.DefaultSequentialGuidType == null)
+            {
+                options.DefaultSequentialGuidType = SequentialGuidType.SequentialAsString;
+            }
+        });
+    }
+}
+```
+
+PostgreSQL stores `uuid` as 16 raw bytes but indexes them as a string-ordered binary; `SequentialAsString` reorders the timestamp bytes so the textual representation increases monotonically, which yields the cleanest clustered-index inserts. As with the other provider modules, the null-check makes the assignment non-clobbering.
+
+## `AbpDbContextOptions.UseNpgsql`
+
+```csharp
+public static class AbpDbContextOptionsPostgreSqlExtensions
+{
+    [Obsolete("Use 'UseNpgsql(...)' method instead. This will be removed in future versions.")]
+    public static void UsePostgreSql(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<NpgsqlDbContextOptionsBuilder> postgreSqlOptionsAction = null)
+        => options.Configure(context => context.UseNpgsql(postgreSqlOptionsAction));
+
+    public static void UseNpgsql(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<NpgsqlDbContextOptionsBuilder> postgreSqlOptionsAction = null)
+        => options.Configure(context => context.UseNpgsql(postgreSqlOptionsAction));
+
+    public static void UseNpgsql<TDbContext>(
+        [NotNull] this AbpDbContextOptions options,
+        [CanBeNull] Action<NpgsqlDbContextOptionsBuilder> postgreSqlOptionsAction = null)
+        where TDbContext : AbpDbContext<TDbContext>
+        => options.Configure<TDbContext>(context => context.UseNpgsql(postgreSqlOptionsAction));
+}
+```
+
+`UsePostgreSql` is preserved as an `[Obsolete]` alias because earlier ABP versions used it. New code should call `UseNpgsql` directly — that is the name used by the underlying `Npgsql.EntityFrameworkCore.PostgreSQL` package, and it matches what `Configure<AbpDbContextOptions>(options => options.UseNpgsql(...))` reads naturally.
+
+The `Action<NpgsqlDbContextOptionsBuilder>` lets you set Npgsql-specific knobs:
+
+```csharp
+Configure<AbpDbContextOptions>(options =>
+{
+    options.UseNpgsql(npgsql =>
+    {
+        npgsql.MigrationsAssembly("MyApp.EntityFrameworkCore");
+        npgsql.EnableRetryOnFailure();
+        npgsql.UseAdminDatabase("postgres");
+        npgsql.UseNetTopologySuite();
+    });
+});
+```
+
+## `AbpDbContextConfigurationContext.UseNpgsql`
+
+```csharp
+public static DbContextOptionsBuilder UseNpgsql(
+    [NotNull] this AbpDbContextConfigurationContext context,
+    [CanBeNull] Action<NpgsqlDbContextOptionsBuilder> postgreSqlOptionsAction = null)
+{
+    if (context.ExistingConnection != null)
+    {
+        return context.DbContextOptions.UseNpgsql(context.ExistingConnection, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            postgreSqlOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+    else
+    {
+        return context.DbContextOptions.UseNpgsql(context.ConnectionString, optionsBuilder =>
+        {
+            optionsBuilder.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery);
+            postgreSqlOptionsAction?.Invoke(optionsBuilder);
+        });
+    }
+}
+```
+
+Same structure as the SQL Server inner extension: `QuerySplittingBehavior.SplitQuery` is set *before* the user callback runs, and the user can override it. The `ExistingConnection` branch is used by integration tests that share a single `NpgsqlConnection` across multiple DbContexts.
+
+## Model-builder marker
+
+```csharp
+public static class AbpPostgreSqlModelBuilderExtensions
+{
+    public static void UsePostgreSql(this ModelBuilder modelBuilder)
+    {
+        modelBuilder.SetDatabaseProvider(EfCoreDatabaseProvider.PostgreSql);
+    }
+}
+```
+
+Same role as the SQL Server marker: stores `EfCoreDatabaseProvider.PostgreSql` on the model so provider-aware convention helpers can branch. `AbpDbContext.OnModelCreating` already auto-detects this from `Database.ProviderName == "Npgsql.EntityFrameworkCore.PostgreSQL"`; the helper is only needed when you build the model outside an `AbpDbContext`.
+
+## Npgsql connection-string checker
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class NpgsqlConnectionStringChecker : IConnectionStringChecker, ITransientDependency
+{
+    public virtual async Task<AbpConnectionStringCheckResult> CheckAsync(string connectionString)
+    {
+        var result = new AbpConnectionStringCheckResult();
+        var connString = new NpgsqlConnectionStringBuilder(connectionString) { Timeout = 1 };
+
+        var oldDatabaseName = connString.Database;
+        connString.Database = "postgres";
+
+        try
+        {
+            await using var conn = new NpgsqlConnection(connString.ConnectionString);
+            await conn.OpenAsync();
+            result.Connected = true;
+            await conn.ChangeDatabaseAsync(oldDatabaseName);
+            result.DatabaseExists = true;
+            await conn.CloseAsync();
+            return result;
+        }
+        catch (Exception) { return result; }
+    }
+}
+```
+
+Notes:
+
+* `Timeout = 1` (in seconds) keeps probe calls fast; tenant administration UIs that call the checker won't block on slow networks.
+* The probe connects to the `postgres` *system database* — every Postgres cluster ships one — before issuing `ChangeDatabaseAsync(oldDatabaseName)` to verify that the application database exists. If your security policy revokes access to `postgres`, supply a custom `IConnectionStringChecker`.
+
+## Version constraints
+
+```xml
+<TargetFramework>net7.0</TargetFramework>
+<PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="7.0.0" />
+```
+
+The Npgsql package is pinned at **7.0.0** in v7.4.0. The pin aligns with EF Core 7's API surface. Upgrading Npgsql to 7.0.4 (a patch release) is the only safe in-place upgrade; jumping to 8.0 requires the matching ABP package built for EF Core 8.
+
+## Registration pattern
+
+```csharp
+[DependsOn(
+    typeof(AbpEntityFrameworkCoreModule),
+    typeof(AbpEntityFrameworkCorePostgreSqlModule))]
+public class MyApplicationEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+        {
+            options.AddDefaultRepositories(includeAllEntities: true);
+        });
+
+        Configure<AbpDbContextOptions>(options =>
+        {
+            options.UseNpgsql(npgsql =>
+            {
+                npgsql.MigrationsAssembly(typeof(MyApplicationEntityFrameworkCoreModule).Assembly.FullName);
+            });
+        });
+    }
+}
+```
+
+If your application has multiple DbContexts and only one uses Postgres, use the generic overload:
+
+```csharp
+options.UseNpgsql<MyAnalyticsDbContext>();
+options.UseSqlServer<MyOperationalDbContext>();
+```
+
+## Case sensitivity and other PostgreSQL gotchas
+
+* **Identifiers are case-folded to lowercase** unless quoted. EF Core by default uses *quoted* identifiers, so a property named `OrderDate` becomes `"OrderDate"` in the SQL — and `SELECT orderdate FROM "Orders"` fails with `column "orderdate" does not exist`. If you import a legacy database, use `[Table("orders")]` / `[Column("order_date")]` to override the casing, or call `modelBuilder.UseSnakeCaseNamingConvention()` from the `EFCore.NamingConventions` package.
+* **`varchar` collations are *case sensitive* by default.** `WHERE Email = 'foo@bar.com'` will not match `'FOO@BAR.COM'`. Use `EF.Functions.ILike` (Npgsql-only) or `EF.Functions.Collate(column, "und-x-icu")` for case-insensitive comparisons. ABP modules that compare email addresses (Identity, etc.) compare the normalised `NormalizedEmail` column, which sidesteps this issue.
+* **`bytea` not `varbinary`.** `byte[]` properties are mapped to `bytea`. If you migrate from SQL Server you may need to add explicit `[Column(TypeName = "bytea")]`. ABP's `ExtraProperties` JSON column is stored as `jsonb` on Postgres — this gives you Postgres-native indexing (`-> 'PropertyName'`).
+* **Default schema is `public`.** Multi-module deployments often share a single Postgres database. To isolate, set `modelBuilder.HasDefaultSchema("identity")` (or per-entity `[Table("Users", Schema = "identity")]`) inside the module's `OnModelCreating`.
+* **JSONB and `IHasExtraProperties`.** The ABP convention helpers use `nvarchar(max)`-style JSON on SQL Server and `jsonb` on PostgreSQL. Queries like `_repository.GetListAsync(x => x.ExtraProperties.Contains("Foo"))` translate cleanly on both, but advanced JSONB operators (`@>`, `?`) require raw SQL.
+* **`pg_hba.conf` and the `postgres` database probe.** The connection-string checker depends on the configured user being allowed to connect to the `postgres` database. Locked-down setups need to either grant `CONNECT` on `postgres` or replace `NpgsqlConnectionStringChecker`.
+* **`TIMESTAMP WITH TIME ZONE` vs `TIMESTAMP`.** Npgsql 6+ requires `DateTime.Kind == DateTimeKind.Utc` for `timestamp with time zone` columns. ABP applies `AbpDateTimeValueConverter` based on `IClock.Kind` (UTC by default in modern templates) which makes round-tripping safe. If you flip `IClock.Kind` to `Local`, you'll need explicit `[Column(TypeName = "timestamp without time zone")]` annotations.
+* **`SequentialAsString` GUIDs.** Postgres orders `uuid` as a 16-byte binary, but the `SequentialAsString` strategy keeps the *string representation* monotonic — useful for log readability — at the cost of binary ordering not being strictly sequential. If you index aggressively on `Id` and care about page-split rate, consider `SequentialAsBinary` instead.
+* **Migrations across providers.** `dotnet ef migrations add` produces provider-specific SQL. The startup templates ship two migration projects per provider when both SQL Server and Postgres are supported; pick `--context` and `--project` explicitly when scaffolding.
+* **`UseQuerySplittingBehavior(SplitQuery)` is forced.** Postgres handles split queries efficiently because each split is a separate `SELECT` over a single index. Override only if you intentionally want a single query with cartesian explosion.

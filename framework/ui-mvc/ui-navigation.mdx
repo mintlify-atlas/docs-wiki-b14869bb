@@ -1,0 +1,428 @@
+---
+title: "Volo.Abp.UI.Navigation: menus, application URLs, contributors"
+sidebarTitle: "UI.Navigation"
+description: "How Volo.Abp.UI.Navigation models ApplicationMenu, ApplicationMenuItem, IMenuContributor and AppUrlProvider — the contracts that every theme reads to render the main menu, user menu and shortcuts."
+---
+
+`Volo.Abp.UI.Navigation` is the UI-agnostic menu engine. Themes (MVC Basic/LeptonX, Blazor Basic, MAUI…) never build their menu tree by hand — instead they ask `IMenuManager` for an `ApplicationMenu` by name, and the manager runs every registered `IMenuContributor` against it. The same contributor wires the menu for MVC, Blazor Server and Blazor WASM.
+
+The package also owns the `AppUrlProvider`, a placeholder-based resolver used to compose absolute URLs to the application's public site, login page, password reset endpoint, and so on — with multi-tenant tokens (`{{tenantId}}`, `{{tenantName}}`) substituted at runtime.
+
+## Package layout
+
+```text framework/src/Volo.Abp.UI.Navigation/
+Volo/Abp/Ui/Navigation/
+  AbpUiNavigationModule.cs
+  AbpNavigationOptions.cs
+  ApplicationMenu.cs
+  ApplicationMenuItem.cs
+  ApplicationMenuItemList.cs
+  ApplicationMenuGroup.cs
+  ApplicationMenuGroupList.cs
+  ApplicationMenuExtensions.cs
+  IHasMenuItems.cs
+  IHasMenuGroups.cs
+  HasMenuItemsExtensions.cs
+  IMenuConfigurationContext.cs
+  MenuConfigurationContext.cs
+  IMenuContributor.cs
+  DefaultMenuContributor.cs
+  IMenuManager.cs
+  MenuManager.cs
+  StandardMenus.cs
+  DefaultMenuNames.cs
+  Urls/
+    AppUrlOptions.cs
+    ApplicationUrlDictionary.cs
+    ApplicationUrlInfo.cs
+    IAppUrlProvider.cs
+    AppUrlProvider.cs
+  Localization/Resource/AbpUiNavigationResource.cs
+```
+
+## The module
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/AbpUiNavigationModule.cs
+[DependsOn(typeof(AbpUiModule), typeof(AbpAuthorizationModule), typeof(AbpMultiTenancyModule))]
+public class AbpUiNavigationModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+            options.FileSets.AddEmbedded<AbpUiNavigationModule>());
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Add<AbpUiNavigationResource>("en")
+                .AddVirtualJson("/Volo/Abp/Ui/Navigation/Localization/Resource");
+        });
+
+        Configure<AbpNavigationOptions>(options =>
+        {
+            options.MenuContributors.Add(new DefaultMenuContributor());
+        });
+    }
+}
+```
+
+| Depends on | Why |
+| --- | --- |
+| [`AbpUiModule`](/framework/ui-mvc/ui) | Inherits branding + layout hook plumbing |
+| `AbpAuthorizationModule` | Resolves `IAuthorizationService` so contributors can hide entries via `RequirePermissions` |
+| `AbpMultiTenancyModule` | `AppUrlProvider` needs `ICurrentTenant` / `ITenantStore` for placeholder substitution |
+
+The module also pre-registers a `DefaultMenuContributor` that adds the **Administration** menu item to every `Main` menu (Identity, Tenant Management, etc. then attach their items underneath).
+
+## The data model
+
+### `ApplicationMenu`
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/ApplicationMenu.cs
+public class ApplicationMenu : IHasMenuItems, IHasMenuGroups
+{
+    public string Name { get; }
+    public string DisplayName { get; set; }
+    public ApplicationMenuItemList Items { get; }
+    public ApplicationMenuGroupList Groups { get; }
+    public Dictionary<string, object> CustomData { get; } = new();
+
+    public ApplicationMenu AddItem(ApplicationMenuItem menuItem) { Items.Add(menuItem); return this; }
+    public ApplicationMenu AddGroup(ApplicationMenuGroup group)  { Groups.Add(group);  return this; }
+    public ApplicationMenu WithCustomData(string key, object value) { CustomData[key] = value; return this; }
+}
+```
+
+A menu has a unique `Name` (the most common values are `"Main"`, `"User"`, `"Shortcut"` — see `StandardMenus`), a tree of `ApplicationMenuItem`, an optional list of `ApplicationMenuGroup` (used by themes that want to render headers between sections), and a free-form `CustomData` bag.
+
+### `ApplicationMenuItem`
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/ApplicationMenuItem.cs
+public class ApplicationMenuItem
+    : IHasMenuItems, IHasSimpleStateCheckers<ApplicationMenuItem>
+{
+    public const int DefaultOrder = 1000;
+
+    public string  Name { get; }
+    public string  DisplayName { get; set; }
+    public int     Order { get; set; }
+    public string? Url { get; set; }
+    public string? Icon { get; set; }
+    public string? Target { get; set; }
+    public bool    IsDisabled { get; set; }
+    public bool    IsLeaf => Items.IsNullOrEmpty();
+    public ApplicationMenuItemList Items { get; }
+    public List<ISimpleStateChecker<ApplicationMenuItem>> StateCheckers { get; }
+    public Dictionary<string, object> CustomData { get; } = new();
+    public string? ElementId { get; set; }
+    public string? CssClass { get; set; }
+    public string? GroupName { get; set; }
+}
+```
+
+Items are tree-shaped (an item itself implements `IHasMenuItems`, so a parent can carry children). Every item exposes a `StateCheckers` collection — this is how `RequirePermissions("MyPermission")` or `RequireFeatures("MyFeature")` work behind the scenes.
+
+`ElementId` is automatically normalised: dots are replaced by underscores so the ID is always a legal DOM identifier.
+
+### `ApplicationMenuItemList`
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/ApplicationMenuItemList.cs
+public class ApplicationMenuItemList : List<ApplicationMenuItem>
+{
+    public void Normalize()
+    {
+        RemoveEmptyItems();
+        Order();
+    }
+
+    private void RemoveEmptyItems()
+    {
+        RemoveAll(item => item.IsLeaf && item.Url.IsNullOrEmpty());
+    }
+
+    private void Order()
+    {
+        var orderedItems = this.OrderBy(item => item.Order).ToArray();
+        Clear();
+        AddRange(orderedItems);
+    }
+}
+```
+
+`Normalize()` is invoked by the `MenuManager` after contributors have finished — it drops "ghost" items (no URL **and** no children, typically because every child was removed by a state checker) and sorts by `Order`. Because every leaf node falls through to a `null` URL when its only children are denied, ABP transparently collapses entire empty subtrees.
+
+### Groups
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/ApplicationMenuGroup.cs
+public class ApplicationMenuGroup
+{
+    public const int DefaultOrder = 1000;
+
+    public string Name { get; }
+    public string DisplayName { get; set; }
+    public string? ElementId { get; set; }   // normalised: dots → underscores
+    public int Order { get; set; }
+}
+```
+
+Items reference a group by setting `ApplicationMenuItem.GroupName`. After contributors run, `MenuManager.NormalizeMenuGroup` clears any `GroupName` that doesn't correspond to an actual registered group, which prevents themes from rendering orphan headers.
+
+## Contributors
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/IMenuContributor.cs
+public interface IMenuContributor
+{
+    Task ConfigureMenuAsync(MenuConfigurationContext context);
+}
+```
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/DefaultMenuContributor.cs
+public class DefaultMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        var l = context.GetLocalizer<AbpUiNavigationResource>();
+
+        if (context.Menu.Name == StandardMenus.Main)
+        {
+            context.Menu.AddItem(
+                new ApplicationMenuItem(
+                    DefaultMenuNames.Application.Main.Administration,
+                    l["Menu:Administration"],
+                    icon: "fa fa-wrench"
+                )
+            );
+        }
+        return Task.CompletedTask;
+    }
+}
+```
+
+The pattern is universal:
+
+1. **Branch on `context.Menu.Name`** so the same contributor can supply different menus.
+2. Use `context.GetLocalizer<TResource>()` (or `context.GetDefaultLocalizer()`) to localize labels.
+3. Add items, chain `.AddItem(child)` for sub-menus, call `RequirePermissions(...)` to gate visibility.
+
+### The configuration context
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/MenuConfigurationContext.cs
+public class MenuConfigurationContext : IMenuConfigurationContext
+{
+    public IServiceProvider ServiceProvider { get; }
+    public ApplicationMenu Menu { get; }
+
+    public IAuthorizationService AuthorizationService =>
+        _lazy.LazyGetRequiredService<IAuthorizationService>();
+    public IStringLocalizerFactory StringLocalizerFactory =>
+        _lazy.LazyGetRequiredService<IStringLocalizerFactory>();
+
+    public Task<bool> IsGrantedAsync(string policyName)
+        => AuthorizationService.IsGrantedAsync(policyName);
+
+    public IStringLocalizer? GetDefaultLocalizer()
+        => StringLocalizerFactory.CreateDefaultOrNull();
+
+    public IStringLocalizer GetLocalizer<T>()
+        => StringLocalizerFactory.Create<T>();
+
+    public IStringLocalizer GetLocalizer(Type resourceType)
+        => StringLocalizerFactory.Create(resourceType);
+}
+```
+
+Services are resolved through `IAbpLazyServiceProvider` so contributors that never touch authorization don't pay the activation cost.
+
+### Registering a contributor
+
+```csharp
+public class MyMenuContributor : IMenuContributor
+{
+    public async Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.Main) return;
+
+        var l = context.GetLocalizer<MyResource>();
+
+        var dashboard = new ApplicationMenuItem("MyApp.Dashboard", l["Menu:Dashboard"], "/dashboard", "fa fa-tachometer-alt")
+            .RequirePermissions("MyApp.Dashboards.View");
+
+        context.Menu.AddItem(dashboard);
+    }
+}
+
+// in a module:
+Configure<AbpNavigationOptions>(options =>
+{
+    options.MenuContributors.Add(new MyMenuContributor());
+});
+```
+
+## `AbpNavigationOptions`
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/AbpNavigationOptions.cs
+public class AbpNavigationOptions
+{
+    public List<IMenuContributor> MenuContributors { get; }
+
+    /// <summary>Includes the StandardMenus.Main by default.</summary>
+    public List<string> MainMenuNames { get; }
+
+    public AbpNavigationOptions()
+    {
+        MenuContributors = new List<IMenuContributor>();
+        MainMenuNames    = new List<string> { StandardMenus.Main };
+    }
+}
+```
+
+`MainMenuNames` is what `IMenuManager.GetMainMenuAsync()` calls; by default it merges everything under `StandardMenus.Main`, but a theme that wanted to render two parallel main menus (top-bar + side-bar) could push a second name onto the list.
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/StandardMenus.cs
+public static class StandardMenus
+{
+    public const string Main     = "Main";
+    public const string User     = "User";
+    public const string Shortcut = "Shortcut";
+}
+```
+
+## The `MenuManager`
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/MenuManager.cs
+public class MenuManager : IMenuManager, ITransientDependency
+{
+    public Task<ApplicationMenu> GetAsync(string name) => GetInternalAsync(name);
+
+    public Task<ApplicationMenu> GetMainMenuAsync()
+        => GetAsync(Options.MainMenuNames.ToArray());
+
+    protected virtual async Task<ApplicationMenu> GetInternalAsync(string name)
+    {
+        var menu = new ApplicationMenu(name);
+
+        using (var scope = ServiceScopeFactory.CreateScope())
+        using (RequirePermissionsSimpleBatchStateChecker<ApplicationMenuItem>.Use(
+                  new RequirePermissionsSimpleBatchStateChecker<ApplicationMenuItem>()))
+        {
+            var context = new MenuConfigurationContext(menu, scope.ServiceProvider);
+            foreach (var contributor in Options.MenuContributors)
+                await contributor.ConfigureMenuAsync(context);
+
+            await CheckPermissionsAsync(scope.ServiceProvider, menu);
+        }
+
+        NormalizeMenu(menu);
+        NormalizeMenuGroup(menu);
+        return menu;
+    }
+}
+```
+
+The flow per request:
+
+1. Create a fresh, empty `ApplicationMenu`.
+2. Open a service scope and a permission-batch checker scope (so all "is granted?" calls are batched in one DB hit).
+3. Run every contributor in registration order.
+4. Walk every item, materialise `RequiredPermissionName` into a `RequirePermissionsSimpleStateChecker`, run the batched checker, and delete items whose state evaluates to `false`.
+5. Recursively `Normalize()` — sort + drop empty items — then normalise groups.
+
+If multiple `MainMenuNames` are configured, `MergeMenus` flattens their items into the first menu.
+
+## Extension helpers
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/ApplicationMenuExtensions.cs
+public static ApplicationMenuItem GetAdministration(this ApplicationMenu menu)
+    => menu.GetMenuItem(DefaultMenuNames.Application.Main.Administration);
+
+public static ApplicationMenuItem? GetMenuItemOrNull(this IHasMenuItems menu, string name)
+    => menu.Items.FirstOrDefault(mi => mi.Name == name);
+
+public static bool TryRemoveMenuItem(this IHasMenuItems menu, string name)
+    => menu.Items.RemoveAll(item => item.Name == name) > 0;
+
+public static IHasMenuItems SetSubItemOrder(this IHasMenuItems menu, string name, int order)
+{
+    var item = menu.GetMenuItemOrNull(name);
+    if (item != null) item.Order = order;
+    return menu;
+}
+```
+
+These are how downstream modules attach to the framework-provided "Administration" item:
+
+```csharp
+context.Menu.GetAdministration()
+    .AddItem(new ApplicationMenuItem("Identity", l["Menu:Identity"])
+        .AddItem(new ApplicationMenuItem("Identity.Users", l["Users"], "/Identity/Users")));
+```
+
+`HasMenuItemsExtensions.FindMenuItem` does a recursive search if you don't know the parent.
+
+## Application URLs
+
+The `Urls` folder solves "where is the public site?" / "where is the password reset page?" — useful when the API host is a separate site from the SPA or when each tenant lives on its own subdomain.
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/Urls/AppUrlOptions.cs
+public class AppUrlOptions
+{
+    public ApplicationUrlDictionary Applications { get; }
+    public List<string> RedirectAllowedUrls { get; }
+}
+
+public class ApplicationUrlInfo
+{
+    public string? RootUrl { get; set; }
+    public IDictionary<string, string> Urls { get; }
+}
+```
+
+A typical registration:
+
+```csharp
+Configure<AppUrlOptions>(options =>
+{
+    options.Applications["MVC"].RootUrl = configuration["App:SelfUrl"];
+    options.Applications["MVC"].Urls[AccountUrlNames.PasswordReset] = "Account/ResetPassword";
+    options.RedirectAllowedUrls.AddRange(configuration["App:RedirectAllowedUrls"].Split(','));
+});
+```
+
+### `AppUrlProvider`
+
+```csharp framework/src/Volo.Abp.UI.Navigation/Volo/Abp/Ui/Navigation/Urls/AppUrlProvider.cs
+public class AppUrlProvider : IAppUrlProvider, ITransientDependency
+{
+    public const string TenantIdPlaceHolder   = "{{tenantId}}";
+    public const string TenantNamePlaceHolder = "{{tenantName}}";
+
+    public virtual async Task<string> GetUrlAsync(string appName, string? urlName = null)
+        => await ReplacePlaceHoldersAsync(await GetConfiguredUrl(appName, urlName));
+
+    public bool IsRedirectAllowedUrl(string url)
+    {
+        var allow = Options.RedirectAllowedUrls
+            .Any(x => url.StartsWith(x, StringComparison.CurrentCultureIgnoreCase));
+        if (!allow) Logger.LogError($"Invalid RedirectUrl: {url}, …");
+        return allow;
+    }
+}
+```
+
+The provider rewrites two tokens at runtime:
+
+| Placeholder | Substituted with | Example input → output |
+| --- | --- | --- |
+| `{{tenantId}}` | `CurrentTenant.Id` (empty if host side) | `https://api.app.com/{{tenantId}}` → `https://api.app.com/8a-…` |
+| `{{tenantName}}` | `CurrentTenant.Name` (loaded from `ITenantStore` if missing) | `https://{{tenantName}}.app.com/` → `https://acme.app.com/` |
+
+When the current side is the host (no tenant), the placeholders are replaced with an empty string and the trailing dot before the tenant slot is dropped automatically.
+
+`IsRedirectAllowedUrl` is the **allow-list check** used by login pages and the email-confirmation flow to make sure they don't redirect to arbitrary attacker-controlled URLs.
+
+## Cross-references
+
+- The simple-state checker that powers `RequirePermissions` lives in [`Volo.Abp.SimpleStateChecking`](/framework/core/simple-state-checking).
+- The authorization-service abstraction comes from [`Volo.Abp.Authorization`](/framework/auth/authorization).
+- The MVC layer that renders these menus is [`Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared`](/framework/ui-mvc/mvc-ui-theme-shared) (look for the `_Sidebar.cshtml` and `_Toolbar.cshtml` partials).
+- For host/tenant URL resolution at HTTP level, see [`Volo.Abp.AspNetCore.MultiTenancy`](/framework/cross/aspnetcore-multitenancy).

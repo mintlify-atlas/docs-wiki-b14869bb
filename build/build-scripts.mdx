@@ -1,0 +1,311 @@
+---
+title: "PowerShell build scripts in the abpframework/abp repo"
+sidebarTitle: "Build Scripts"
+description: "Tour of every script under build/ — common.ps1 solution discovery, build-all.ps1 development build, build-all-release.ps1 release build, test-all.ps1, and delete-bin-obj.ps1."
+---
+
+The `build/` folder at the root of `abpframework/abp` contains the four PowerShell scripts that drive every developer-side build of the framework, modules and templates. Each script is intentionally tiny — solution discovery lives in `build/common.ps1`, and the rest just iterates over the list and shells out to `dotnet`.
+
+This page walks every script in `build/` and the root-level `delete-bin-obj.ps1`, quoting the actual source and summarising the inputs, outputs and side effects.
+
+## Layout of `build/`
+
+```text
+build/
+├── build-all.ps1            # development build (Debug, partial solution list)
+├── build-all-release.ps1    # release build (full solution list, /maxcpucount)
+├── common.ps1               # solution discovery; sourced by every script
+└── test-all.ps1             # dotnet test --collect "XPlat Code Coverage"
+```
+
+There is also `delete-bin-obj.ps1` at the repo root for nuking generated artefacts.
+
+## Script summary table
+
+| Script | Inputs | Outputs | Side effects |
+|--------|--------|---------|--------------|
+| `build/common.ps1` | `$args[0]` — `-f` (full) or empty (dev) | Defines `$rootFolder` and `$solutionPaths` | Prints a red/yellow warning banner when not run with `-f` |
+| `build/build-all.ps1` | `$args[0]` forwarded to `common.ps1` | Bin/obj output for every solution; non-zero exit on failure | Installs `wasm-tools` and `maui-tizen` dotnet workloads, runs `dotnet build` per solution, `cd`s through subfolders |
+| `build/build-all-release.ps1` | Hard-codes `-f` when sourcing `common.ps1` | Release-config binaries for the full solution list | Runs `dotnet build --configuration Release -- /maxcpucount` |
+| `build/test-all.ps1` | `$args[0]` forwarded to `common.ps1` | TRX/coverage outputs per solution | Runs `dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"` |
+| `delete-bin-obj.ps1` | None | Removes every `bin/` and `obj/` directory under the repo | Skips paths containing `\node_modules\`; colour-coded console output |
+
+## `build/common.ps1` — solution discovery
+
+`common.ps1` is the single source of truth for "which solutions are part of an ABP build". It is dot-sourced by `build-all.ps1`, `build-all-release.ps1` and `test-all.ps1`.
+
+```powershell
+$full = $args[0]
+
+# COMMON PATHS
+
+$rootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+# List of solutions used only in development mode
+$solutionPaths = @(
+        "../framework",
+        "../modules/basic-theme",
+        "../modules/users",
+        "../modules/permission-management",
+        "../modules/setting-management",
+        "../modules/feature-management",
+        "../modules/identity",
+        "../modules/identityserver",
+        "../modules/openiddict",
+        "../modules/tenant-management",
+        "../modules/audit-logging",
+        "../modules/background-jobs",
+        "../modules/account",
+        "../modules/cms-kit",
+        "../modules/blob-storing-database"
+    )
+```
+
+`$rootFolder` is set from `Get-Item -Path "./"`, which means **the script must be invoked from inside `build/`** — every other entry is interpreted relative to that working directory.
+
+The default list above is the *development* set: framework + the modules a contributor working on the framework typically rebuilds. The list is extended when `-f` (full) is passed:
+
+```powershell
+if ($full -eq "-f")
+{
+    # List of additional solutions required for full build
+    $solutionPaths += (
+        "../modules/client-simulation",
+        "../modules/virtual-file-explorer",
+        "../modules/docs",
+        "../modules/blogging",
+        "../templates/module/aspnet-core",
+        "../templates/app/aspnet-core",
+        "../templates/console",
+        "../templates/wpf",
+        "../templates/app-nolayers/aspnet-core",
+        "../abp_io/AbpIoLocalization",
+        "../source-code"
+    )
+}else{
+    Write-host ""
+    Write-host ":::::::::::::: !!! You are in development mode !!! ::::::::::::::" -ForegroundColor red -BackgroundColor  yellow
+    Write-host ""
+}
+```
+
+### Why the list matters
+
+* The `deploy/` pipeline calls `build-all-release.ps1` (which forces `-f`) and then `nupkg/pack.ps1` iterates the *project* list in `nupkg/common.ps1` — not the solution list. The two lists must stay in sync.
+* The development build skips `templates/*`, `modules/docs`, `modules/blogging`, `source-code/` and `abp_io/AbpIoLocalization` because most contributors never touch them.
+* When the warning banner appears, you are building the dev set — CI and release builds always pass `-f`.
+
+### Ordering
+
+The order is significant for first-time restores: `framework` is built first so that downstream modules can resolve `Volo.Abp.*` project references. The full list appends templates last because templates depend on every module.
+
+## `build/build-all.ps1` — development build
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Build all solutions
+
+Write-Host $solutionPaths
+
+dotnet workload install wasm-tools
+dotnet workload install maui-tizen
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+Key behaviours:
+
+* **Workload install** — `dotnet workload install wasm-tools` and `dotnet workload install maui-tizen` are unconditional. They are required because `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly` targets `net7.0` with `wasm-tools`, and `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor` depends on the MAUI workload (Tizen included for cross-targeting).
+* **Default configuration** — no `--configuration` flag, so `dotnet build` falls back to `Debug`.
+* **No `/maxcpucount`** — relies on MSBuild's default node count. Use the release script if you want full parallelism.
+* **Per-solution `cd`** — `Set-Location` changes into each solution folder. `dotnet build` without a path argument therefore picks up the `.sln` file in that folder.
+* **Fail-fast** — `-Not $?` checks the previous command's success boolean. On failure the script `exit`s with `$LASTEXITCODE`, ensuring CI sees the same non-zero code.
+* **Final `cd`** — restores `$rootFolder` so the caller's shell does not end up in the last solution directory.
+
+`Write-Host $solutionPaths` at the top is a debugging aid: it prints every path resolved by `common.ps1` before the workload installs begin.
+
+## `build/build-all-release.ps1` — release build
+
+```powershell
+. ".\common.ps1" -f
+
+# Build all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build --configuration Release -- /maxcpucount
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+Differences from `build-all.ps1`:
+
+| Aspect | `build-all.ps1` | `build-all-release.ps1` |
+|--------|-----------------|-------------------------|
+| Solution set | Dev (15 entries) | Full (`-f` adds templates, blogging, docs, etc.) |
+| Configuration | `Debug` | `Release` (matches what `nupkg/pack.ps1` will `--no-build` pack) |
+| Parallelism | MSBuild default | `/maxcpucount` (all logical cores) |
+| Workload install | `wasm-tools` + `maui-tizen` | None — assumes the dev script has been run, or that CI provisions workloads externally |
+| Used by | Contributors | `deploy/1-fetch-and-build.ps1` |
+
+The `-- /maxcpucount` syntax uses `--` to tell `dotnet build` to pass everything after the separator straight to MSBuild. Without the separator, `dotnet` would try to interpret `/maxcpucount` as one of its own flags.
+
+This is the exact build that the release pipeline runs before NuGet packing. Because `dotnet pack` later uses `--no-build`, the bits produced here are the bits that ship.
+
+## `build/test-all.ps1` — coverage-enabled test runner
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Test all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"
+    if (-Not $?) {
+        Write-Host ("Test failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+Notes:
+
+* `--no-build --no-restore` assumes `build-all.ps1` or `build-all-release.ps1` has already run. This is by design — running them again would double CI time.
+* `--collect:"XPlat Code Coverage"` activates the `coverlet.collector` package that `Directory.Build.props` automatically references for any project where `IsTestProject == true`. The collector writes `coverage.cobertura.xml` files under each project's `TestResults/` directory.
+* Coverage is uploaded to Codecov via the GitHub Actions job; the thresholds and branch are defined in `codecov.yml` at the repo root (see [Test Infrastructure](/build/test-infrastructure)).
+* The fail-fast loop mirrors the build scripts: any failing test solution stops the run.
+* The argument is forwarded to `common.ps1`, so `./test-all.ps1 -f` will test the full superset (templates included).
+
+## `delete-bin-obj.ps1` — clean slate
+
+This script sits at the repo root rather than under `build/`, but it is the canonical "reset my working tree" helper that complements the build scripts.
+
+```powershell
+Clear-Host
+Write-Host "Deleting all BIN and OBJ folders..." -ForegroundColor Cyan
+Get-ChildItem -Path . -Include bin,obj -Recurse -Directory | ForEach-Object {
+    if ($_.FullName -notmatch "\\node_modules\\") {
+        Write-Host "Deleting:" $_.FullName -ForegroundColor Yellow
+        Remove-Item $_.FullName -Recurse -Force
+    } else {
+        Write-Host "Skipping:" $_.FullName -ForegroundColor Magenta
+    }
+}
+
+Write-Host "BIN and OBJ folders have been successfully deleted." -ForegroundColor Green
+```
+
+Highlights:
+
+* `Get-ChildItem -Include bin,obj -Recurse -Directory` enumerates every `bin/` and `obj/` directory under the working tree. The `-Include` filter only fires when the path ends with the matched name, which is what the `-Directory` switch effectively guarantees.
+* The `node_modules` exclusion is critical — npm packages routinely ship transitive `bin/` directories (CLI shims) and `obj/` directories (TypeScript build cache), and blowing those away would silently break the `npm/ng-packs` workspace.
+* Use this before a release build or after switching branches with significant project additions/removals to avoid stale references.
+
+## Putting it together
+
+A typical clean release rehearsal looks like this from `build/`:
+
+```powershell
+# from build/
+../delete-bin-obj.ps1
+./build-all-release.ps1
+./test-all.ps1 -f
+```
+
+A fast contributor inner loop is:
+
+```powershell
+# from build/
+./build-all.ps1     # warns "development mode"; builds Debug
+./test-all.ps1      # tests the same dev solution set
+```
+
+For the release pipeline, `deploy/1-fetch-and-build.ps1` chains `git switch`, `git pull origin`, and then `./build-all-release.ps1`; see [Deploy Pipeline](/build/deploy-pipeline). The packs produced from this build feed [NuGet Packaging](/build/nuget-packaging).
+
+## Common pitfalls
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Build failed for the solution: ../templates/...` on first run | You forgot `-f` and templates were not in the dev list, then ran `dotnet pack` which expects them | Pass `-f` to `build-all.ps1` or use `build-all-release.ps1` |
+| `dotnet workload install` prompts for elevation | Running PowerShell unelevated on Windows | Run from an elevated terminal once per machine |
+| `test-all.ps1` rebuilds everything | The `--no-build` flag was removed in a local edit | Restore the original flags — the deploy pipeline relies on them |
+| `delete-bin-obj.ps1` removes Angular `dist` artefacts | None — it only deletes `bin/` and `obj/` | None needed; for Angular cleanup see `npm/ng-packs/scripts/` |
+| Empty `$solutionPaths` | Script invoked from repo root instead of `build/` | `cd build` before running |
+
+## What gets built — solution inventory
+
+When `common.ps1` runs with `-f`, the resolved `$solutionPaths` set is:
+
+| Path (relative to `build/`) | Contains |
+|----------------------------|----------|
+| `../framework` | `framework.sln` — every `Volo.Abp.*` package + its test projects |
+| `../modules/basic-theme` | Bootstrap-flavoured default UI theme |
+| `../modules/users` | `Volo.Abp.Users.*` abstractions and storage providers |
+| `../modules/permission-management` | Permission storage and admin UI |
+| `../modules/setting-management` | Setting storage and admin UI |
+| `../modules/feature-management` | Multi-tenant feature flags |
+| `../modules/identity` | ASP.NET Identity wrapper + UI |
+| `../modules/identityserver` | Duende IdentityServer integration |
+| `../modules/openiddict` | OpenIddict alternative to IdentityServer |
+| `../modules/tenant-management` | Tenant CRUD UI + storage |
+| `../modules/audit-logging` | Audit log entity + EFCore / Mongo providers |
+| `../modules/background-jobs` | Persistent background job store |
+| `../modules/account` | Login / register / external login UI |
+| `../modules/cms-kit` | Blog / pages / comments / reactions / menus |
+| `../modules/blob-storing-database` | Blob storage that targets EFCore / Mongo |
+| `../modules/client-simulation` | Load-testing harness (`-f` only) |
+| `../modules/virtual-file-explorer` | Embedded-resource explorer UI (`-f` only) |
+| `../modules/docs` | docs.abp.io rendering module (`-f` only) |
+| `../modules/blogging` | Legacy blogging module (`-f` only) |
+| `../templates/module/aspnet-core` | Module template (`-f` only) |
+| `../templates/app/aspnet-core` | Application template (`-f` only) |
+| `../templates/console` | Console template (`-f` only) |
+| `../templates/wpf` | WPF template (`-f` only) |
+| `../templates/app-nolayers/aspnet-core` | Single-layer app template (`-f` only) |
+| `../abp_io/AbpIoLocalization` | abp.io localization assets (`-f` only) |
+| `../source-code` | "Source code" reference projects (`-f` only) |
+
+The dev set is the first fifteen entries; everything below the `if ($full -eq "-f")` block is added when `-f` is passed.
+
+## Why `dotnet build` per folder
+
+The scripts deliberately `cd` into each solution and call `dotnet build` without arguments instead of `dotnet build path/to/solution.sln` from the repo root. Two reasons:
+
+1. Some solutions check in a custom `nuget.config` or `global.json` alongside the `.sln`; `cd`-ing in lets MSBuild pick those up.
+2. Multi-line `Set-Location` traces are easier to read in the transcript — each section visibly switches working directory before its build output.
+
+The downside is that an exception in one solution leaves the shell in an unexpected folder; the trailing `Set-Location $rootFolder` after the loop is what keeps the script composable inside `_run_all.ps1`.
+
+## Related pages
+
+* [NuGet Packaging](/build/nuget-packaging) — what `dotnet pack` does with the binaries this folder produces.
+* [Deploy Pipeline](/build/deploy-pipeline) — how `build-all-release.ps1` is wired into release automation.
+* [Test Infrastructure](/build/test-infrastructure) — what `dotnet test --collect "XPlat Code Coverage"` actually instruments.

@@ -1,0 +1,407 @@
+---
+title: "Volo.Abp.ObjectMapping — IObjectMapper"
+description: "ABP's pluggable object-to-object mapping abstraction: IObjectMapper, the DefaultObjectMapper resolution order, IMapTo / IMapFrom convention interfaces, custom IObjectMapper<TSource,TDest> overrides, and the IAutoObjectMappingProvider extension point."
+---
+
+`Volo.Abp.ObjectMapping` is a *thin* contract layer that decouples ABP application services from any specific mapping library. Application code injects `IObjectMapper` and calls `Map<TSource, TDestination>(source)`; behind the scenes one of three strategies wins in a well-defined order: a per-pair `IObjectMapper<TSource, TDestination>` registered in DI, the `IMapTo<TDestination>` / `IMapFrom<TSource>` convention interfaces, or an underlying `IAutoObjectMappingProvider` such as `AutoMapperAutoObjectMappingProvider`. By default the module ships `NotImplementedAutoObjectMappingProvider`, which forces consumers to depend on `Volo.Abp.AutoMapper` (or implement their own provider) to get auto-mapping.
+
+The contract is purposefully minimal. Two generic `Map` overloads, a property exposing the underlying `IAutoObjectMappingProvider`, and a `Type`-based reflective helper for cases where source/destination types are only known at runtime. That's it — and it's enough to swap AutoMapper for Mapster or hand-written mappers in a few lines.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/ObjectMapping/AbpObjectMappingModule.cs` | Module class; auto-registers per-pair mappers and the open-generic `DefaultObjectMapper<TContext>`. |
+| `Volo/Abp/ObjectMapping/IObjectMapper.cs` | Three interfaces: `IObjectMapper`, `IObjectMapper<TContext>`, `IObjectMapper<TSource, TDestination>`. |
+| `Volo/Abp/ObjectMapping/DefaultObjectMapper.cs` | Default implementation; orchestrates the resolution chain. |
+| `Volo/Abp/ObjectMapping/IAutoObjectMappingProvider.cs` | Provider contract that the library (AutoMapper/Mapster/…) implements. |
+| `Volo/Abp/ObjectMapping/NotImplementedAutoObjectMappingProvider.cs` | Throws when no provider is registered — the fail-fast default. |
+| `Volo/Abp/ObjectMapping/IMapTo.cs` | Convention interface: source object knows how to project itself. |
+| `Volo/Abp/ObjectMapping/IMapFrom.cs` | Convention interface: destination object knows how to absorb the source. |
+| `Volo/Abp/ObjectMapping/ObjectMapperExtensions.cs` | `Map(Type sourceType, Type destinationType, object source)` reflective overloads. |
+
+## Key abstractions
+
+| Type | Signature (excerpt) | Notes |
+| --- | --- | --- |
+| `IObjectMapper` | `IAutoObjectMappingProvider AutoObjectMappingProvider { get; }`<br/>`TDestination Map<TSource, TDestination>(TSource source)`<br/>`TDestination Map<TSource, TDestination>(TSource source, TDestination destination)` | The injected facade. |
+| `IObjectMapper<TContext>` | `: IObjectMapper` | Lets you have multiple isolated mapper instances (one per module). |
+| `IObjectMapper<in TSource, TDestination>` | `TDestination Map(TSource source)` / `TDestination Map(TSource source, TDestination destination)` | Per-pair override; highest priority. |
+| `IAutoObjectMappingProvider` | `TDestination Map<TSource, TDestination>(object source)` / `TDestination Map<TSource, TDestination>(TSource source, TDestination destination)` | Hook for AutoMapper or any third-party lib. |
+| `IMapTo<TDestination>` | `TDestination MapTo()` / `void MapTo(TDestination destination)` | Source-side convention. |
+| `IMapFrom<in TSource>` | `void MapFrom(TSource source)` | Destination-side convention. |
+
+## The three interfaces
+
+```csharp
+public interface IObjectMapper
+{
+    IAutoObjectMappingProvider AutoObjectMappingProvider { get; }
+
+    TDestination Map<TSource, TDestination>(TSource source);
+
+    TDestination Map<TSource, TDestination>(TSource source, TDestination destination);
+}
+
+public interface IObjectMapper<TContext> : IObjectMapper
+{
+}
+
+public interface IObjectMapper<in TSource, TDestination>
+{
+    TDestination Map(TSource source);
+    TDestination Map(TSource source, TDestination destination);
+}
+```
+
+A few notes:
+
+- **`IObjectMapper<TContext>`** is the *named-instance* pattern. ABP modules that ship their own mapping profiles (Identity, Tenant Management, BlobStoring …) inject `IObjectMapper<MyModuleContext>` so their mappings are evaluated by a dedicated `AutoMapper` configuration. The host's `IObjectMapper` still talks to the global mapper.
+- **`IObjectMapper<TSource, TDestination>`** is the *escape hatch*. When you need imperative logic (e.g. read tenant settings, format dates with current culture) you register a transient implementation and the `DefaultObjectMapper` will pick it up before any other strategy.
+
+## `IAutoObjectMappingProvider`
+
+```csharp
+public interface IAutoObjectMappingProvider
+{
+    TDestination Map<TSource, TDestination>(object source);
+    TDestination Map<TSource, TDestination>(TSource source, TDestination destination);
+}
+
+public interface IAutoObjectMappingProvider<TContext> : IAutoObjectMappingProvider
+{
+}
+```
+
+The provider is the *only* coupling point with the underlying mapping library. `Volo.Abp.AutoMapper` ships `AutoMapperAutoObjectMappingProvider`; you can substitute Mapster, Riok.Mapperly source generators, or even hand-rolled `Func<TSource, TDestination>` tables by registering a different implementation.
+
+`NotImplementedAutoObjectMappingProvider` is the deliberate fail-fast default — calling it raises `NotImplementedException`:
+
+```csharp
+public sealed class NotImplementedAutoObjectMappingProvider : IAutoObjectMappingProvider, ISingletonDependency
+{
+    public TDestination Map<TSource, TDestination>(object source)
+    {
+        throw new NotImplementedException($"Can not map from given object ({source}) to {typeof(TDestination).AssemblyQualifiedName}.");
+    }
+
+    public TDestination Map<TSource, TDestination>(TSource source, TDestination destination)
+    {
+        throw new NotImplementedException($"Can no map from {typeof(TSource).AssemblyQualifiedName} to {typeof(TDestination).AssemblyQualifiedName}.");
+    }
+}
+```
+
+If you forget to add `Volo.Abp.AutoMapper` as a module dependency, the first un-mapped call surfaces an actionable error instead of silently returning `null` or `default(T)`.
+
+## `DefaultObjectMapper` — the resolution chain
+
+```csharp
+public class DefaultObjectMapper : IObjectMapper, ITransientDependency
+{
+    public IAutoObjectMappingProvider AutoObjectMappingProvider { get; }
+    protected IServiceProvider ServiceProvider { get; }
+
+    public DefaultObjectMapper(
+        IServiceProvider serviceProvider,
+        IAutoObjectMappingProvider autoObjectMappingProvider)
+    {
+        AutoObjectMappingProvider = autoObjectMappingProvider;
+        ServiceProvider = serviceProvider;
+    }
+
+    public virtual TDestination Map<TSource, TDestination>(TSource source)
+    {
+        if (source == null) return default!;
+
+        using (var scope = ServiceProvider.CreateScope())
+        {
+            var specificMapper = scope.ServiceProvider.GetService<IObjectMapper<TSource, TDestination>>();
+            if (specificMapper != null) return specificMapper.Map(source);
+        }
+
+        if (source is IMapTo<TDestination> mapperSource)
+            return mapperSource.MapTo();
+
+        if (typeof(IMapFrom<TSource>).IsAssignableFrom(typeof(TDestination)))
+        {
+            try
+            {
+                //TODO: Check if TDestination has a proper constructor which takes TSource
+                //TODO: Check if TDestination has an empty constructor (in this case, use MapFrom)
+                return (TDestination)Activator.CreateInstance(typeof(TDestination), source)!;
+            }
+            catch
+            {
+                //TODO: Remove catch when TODOs are implemented above
+            }
+        }
+
+        return AutoMap<TSource, TDestination>(source);
+    }
+
+    public virtual TDestination Map<TSource, TDestination>(TSource source, TDestination destination)
+    {
+        if (source == null) return default!;
+
+        using (var scope = ServiceProvider.CreateScope())
+        {
+            var specificMapper = scope.ServiceProvider.GetService<IObjectMapper<TSource, TDestination>>();
+            if (specificMapper != null) return specificMapper.Map(source, destination);
+        }
+
+        if (source is IMapTo<TDestination> mapperSource)
+        {
+            mapperSource.MapTo(destination);
+            return destination;
+        }
+
+        if (destination is IMapFrom<TSource> mapperDestination)
+        {
+            mapperDestination.MapFrom(source);
+            return destination;
+        }
+
+        return AutoMap(source, destination);
+    }
+
+    protected virtual TDestination AutoMap<TSource, TDestination>(object source)
+        => AutoObjectMappingProvider.Map<TSource, TDestination>(source);
+
+    protected virtual TDestination AutoMap<TSource, TDestination>(TSource source, TDestination destination)
+        => AutoObjectMappingProvider.Map<TSource, TDestination>(source, destination);
+}
+```
+
+### Resolution order
+
+```mermaid
+flowchart TD
+    Start([Map&lt;S,D&gt;(source)]) --> Null{source == null?}
+    Null -- yes --> ReturnDefault[return default!]
+    Null -- no --> Specific{IObjectMapper&lt;S,D&gt;<br/>registered in DI?}
+    Specific -- yes --> SpecificMap[specificMapper.Map] --> End
+    Specific -- no --> IMapTo{source is IMapTo&lt;D&gt;?}
+    IMapTo -- yes --> ToCall[source.MapTo()] --> End
+    IMapTo -- no --> IMapFrom{D implements<br/>IMapFrom&lt;S&gt;?}
+    IMapFrom -- yes --> Ctor[Activator.CreateInstance&lt;D&gt;(source)] --> End
+    IMapFrom -- no --> Auto[AutoObjectMappingProvider.Map&lt;S,D&gt;] --> End
+    End([return result])
+```
+
+Important properties of this order:
+
+- **Explicit beats convention** — if you register `IObjectMapper<UserCreateDto, IdentityUser>` it wins, even if the destination happens to implement `IMapFrom<UserCreateDto>`.
+- **Each call opens a child `IServiceScope`** for the per-pair lookup, so transient/scoped specific-mappers can pull in their own dependencies (e.g. a `IStringLocalizer<>` for culture-aware formatting) without leaking the scope.
+- **`IMapFrom` uses constructor injection** of the source object: the destination type is expected to expose `public TDestination(TSource source) { ... }`. If no matching constructor exists the `catch` swallows the exception and falls through to the auto mapper — the in-source `//TODO` notes that this is intentionally lenient.
+- **`null` short-circuits**. Mapping `null` returns `default(TDestination)` without invoking any provider — a subtle change from raw AutoMapper, which throws on null sources.
+
+### Generic-context overload
+
+`DefaultObjectMapper<TContext>` is a transparent subclass:
+
+```csharp
+public class DefaultObjectMapper<TContext> : DefaultObjectMapper, IObjectMapper<TContext>
+{
+    public DefaultObjectMapper(
+        IServiceProvider serviceProvider,
+        IAutoObjectMappingProvider<TContext> autoObjectMappingProvider)
+        : base(serviceProvider, autoObjectMappingProvider) { }
+}
+```
+
+…and the module registers it open-generically so that injecting `IObjectMapper<MyContext>` *also* injects `IAutoObjectMappingProvider<MyContext>` if one is registered.
+
+## Module wiring
+
+```csharp
+public class AbpObjectMappingModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.OnExposing(onServiceExposingContext =>
+        {
+                //Register types for IObjectMapper<TSource, TDestination> if implements
+                onServiceExposingContext.ExposedTypes.AddRange(
+                ReflectionHelper.GetImplementedGenericTypes(
+                    onServiceExposingContext.ImplementationType,
+                    typeof(IObjectMapper<,>)
+                )
+            );
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddTransient(
+            typeof(IObjectMapper<>),
+            typeof(DefaultObjectMapper<>)
+        );
+    }
+}
+```
+
+Two design choices:
+
+1. **Per-pair auto-exposure.** `OnExposing` runs for every conventional registration; if a class implements `IObjectMapper<UserCreateDto, IdentityUser>` it is automatically registered under both interfaces. You can therefore drop a custom mapper anywhere in your project without touching `Module.cs`.
+2. **Open-generic `IObjectMapper<TContext>`.** Adding `[DependsOn(typeof(AbpObjectMappingModule))]` is enough; you do not need to register `IObjectMapper<MyContext>` manually.
+
+## Convention interfaces — `IMapTo` and `IMapFrom`
+
+```csharp
+public interface IMapTo<TDestination>
+{
+    TDestination MapTo();
+    void MapTo(TDestination destination);
+}
+
+public interface IMapFrom<in TSource>
+{
+    void MapFrom(TSource source);
+}
+```
+
+`IMapTo` and `IMapFrom` are *opt-in conventions*, not contracts — they exist so simple cases (`Entity → ReadOnlyDto`) don't need an AutoMapper profile. Pick one direction:
+
+```csharp
+public class CreateUserDto : IMapTo<IdentityUser>
+{
+    public string UserName { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+
+    public IdentityUser MapTo() => new IdentityUser(Guid.NewGuid(), UserName, Email);
+    public void MapTo(IdentityUser destination)
+    {
+        destination.SetUserName(UserName);
+        destination.SetEmail(Email);
+    }
+}
+```
+
+…or symmetrically:
+
+```csharp
+public class IdentityUserDto : IMapFrom<IdentityUser>
+{
+    public string UserName { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+
+    public IdentityUserDto(IdentityUser user)  // used by Activator
+    {
+        UserName = user.UserName;
+        Email = user.Email;
+    }
+
+    public void MapFrom(IdentityUser source)  // used for Map(source, destination)
+    {
+        UserName = source.UserName;
+        Email = source.Email;
+    }
+}
+```
+
+`DefaultObjectMapper` tries the constructor first for `IMapFrom` (`Activator.CreateInstance(typeof(TDestination), source)`), then `MapFrom` on the already-existing destination. The order is documented in the resolution diagram above.
+
+## Custom per-pair mapper
+
+For a one-off transformation that needs DI (database lookup, localization, current user, etc.):
+
+```csharp
+public class UserCreateDtoToUserMapper :
+    IObjectMapper<UserCreateDto, IdentityUser>,
+    ITransientDependency   // automatically picked up by the conventional registrar
+{
+    private readonly IGuidGenerator _guidGenerator;
+    private readonly IClock _clock;
+
+    public UserCreateDtoToUserMapper(IGuidGenerator guidGenerator, IClock clock)
+    {
+        _guidGenerator = guidGenerator;
+        _clock = clock;
+    }
+
+    public IdentityUser Map(UserCreateDto source)
+    {
+        var user = new IdentityUser(_guidGenerator.Create(), source.UserName, source.Email);
+        user.SetProperty("CreatedAt", _clock.Now);
+        return user;
+    }
+
+    public IdentityUser Map(UserCreateDto source, IdentityUser destination)
+    {
+        destination.SetUserName(source.UserName);
+        destination.SetEmail(source.Email);
+        return destination;
+    }
+}
+```
+
+…and you call it transparently:
+
+```csharp
+var user = _objectMapper.Map<UserCreateDto, IdentityUser>(dto);
+```
+
+The `DefaultObjectMapper` will find the registration via the per-call scope before falling through to AutoMapper.
+
+## Reflective mapping
+
+When source/destination types are only known at runtime (typical for code-generation, dynamic API explorers):
+
+```csharp
+public static class ObjectMapperExtensions
+{
+    private static readonly MethodInfo MapToNewObjectMethod = default!;
+    private static readonly MethodInfo MapToExistingObjectMethod = default!;
+
+    static ObjectMapperExtensions()
+    {
+        var methods = typeof(IObjectMapper).GetMethods();
+        foreach (var method in methods)
+        {
+            if (method.Name == nameof(IObjectMapper.Map) && method.IsGenericMethodDefinition)
+            {
+                var parameters = method.GetParameters();
+                if (parameters.Length == 1)      MapToNewObjectMethod = method;
+                else if (parameters.Length == 2) MapToExistingObjectMethod = method;
+            }
+        }
+    }
+
+    public static object Map(this IObjectMapper objectMapper, Type sourceType, Type destinationType, object source)
+        => MapToNewObjectMethod
+            .MakeGenericMethod(sourceType, destinationType)
+            .Invoke(objectMapper, new[] { source })!;
+
+    public static object Map(this IObjectMapper objectMapper, Type sourceType, Type destinationType, object source, object destination)
+        => MapToExistingObjectMethod
+            .MakeGenericMethod(sourceType, destinationType)
+            .Invoke(objectMapper, new[] { source, destination })!;
+}
+```
+
+The reflective method tables are cached as `static readonly` fields at module load — there is no per-call reflection scan, only a single `MakeGenericMethod`/`Invoke` per logical map.
+
+## When to use what
+
+| Need | Use |
+| --- | --- |
+| Plain entity → DTO with same property names | AutoMapper profile (see [AutoMapper integration](./automapper)) |
+| Trivial one-way conversion | `IMapTo<TDestination>` on source |
+| Trivial constructor-based reverse | `IMapFrom<TSource>` on destination |
+| Conversion that needs DI | `IObjectMapper<TSource, TDestination>` |
+| Multiple isolated mapper graphs (modules) | Inject `IObjectMapper<TContext>` |
+| Library-agnostic abstractions in shared code | Inject `IObjectMapper` |
+| Runtime / dynamic type pairs | `objectMapper.Map(srcType, destType, src)` extension |
+
+## Pitfalls
+
+- **Per-pair lookup creates a child scope on every call.** Cheap, but inside a hot loop a hand-rolled mapper avoids the resolution overhead.
+- **`IMapFrom` swallows construction failures.** If the destination's `(TSource)` constructor throws for legitimate reasons, the error is silently lost and the call falls through to the auto-provider. The in-source `//TODO` acknowledges this.
+- **`null` returns `default!`.** Code expecting `NullReferenceException` on a null source needs an explicit guard.
+- **Scoped specific mappers** must be designed for transient consumption — the resolution scope is disposed immediately after the call.
+
+## Related pages
+
+- [AutoMapper integration](./automapper) — `AbpAutoMapperOptions`, `AutoMapperAutoObjectMappingProvider`, `MapExtraProperties`.
+- [Object Extending](./object-extending) — how `MapExtraProperties` is wired through here.

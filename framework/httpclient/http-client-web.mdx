@@ -1,0 +1,561 @@
+---
+title: "Volo.Abp.Http.Client.Web: serving static proxies as MVC controllers"
+sidebarTitle: "Http.Client.Web"
+description: "How the Web package promotes ClientProxyBase<T> classes to first-class MVC controllers using ApplicationParts, a ControllerFeatureProvider, and an Abp service convention driven by generate-proxy.json."
+---
+
+`Volo.Abp.Http.Client.Web` is the bridge that lets the **server side**
+of an ABP solution expose a remote service's *static client proxy*
+classes as real ASP.NET Core controllers. It is the package you depend
+on when the host project hosts only a thin client proxy layer (a
+"BFF") and forwards all calls to a downstream API, but still needs the
+proxy interface to appear in Swagger, the application model, and the
+authorisation pipeline as though it were a normal controller.
+
+The package does three things:
+
+1. Registers an MVC `ControllerFeatureProvider` that recognises
+   `ClientProxyBase<T>` subclasses as controllers.
+2. Adds the discovered proxy assemblies as application parts at
+   startup.
+3. Replaces the default `IAbpServiceConvention` with one that copies
+   routes, HTTP verbs, parameter bindings, and area metadata from the
+   embedded `generate-proxy.json` (read via
+   `IClientProxyApiDescriptionFinder`) onto those controllers.
+
+The package does **not** add any access‑token retrieval — that belongs
+to the `IdentityModel.Web` package and is documented separately on
+[identitymodel-web](/framework/httpclient/identitymodel-web).
+
+## Package layout
+
+```
+framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/
+├── AbpHttpClientWebModule.cs
+└── Conventions/
+    ├── AbpHttpClientProxyControllerFeatureProvider.cs
+    ├── AbpHttpClientProxyHelper.cs
+    └── AbpHttpClientProxyServiceConvention.cs
+```
+
+Four files total. They cooperate around a single concept:
+*“a class is a proxy controller if it implements
+`IApplicationService` and inherits from
+`ClientProxyBase<>`.”*
+
+## The detection rule
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyHelper.cs
+public static class AbpHttpClientProxyHelper
+{
+    public static bool IsClientProxyService(Type type)
+    {
+        return typeof(IApplicationService).IsAssignableFrom(type) &&
+            type.GetBaseClasses().Any(x => x.IsGenericType && x.GetGenericTypeDefinition() == typeof(ClientProxyBase<>));
+    }
+}
+```
+
+`abp generate-proxy --t csharp` produces classes that look like:
+
+```csharp
+public class IdentityUserClientProxy : ClientProxyBase<IIdentityUserAppService>, IIdentityUserAppService
+{
+    public virtual Task<IdentityUserDto> GetAsync(Guid id)
+        => RequestAsync<IdentityUserDto>(nameof(GetAsync), new ClientProxyRequestTypeValue { { typeof(Guid), id } });
+    // ...
+}
+```
+
+That class satisfies the predicate because it implements
+`IIdentityUserAppService` (which extends `IApplicationService`) **and**
+its base type chain contains `ClientProxyBase<IIdentityUserAppService>`.
+Vanilla `IApplicationService` controllers — i.e. the normal `AbpController`
+variants — do not match because they do not inherit from `ClientProxyBase<>`.
+
+## The module
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/AbpHttpClientWebModule.cs
+[DependsOn(
+    typeof(AbpAspNetCoreMvcModule),
+    typeof(AbpHttpClientModule)
+    )]
+public class AbpHttpClientWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.Replace(ServiceDescriptor.Transient<IAbpServiceConvention, AbpHttpClientProxyServiceConvention>());
+        context.Services.AddTransient<AbpHttpClientProxyServiceConvention>();
+
+        var partManager = context.Services.GetSingletonInstance<ApplicationPartManager>();
+        partManager.FeatureProviders.Add(new AbpHttpClientProxyControllerFeatureProvider());
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var partManager = context.ServiceProvider.GetRequiredService<ApplicationPartManager>();
+        foreach (var moduleAssembly in context
+            .ServiceProvider
+            .GetRequiredService<IModuleContainer>()
+            .Modules
+            .SelectMany(m => m.AllAssemblies)
+            .Where(a => a.GetTypes().Any(AbpHttpClientProxyHelper.IsClientProxyService))
+            .Distinct())
+        {
+            partManager.ApplicationParts.AddIfNotContains(moduleAssembly);
+        }
+    }
+}
+```
+
+| Step | Why |
+| --- | --- |
+| `Services.Replace(IAbpServiceConvention → AbpHttpClientProxyServiceConvention)` | Inserts proxy-aware behaviour into the normal ABP service convention pipeline. The replacement is a `Transient` — same lifetime as the base service. |
+| `partManager.FeatureProviders.Add(...)` | Teach MVC that classes which look like proxies should be treated as controllers. |
+| `OnApplicationInitialization` | Loop over every loaded module assembly, and for any assembly that contains at least one proxy class, register the assembly as an `ApplicationPart`. Without this MVC would not discover the proxy types unless their assembly happened to already be added. |
+
+## Telling MVC: "this is a controller"
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyControllerFeatureProvider.cs
+public class AbpHttpClientProxyControllerFeatureProvider : ControllerFeatureProvider
+{
+    protected override bool IsController(TypeInfo typeInfo)
+    {
+        return AbpHttpClientProxyHelper.IsClientProxyService(typeInfo);
+    }
+}
+```
+
+`ControllerFeatureProvider.IsController` is virtual; MVC ORs the result
+of every registered feature provider with the built‑in heuristic. So
+the proxy classes are appended to MVC's controller catalog without
+suppressing the normal `[Controller]` / `Controller`‑suffix detection
+used by everything else.
+
+## The service convention
+
+`AbpHttpClientProxyServiceConvention` derives from
+`Volo.Abp.AspNetCore.Mvc.Conventions.AbpServiceConvention` — the default
+ABP convention that turns app‑service interfaces into MVC routes. It
+overrides three things:
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyServiceConvention.cs
+[DisableConventionalRegistration]
+public class AbpHttpClientProxyServiceConvention : AbpServiceConvention
+{
+    protected readonly IClientProxyApiDescriptionFinder ClientProxyApiDescriptionFinder;
+    protected readonly List<ControllerModel> ControllerWithAttributeRoute;
+    protected readonly List<ActionModel> ActionWithAttributeRoute;
+    protected readonly AbpHttpClientStaticProxyingOptions StaticProxyingOptions;
+
+    public AbpHttpClientProxyServiceConvention(
+        IOptions<AbpAspNetCoreMvcOptions> options,
+        IConventionalRouteBuilder conventionalRouteBuilder,
+        IClientProxyApiDescriptionFinder clientProxyApiDescriptionFinder,
+        IOptions<AbpHttpClientStaticProxyingOptions> staticProxyingOptions)
+        : base(options, conventionalRouteBuilder)
+    {
+        ClientProxyApiDescriptionFinder = clientProxyApiDescriptionFinder;
+        StaticProxyingOptions = staticProxyingOptions.Value;
+        ControllerWithAttributeRoute = new List<ControllerModel>();
+        ActionWithAttributeRoute = new List<ActionModel>();
+    }
+
+    protected override IList<ControllerModel> GetControllers(ApplicationModel application)
+    {
+        return application.Controllers.Where(c => !AbpHttpClientProxyHelper.IsClientProxyService(c.ControllerType)).ToList();
+    }
+
+    protected virtual IList<ControllerModel> GetClientProxyControllers(ApplicationModel application)
+    {
+        return application.Controllers.Where(c => AbpHttpClientProxyHelper.IsClientProxyService(c.ControllerType)).ToList();
+    }
+    // ...
+}
+```
+
+The split is important:
+
+- `GetControllers` returns **non‑proxy** controllers so the base
+  convention's logic runs over them exactly as it always did.
+- `GetClientProxyControllers` returns the proxies, which the override
+  processes separately with a different ruleset (routes from
+  `generate-proxy.json`, not from the conventional route template).
+
+### Top‑level controller loop
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyServiceConvention.cs
+protected override void ApplyForControllers(ApplicationModel application)
+{
+    base.ApplyForControllers(application);
+
+    foreach (var controller in GetClientProxyControllers(application))
+    {
+        if (ShouldBeRemove(application, controller))
+        {
+            application.Controllers.Remove(controller);
+            continue;
+        }
+
+        controller.ControllerName = controller.ControllerName.RemovePostFix("ClientProxy");
+
+        var controllerApiDescription = FindControllerApiDescriptionModel(controller);
+        if (controllerApiDescription != null &&
+            !controllerApiDescription.ControllerGroupName.IsNullOrWhiteSpace())
+        {
+            controller.ControllerName = controllerApiDescription.ControllerGroupName;
+        }
+
+        ConfigureClientProxySelector(controller);
+        ConfigureClientProxyApiExplorer(controller);
+        ConfigureParameters(controller);
+    }
+}
+```
+
+For each proxy controller:
+
+1. **Deduplicate.** If another controller in the application already
+   implements the same app‑service interface (the real implementation
+   wins), the proxy is removed. This is what `ShouldBeRemove` checks:
+
+   ```csharp
+   protected virtual bool ShouldBeRemove(ApplicationModel application, ControllerModel controllerModel)
+   {
+       return application.Controllers
+           .Where(x => x.ControllerType != controllerModel.ControllerType)
+           .Any(x => FindAppServiceInterfaceType(x) == FindAppServiceInterfaceType(controllerModel));
+   }
+   ```
+
+2. **Rename.** `IdentityUserClientProxy` → `IdentityUser` — drop the
+   `"ClientProxy"` suffix so the URL and Swagger group look identical
+   to the original API.
+
+3. **Group.** If the proxy description recorded a
+   `ControllerGroupName`, prefer that.
+
+4. Apply route, ApiExplorer, and parameter conventions.
+
+### Building the selector from the description
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyServiceConvention.cs
+protected virtual void ConfigureClientProxySelector(ControllerModel controller, ActionModel action)
+{
+    try
+    {
+        RemoveEmptySelectors(action.Selectors);
+
+        var remoteServiceAtt = ReflectionHelper.GetSingleAttributeOrDefault<RemoteServiceAttribute>(action.ActionMethod);
+        if (remoteServiceAtt != null && !remoteServiceAtt.IsEnabledFor(action.ActionMethod))
+        {
+            return;
+        }
+
+        var actionApiDescriptionModel = FindActionApiDescriptionModel(controller, action);
+        if (actionApiDescriptionModel == null)
+        {
+            Logger.LogWarning($"Could not find ApiDescriptionModel for action: {action.ActionName} in controller: {controller.ControllerName}, May be the generate-proxy.json is not up to date.");
+            return;
+        }
+
+        ControllerWithAttributeRoute.Add(controller);
+        ActionWithAttributeRoute.Add(action);
+
+        if (!action.Selectors.Any())
+        {
+            var abpServiceSelectorModel = new SelectorModel
+            {
+                AttributeRouteModel = new AttributeRouteModel(new RouteAttribute(template: actionApiDescriptionModel.Url)),
+                ActionConstraints = { new HttpMethodActionConstraint(new[] { actionApiDescriptionModel.HttpMethod }) }
+            };
+
+            action.Selectors.Add(abpServiceSelectorModel);
+        }
+        else
+        {
+            foreach (var selector in action.Selectors)
+            {
+                var httpMethod = selector.ActionConstraints
+                    .OfType<HttpMethodActionConstraint>()
+                    .FirstOrDefault()?
+                    .HttpMethods?
+                    .FirstOrDefault();
+
+                if (httpMethod == null)
+                {
+                    httpMethod = actionApiDescriptionModel.HttpMethod;
+                }
+
+                if (selector.AttributeRouteModel == null)
+                {
+                    selector.AttributeRouteModel = new AttributeRouteModel(new RouteAttribute(template: actionApiDescriptionModel.Url));
+                }
+
+                if (!selector.ActionConstraints.OfType<HttpMethodActionConstraint>().Any())
+                {
+                    selector.ActionConstraints.Add(new HttpMethodActionConstraint(new[] { httpMethod }));
+                }
+            }
+        }
+    }
+    catch
+    {
+        Logger.LogError($"An exception has occured while configuring client proxy selector. Controller: {controller.ControllerName} ({controller.ControllerType.AssemblyQualifiedName}), Action: {action.ActionName}");
+        throw;
+    }
+}
+```
+
+Two cases:
+
+- **Action has no selectors yet** — create one with the URL from the
+  description and the HTTP verb from the description.
+- **Action already has selectors** — fill in only the missing pieces.
+  Existing `[HttpGet]`/`[Route]` attributes on the generated proxy
+  take precedence; the convention only supplies what's missing.
+
+The `Url` and `HttpMethod` come from `actionApiDescriptionModel`, which
+was built from the embedded JSON. So the *server* convention is, in
+effect, replaying the route metadata that the original API exposed —
+guaranteeing that the BFF and the downstream API share the same URLs.
+
+### Looking up the description
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyServiceConvention.cs
+protected virtual ActionApiDescriptionModel FindActionApiDescriptionModel(ControllerModel controller, ActionModel action)
+{
+    var appServiceType = FindAppServiceInterfaceType(controller);
+    if (appServiceType == null)
+    {
+        return null;
+    }
+
+    var key =
+        $"{appServiceType.FullName}." +
+        $"{action.ActionMethod.Name}." +
+        $"{string.Join("-", action.Parameters.Select(x => TypeHelper.GetFullNameHandlingNullableAndGenerics(x.ParameterType)))}";
+
+    var actionApiDescriptionModel = ClientProxyApiDescriptionFinder.FindAction(key);
+    if (actionApiDescriptionModel == null)
+    {
+        return null;
+    }
+
+    if (actionApiDescriptionModel.ImplementFrom.StartsWith("Volo.Abp.Application.Services"))
+    {
+        return actionApiDescriptionModel;
+    }
+
+    if (appServiceType.FullName != null && actionApiDescriptionModel.ImplementFrom.StartsWith(appServiceType.FullName))
+    {
+        return actionApiDescriptionModel;
+    }
+
+    return null;
+}
+```
+
+The key format is **identical** to the one
+`ClientProxyApiDescriptionFinder.Initialize` indexes by (see
+[http-client](/framework/httpclient/http-client#static-proxies-and-generate-proxy-json)):
+
+```
+{InterfaceFullName}.{MethodName}.{Param1Type}-{Param2Type}-...
+```
+
+So the proxy class's intercepted method maps to *the same row in the
+same dictionary* that the runtime ClientProxyBase uses when it sends
+the actual request — guaranteeing route alignment between client and
+server.
+
+The `ImplementFrom` guard rejects an action that just happens to share
+a name but actually belongs to a different interface — e.g. a method
+called `GetAsync` that is implemented by both `IRepository<T>` and the
+target application service.
+
+### Inferring `[FromQuery]` for complex types
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyServiceConvention.cs
+protected override void ConfigureParameters(ControllerModel controller)
+{
+    foreach (var action in controller.Actions)
+    {
+        foreach (var prm in action.Parameters)
+        {
+            if (prm.BindingInfo != null)
+            {
+                continue;
+            }
+
+            if (StaticProxyingOptions.BindingFromQueryTypes.Contains(prm.ParameterInfo.ParameterType))
+            {
+                prm.BindingInfo = BindingInfo.GetBindingInfo(new[] { new FromQueryAttribute() });
+            }
+        }
+    }
+
+    base.ConfigureParameters(controller);
+}
+```
+
+`AbpHttpClientStaticProxyingOptions.BindingFromQueryTypes` is the
+explicit allow‑list a host registers for complex DTOs that should bind
+from the query string rather than from the body:
+
+```csharp framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/StaticProxying/AbpHttpClientStaticProxyingOptions.cs
+public class AbpHttpClientStaticProxyingOptions
+{
+    public List<Type> BindingFromQueryTypes { get; }
+
+    public AbpHttpClientStaticProxyingOptions()
+    {
+        BindingFromQueryTypes = new List<Type>();
+    }
+}
+```
+
+A typical configuration:
+
+```csharp
+Configure<AbpHttpClientStaticProxyingOptions>(options =>
+{
+    options.BindingFromQueryTypes.Add(typeof(PagedAndSortedResultRequestDto));
+});
+```
+
+Without this, an `IList<MyFilter>` parameter on a `GET` action would
+silently fall to the default model binder and bind from form/body —
+which fails because `GET` has no body.
+
+### Area metadata
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyServiceConvention.cs
+protected virtual void ConfigureClientProxySelector(ControllerModel controller)
+{
+    RemoveEmptySelectors(controller.Selectors);
+
+    var moduleApiDescription = FindModuleApiDescriptionModel(controller);
+    if (moduleApiDescription != null && !moduleApiDescription.RootPath.IsNullOrWhiteSpace())
+    {
+        var selector = controller.Selectors.FirstOrDefault();
+        selector?.EndpointMetadata.Add(new AreaAttribute(moduleApiDescription.RootPath));
+        controller.RouteValues.Add(new KeyValuePair<string, string>("area", moduleApiDescription.RootPath));
+    }
+
+    var controllerType = controller.ControllerType.AsType();
+    var remoteServiceAtt = ReflectionHelper.GetSingleAttributeOrDefault<RemoteServiceAttribute>(controllerType.GetTypeInfo());
+    if (remoteServiceAtt != null && !remoteServiceAtt.IsEnabledFor(controllerType))
+    {
+        return;
+    }
+
+    if (controller.Selectors.Any(selector => selector.AttributeRouteModel != null))
+    {
+        return;
+    }
+
+    foreach (var action in controller.Actions)
+    {
+        ConfigureClientProxySelector(controller, action);
+    }
+}
+```
+
+The `RootPath` of the originating module (e.g. `"identity"` for
+`Volo.Abp.Identity`) is copied onto the controller as an `AreaAttribute`
+so that route templates such as `api/identity/users/{id}` continue to
+work after the controller has been reincarnated as a client proxy in a
+different host.
+
+### ApiExplorer integration
+
+```csharp framework/src/Volo.Abp.Http.Client.Web/Volo/Abp/Http/Client/Web/Conventions/AbpHttpClientProxyServiceConvention.cs
+protected virtual void ConfigureClientProxyApiExplorer(ControllerModel controller)
+{
+    if (ControllerWithAttributeRoute.Contains(controller))
+    {
+        if (Options.ChangeControllerModelApiExplorerGroupName && controller.ApiExplorer.GroupName.IsNullOrEmpty())
+        {
+            controller.ApiExplorer.GroupName = controller.ControllerName;
+        }
+
+        if (controller.ApiExplorer.IsVisible == null)
+        {
+            controller.ApiExplorer.IsVisible = IsVisibleRemoteService(controller.ControllerType);
+        }
+    }
+
+    foreach (var action in controller.Actions)
+    {
+        if (ActionWithAttributeRoute.Contains(action))
+        {
+            ConfigureApiExplorer(action);
+        }
+    }
+}
+```
+
+The `ControllerWithAttributeRoute` / `ActionWithAttributeRoute` lists
+populated earlier are the exact set of items whose ApiExplorer
+metadata needs `GroupName` + `IsVisible` filled in. Anything else in
+the application is untouched.
+
+## End‑to‑end flow
+
+```
+Module assemblies containing ClientProxyBase<T> subclasses
+        │
+        ▼  (OnApplicationInitialization)
+ApplicationPartManager.ApplicationParts.Add(assembly)
+        │
+        ▼  (ControllerFeatureProvider)
+ControllerFeature.Controllers ← every ClientProxyBase<T>+IApplicationService class
+        │
+        ▼  (IApplicationModelProvider; AbpHttpClientProxyServiceConvention)
+For each proxy controller:
+  • Remove if real implementation already present
+  • Strip "ClientProxy" suffix
+  • For each action:
+      lookup key {Iface}.{Method}.{Params}
+      → action.ApiDescriptionModel.Url       → AttributeRouteModel
+      → action.ApiDescriptionModel.HttpMethod → HttpMethodActionConstraint
+  • Add AreaAttribute(moduleApiDescription.RootPath)
+  • Apply [FromQuery] for AbpHttpClientStaticProxyingOptions.BindingFromQueryTypes
+  • Fill ApiExplorer.GroupName + IsVisible
+        │
+        ▼
+MVC builds normal endpoints, identical URLs/verbs to the downstream API
+```
+
+## Options reference
+
+| Option | Source | Effect |
+| --- | --- | --- |
+| `AbpHttpClientStaticProxyingOptions.BindingFromQueryTypes` | This package, applied in `ConfigureParameters`. | Force `[FromQuery]` for parameters whose CLR type matches. |
+| `AbpAspNetCoreMvcOptions.ChangeControllerModelApiExplorerGroupName` | Inherited from `AbpServiceConvention`. | If `true`, sets the ApiExplorer `GroupName` to the controller name for Swagger. |
+| `RemoteServiceAttribute.IsEnabledFor(...)` | Per‑controller / per‑action. | Skip the proxy if disabled, so individual actions can be opted out. |
+
+## Caveats
+
+- The package targets ASP.NET Core hosts only. For Blazor WebAssembly
+  and MAUI Blazor there are no MVC controllers to register — the
+  static proxies are consumed directly through DI and their
+  authentication is handled by the host‑specific modules.
+- If `generate-proxy.json` is **out of date** relative to the proxy
+  classes, `ConfigureClientProxySelector` logs a warning and silently
+  skips that action. The action is still in the controller, but it
+  will not be routable. Regenerate the proxies.
+- `ShouldBeRemove` compares interface identity by reference equality
+  on `FindAppServiceInterfaceType`. If two assemblies expose the same
+  interface from different `Type` instances (rare, but possible with
+  load contexts) the deduplication can mis‑fire.
+
+## Related pages
+
+- [http-client](/framework/httpclient/http-client) — the
+  `ClientProxyApiDescriptionFinder` and `ClientProxyBase<T>` documented
+  here are explained in detail.
+- [identitymodel-web](/framework/httpclient/identitymodel-web) — the
+  matching package that wires HttpContext‑based access‑token retrieval
+  into proxy outgoing calls.

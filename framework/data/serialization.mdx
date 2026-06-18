@@ -1,0 +1,230 @@
+---
+title: "Volo.Abp.Serialization — IObjectSerializer"
+description: "ABP's tiny binary-friendly serialization abstraction used by caching, BLOB storage and event-bus payloads: IObjectSerializer, IObjectSerializer<T>, DefaultObjectSerializer, and how it fits next to IJsonSerializer."
+---
+
+`Volo.Abp.Serialization` defines the contract every ABP subsystem uses when it needs to **persist or transport an arbitrary object as bytes** — distributed cache values, blob payloads, outbox event bodies, snapshot stores. The contract is `IObjectSerializer` (byte-oriented) and its typed `IObjectSerializer<T>` counterpart. The module ships **one** implementation, `DefaultObjectSerializer`, that delegates to `System.Text.Json` for the bytes; library users replace or wrap it (e.g. with MessagePack, ProtoBuf, or `Volo.Abp.Json`'s Newtonsoft-backed serializer) when they need a different wire format.
+
+The distinction with `Volo.Abp.Json.IJsonSerializer` is sharp:
+
+- **`IJsonSerializer`** produces a `string` and is meant for *human-facing* JSON (REST responses, log output, configuration). It always camelCases by default.
+- **`IObjectSerializer`** produces a `byte[]` and is meant for *machine-to-machine* transport. The default happens to use JSON UTF-8, but you should not assume that; the bytes are opaque to consumers.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/Serialization/AbpSerializationModule.cs` | Module class. Exposes per-T `IObjectSerializer<T>` registrations during DI conventional registration. |
+| `Volo/Abp/Serialization/IObjectSerializer.cs` | Two contracts: untyped and per-T. |
+| `Volo/Abp/Serialization/DefaultObjectSerializer.cs` | Default implementation using `System.Text.Json.JsonSerializer.SerializeToUtf8Bytes`. |
+
+## Key abstractions
+
+| Type | Signature | Notes |
+| --- | --- | --- |
+| `IObjectSerializer` | `byte[]? Serialize<T>(T? obj)` / `T? Deserialize<T>(byte[] bytes)` | Untyped façade. Resolves per-T via DI. |
+| `IObjectSerializer<T>` | `byte[]? Serialize(T? obj)` / `T? Deserialize(byte[]? bytes)` | Per-type override. |
+| `DefaultObjectSerializer` | Both `Serialize` and `Deserialize` virtual + protected `AutoSerialize` / `AutoDeserialize` hooks | Falls back to System.Text.Json when no per-T override is registered. |
+
+## The interfaces
+
+```csharp
+public interface IObjectSerializer
+{
+    byte[]? Serialize<T>(T? obj);
+
+    T? Deserialize<T>(byte[] bytes);
+}
+
+public interface IObjectSerializer<T>
+{
+    byte[]? Serialize(T? obj);
+
+    T? Deserialize(byte[]? bytes);
+}
+```
+
+Two design choices to notice:
+
+- **Both methods are nullable in both directions.** `Serialize` returns `null` when the input is `null`; consumers (e.g. `IDistributedCache` wrappers) take advantage of this to skip the round-trip entirely on null cache values.
+- **Per-type override (`IObjectSerializer<T>`)**, not per-format. If you need MessagePack for `OutboxEvent` but JSON for everything else, you register `IObjectSerializer<OutboxEvent>` — the framework dispatches based on the *type argument* of the call.
+
+## The default implementation
+
+```csharp
+public class DefaultObjectSerializer : IObjectSerializer, ITransientDependency
+{
+    private readonly IServiceProvider _serviceProvider;
+
+    public DefaultObjectSerializer(IServiceProvider serviceProvider)
+    {
+        _serviceProvider = serviceProvider;
+    }
+
+    public virtual byte[]? Serialize<T>(T? obj)
+    {
+        if (obj == null) return null;
+
+        //Check if a specific serializer is registered
+        using (var scope = _serviceProvider.CreateScope())
+        {
+            var specificSerializer = scope.ServiceProvider.GetService<IObjectSerializer<T>>();
+            if (specificSerializer != null)
+            {
+                return specificSerializer.Serialize(obj);
+            }
+        }
+
+        return AutoSerialize(obj);
+    }
+
+    public virtual T? Deserialize<T>(byte[]? bytes)
+    {
+        if (bytes == null) return default;
+
+        //Check if a specific serializer is registered
+        using (var scope = _serviceProvider.CreateScope())
+        {
+            var specificSerializer = scope.ServiceProvider.GetService<IObjectSerializer<T>>();
+            if (specificSerializer != null)
+            {
+                return specificSerializer.Deserialize(bytes);
+            }
+        }
+
+        return AutoDeserialize<T>(bytes);
+    }
+
+    protected virtual byte[] AutoSerialize<T>(T obj)
+    {
+        return JsonSerializer.SerializeToUtf8Bytes(obj);
+    }
+
+    protected virtual T? AutoDeserialize<T>(byte[] bytes)
+    {
+        return JsonSerializer.Deserialize<T>(bytes);
+    }
+}
+```
+
+Three things matter here:
+
+1. **Per-T DI lookup**. Every call walks the container with `GetService<IObjectSerializer<T>>()`. The lookup is wrapped in a child scope so a transient/scoped per-T serializer is properly released. The cost is a service-resolution roundtrip per call — usually negligible compared to the actual encoding work, but worth knowing for tight inner loops.
+2. **`AutoSerialize` / `AutoDeserialize` are virtual**. To swap the *default fallback* from `System.Text.Json` to `Newtonsoft.Json`, derive from `DefaultObjectSerializer` and override the two protected hooks, then replace the registration with `services.Replace(...)`. You preserve the per-T override mechanism for free.
+3. **No options object**. `DefaultObjectSerializer` uses the **default** `JsonSerializerOptions`, which does **not** carry any of the `AbpSystemTextJsonSerializerOptions` configured for `IJsonSerializer`. If you need DateTime-normalization, custom converters, or the relaxed JS encoder applied to serialized bytes, register an `IObjectSerializer<T>` that delegates to `IJsonSerializer` (or to a configured `JsonSerializerOptions` instance).
+
+## Module wiring
+
+```csharp
+public class AbpSerializationModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.OnExposing(onServiceExposingContext =>
+        {
+            //Register types for IObjectSerializer<T> if implements
+            onServiceExposingContext.ExposedTypes.AddRange(
+                ReflectionHelper.GetImplementedGenericTypes(
+                    onServiceExposingContext.ImplementationType,
+                    typeof(IObjectSerializer<>)
+                )
+            );
+        });
+    }
+}
+```
+
+The single behaviour: every conventionally registered class is inspected for `IObjectSerializer<T>` implementations and *all matching closed generics* are auto-exposed as services. Drop a `class OutboxEventSerializer : IObjectSerializer<OutboxEvent>, ITransientDependency` anywhere in your project and `DefaultObjectSerializer.Serialize<OutboxEvent>` picks it up — no manual `services.AddTransient` needed.
+
+## Where it's used
+
+- **`IDistributedCache<T>` (Volo.Abp.Caching)** — value bytes are produced via `IObjectSerializer.Serialize<T>()`. The cache key + serialized bytes are written to Redis/MemCached.
+- **`IBlobContainer` (Volo.Abp.BlobStoring)** — typed `SaveAsync<T>` overload pipes through `IObjectSerializer`.
+- **Outbox / inbox event bodies (Volo.Abp.EventBus)** — serialized payloads are stored as `varbinary` in `AbpEventInbox` / `AbpEventOutbox` tables.
+- **Background-job payloads (Volo.Abp.BackgroundJobs)** — `JobArgs` are persisted as bytes and resurrected on dequeue.
+
+## Custom per-type serializer example
+
+```csharp
+public sealed class MessagePackUserSnapshotSerializer
+    : IObjectSerializer<UserSnapshot>, ITransientDependency
+{
+    public byte[]? Serialize(UserSnapshot? obj)
+    {
+        if (obj is null) return null;
+        return MessagePackSerializer.Serialize(obj, MessagePackSerializerOptions.Standard);
+    }
+
+    public UserSnapshot? Deserialize(byte[]? bytes)
+    {
+        if (bytes is null) return default;
+        return MessagePackSerializer.Deserialize<UserSnapshot>(bytes, MessagePackSerializerOptions.Standard);
+    }
+}
+```
+
+`DefaultObjectSerializer.Serialize<UserSnapshot>(...)` resolves this implementation through DI; every other call still uses System.Text.Json.
+
+## Replacing the default fallback
+
+If you want **all** types to use Newtonsoft.Json bytes by default:
+
+```csharp
+public class NewtonsoftDefaultObjectSerializer : DefaultObjectSerializer
+{
+    public NewtonsoftDefaultObjectSerializer(IServiceProvider sp) : base(sp) { }
+
+    protected override byte[] AutoSerialize<T>(T obj)
+    {
+        var json = JsonConvert.SerializeObject(obj);
+        return Encoding.UTF8.GetBytes(json);
+    }
+
+    protected override T? AutoDeserialize<T>(byte[] bytes)
+    {
+        var json = Encoding.UTF8.GetString(bytes);
+        return JsonConvert.DeserializeObject<T>(json);
+    }
+}
+
+// In your module
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.Replace(
+        ServiceDescriptor.Transient<IObjectSerializer, NewtonsoftDefaultObjectSerializer>());
+}
+```
+
+Per-T overrides registered elsewhere keep working unchanged — the resolution chain is preserved.
+
+## Resolution flow
+
+```mermaid
+flowchart TD
+    Start([Serialize&lt;T&gt;(obj)])
+    Null{obj == null?}
+    PerT{IObjectSerializer&lt;T&gt;<br/>registered?}
+    UsePerT[specific.Serialize(obj)]
+    UseAuto[AutoSerialize(obj)<br/>System.Text.Json]
+    Return([return byte[] / null])
+
+    Start --> Null
+    Null -- yes --> Return
+    Null -- no --> PerT
+    PerT -- yes --> UsePerT --> Return
+    PerT -- no --> UseAuto --> Return
+```
+
+`Deserialize<T>` mirrors the same flow on a `byte[]` input.
+
+## What this module is *not*
+
+- It is not a JSON library. For HTTP responses, persisted strings or anything human-readable, use [`IJsonSerializer`](./json).
+- It does not version your payloads. If your DTOs evolve, embed your own version byte at the head of the payload or maintain side-by-side `IObjectSerializer<TVersion>` implementations.
+- It does not compress. Wrap your serializer with a `GZipStream` step (or use a `IDistributedCache` decorator) when payloads grow large.
+
+## Related pages
+
+- [Volo.Abp.Json (IJsonSerializer)](./json) — string-oriented serializer used by HTTP and configuration.
+- [Newtonsoft adapter](./json-newtonsoft) — drop-in replacement of `IJsonSerializer`.
+- [System.Text.Json adapter](./json-systemtextjson) — the default `IJsonSerializer` provider.

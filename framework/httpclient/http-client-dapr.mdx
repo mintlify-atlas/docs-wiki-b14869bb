@@ -1,0 +1,306 @@
+---
+title: "Volo.Abp.Http.Client.Dapr: routing every proxy call through the Dapr sidecar"
+sidebarTitle: "Http.Client.Dapr"
+description: "How AbpInvocationHandler is pre-wired into every named HttpClient so a remote service URL is transparently rewritten to a Dapr service-invocation URL via the local sidecar."
+---
+
+`Volo.Abp.Http.Client.Dapr` is a four‑line module and a four‑line
+message handler that together do something surprisingly small but
+important: they make every ABP HTTP proxy call go **through the local
+Dapr sidecar** by rewriting the request URL before it leaves the
+process. The application code, the static or dynamic proxy
+infrastructure, the `IdentityModel` authenticator, and the
+`RemoteServiceConfiguration.BaseUrl` all stay exactly as they would be
+in a non‑Dapr deployment.
+
+This page documents:
+
+- The module pre‑configuration that hooks `AbpInvocationHandler` into
+  every named `HttpClient`.
+- How `Dapr.Client.InvocationHandler` actually rewrites the URL
+  (Dapr SDK contract).
+- The `AbpDaprOptions.HttpEndpoint` override and when you need it.
+
+## Package layout
+
+```
+framework/src/Volo.Abp.Http.Client.Dapr/Volo/Abp/Http/Client/Dapr/
+├── AbpHttpClientDaprModule.cs
+└── AbpInvocationHandler.cs
+```
+
+That is the entire package.
+
+## The module pre‑configuration
+
+```csharp framework/src/Volo.Abp.Http.Client.Dapr/Volo/Abp/Http/Client/Dapr/AbpHttpClientDaprModule.cs
+[DependsOn(
+    typeof(AbpHttpClientModule),
+    typeof(AbpDaprModule)
+)]
+public class AbpHttpClientDaprModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<AbpHttpClientBuilderOptions>(options =>
+        {
+            options.ProxyClientBuildActions.Add((_, clientBuilder) =>
+            {
+                clientBuilder.AddHttpMessageHandler<AbpInvocationHandler>();
+            });
+        });
+    }
+}
+```
+
+Two things are worth attention:
+
+- `PreConfigureServices`, not `ConfigureServices`. Recall from
+  [http-client](/framework/httpclient/http-client#registering-a-proxy)
+  that `AddHttpClientFactory` calls
+  `services.ExecutePreConfiguredActions<AbpHttpClientBuilderOptions>()`
+  **once per remote‑service name**. Anything you want to apply to
+  *every* proxy client must therefore be staged in pre‑configuration.
+- The hook adds the handler via `AddHttpMessageHandler<T>()`. That
+  enrols `AbpInvocationHandler` into the DelegatingHandler pipeline
+  fronting the primary `HttpClientHandler`. The order is:
+
+  ```
+  HttpClient
+    → AbpInvocationHandler   (rewrite URL to sidecar)
+      → HttpClientHandler    (TCP send)
+  ```
+
+  When the URL is rewritten on the outbound request, the
+  underlying `HttpClientHandler` ships it to the rewritten host (the
+  sidecar listening on localhost) — TLS, sockets, and Authorization
+  headers are all preserved.
+
+## The invocation handler
+
+```csharp framework/src/Volo.Abp.Http.Client.Dapr/Volo/Abp/Http/Client/Dapr/AbpInvocationHandler.cs
+public class AbpInvocationHandler : InvocationHandler, ITransientDependency
+{
+    public AbpInvocationHandler(IOptions<AbpDaprOptions> daprOptions)
+    {
+        if (!daprOptions.Value.HttpEndpoint.IsNullOrWhiteSpace())
+        {
+            DaprEndpoint = daprOptions.Value.HttpEndpoint;
+        }
+    }
+}
+```
+
+The whole subclass is exactly four lines that read at runtime as: *“if
+the host configured a non‑empty `HttpEndpoint`, override the SDK
+default sidecar URL with it.”* All of the URL‑rewriting logic is
+inherited from the Dapr SDK's `Dapr.Client.InvocationHandler`.
+
+### What `Dapr.Client.InvocationHandler` does
+
+`Dapr.Client.InvocationHandler` is a `DelegatingHandler` that
+intercepts a request whose URL is of the form
+
+```
+{scheme}://{appId}/{path}
+```
+
+and rewrites it to a Dapr service‑invocation URL that targets the
+local sidecar:
+
+```
+http://127.0.0.1:{DAPR_HTTP_PORT}/v1.0/invoke/{appId}/method/{path}
+```
+
+It also propagates the `DaprApiToken` and any other Dapr metadata
+configured through environment variables. Because `InvocationHandler`
+exposes a settable `DaprEndpoint` property, `AbpInvocationHandler` can
+swap the sidecar location for a non‑default deployment (Kubernetes
+sidecar on a custom port, a self‑hosted reverse proxy, etc.).
+
+### `AbpDaprOptions.HttpEndpoint`
+
+```csharp framework/src/Volo.Abp.Dapr/Volo/Abp/Dapr/AbpDaprOptions.cs
+public class AbpDaprOptions
+{
+    public string? HttpEndpoint { get; set; }
+    public string? GrpcEndpoint { get; set; }
+    public string? DaprApiToken { get; set; }
+    public string? AppApiToken { get; set; }
+}
+```
+
+| Property | Used by | Notes |
+| --- | --- | --- |
+| `HttpEndpoint` | `AbpInvocationHandler` (this package). | If set, replaces the SDK's auto‑detected sidecar URL. Empty / null → SDK default (`DAPR_HTTP_ENDPOINT` env var or `http://127.0.0.1:3500`). |
+| `GrpcEndpoint` | gRPC‑oriented `DaprClient` consumers (not this package). |  |
+| `DaprApiToken` | Forwarded as the `dapr-api-token` header by the Dapr SDK. |  |
+| `AppApiToken` | Used by server‑side ABP Dapr modules to verify that an incoming request originated from the sidecar. |  |
+
+Configure it in `appsettings.json`:
+
+```json
+{
+  "Dapr": {
+    "HttpEndpoint": "http://localhost:3500",
+    "DaprApiToken": "..."
+  }
+}
+```
+
+…and bind it through the standard `AbpDaprModule` configuration.
+
+## End‑to‑end flow with Dapr
+
+Suppose the host registers a proxy for `IIdentityUserAppService`
+against the remote service named `"AbpIdentity"` whose `BaseUrl` is
+configured as `"identity-service"` (the **Dapr app id**, not a
+hostname):
+
+```json
+{
+  "RemoteServices": {
+    "AbpIdentity": {
+      "BaseUrl": "http://identity-service"
+    }
+  }
+}
+```
+
+A call to `_userAppService.GetAsync(id)` produces:
+
+```
+[1] ClientProxyBase<T>
+        builds HttpRequestMessage(GET, http://identity-service/api/identity/users/{id})
+        attaches Authorization, __tenant, X-Requested-With, etc.
+
+[2] client.SendAsync(...)
+        enters DelegatingHandler chain
+
+[3] AbpInvocationHandler (inherited InvocationHandler.SendAsync)
+        sees URI host = "identity-service" (no port, no path normalisation issue)
+        rewrites URI to
+            http://127.0.0.1:3500/v1.0/invoke/identity-service/method/api/identity/users/{id}
+        adds  dapr-api-token  header from AbpDaprOptions.DaprApiToken
+
+[4] HttpClientHandler
+        connects to the local sidecar on 127.0.0.1:3500
+
+[5] Dapr sidecar
+        looks up the target app, forwards the request to the destination service's sidecar
+        and finally to the destination service itself.
+```
+
+The rewrite preserves:
+
+- Method and body — `GET`, `POST`, `PUT`, `DELETE` are all forwarded.
+- All ABP headers — Correlation‑Id, Bearer token, tenant key,
+  Accept‑Language, X‑Requested‑With. These are headers, the URL
+  rewrite does not touch them.
+- Cancellation token — `HttpCompletionOption.ResponseHeadersRead` is
+  honoured end‑to‑end so streaming downloads still work.
+
+## Interaction with the IdentityModel authenticators
+
+The order of the `ClientProxyBase<T>` pipeline matters:
+
+```
+ClientAuthenticator.Authenticate (Bearer token attached)
+        ↓
+client.SendAsync (DelegatingHandler chain)
+        ↓
+AbpInvocationHandler (URL rewrite)
+        ↓
+HttpClientHandler (network)
+```
+
+`AbpInvocationHandler` runs **after** authentication, so the
+`Authorization: Bearer <token>` header is already present when the
+request is rewritten and survives the rewrite. It is then forwarded
+verbatim by the Dapr sidecar to the downstream service, which
+authenticates the user normally.
+
+For the OIDC `IIdentityModelAuthenticationService` itself —
+documented on [identitymodel](/framework/httpclient/identitymodel) — the
+behaviour is slightly different. That service uses
+`IHttpClientFactory.CreateClient("IdentityModelAuthenticationServiceHttpClientName")`,
+which is **not** one of the proxy clients, so it does **not** receive
+the `AbpInvocationHandler`. Token requests go directly to the
+configured OIDC authority, not through Dapr. This is intentional:
+authority discovery and token endpoints are typically outside the Dapr
+mesh.
+
+## Why a `PreConfigureServices` hook?
+
+The flow inside `AddHttpClientFactory` (recap):
+
+```csharp framework/src/Volo.Abp.Http.Client/Microsoft/Extensions/DependencyInjection/ServiceCollectionHttpClientProxyExtensions.cs
+var preOptions = services.ExecutePreConfiguredActions<AbpHttpClientBuilderOptions>();
+
+if (preOptions.ConfiguredProxyClients.Contains(remoteServiceConfigurationName))
+{
+    return services;
+}
+
+var clientBuilder = services.AddHttpClient(remoteServiceConfigurationName, ...);
+
+foreach (var clientBuildAction in preOptions.ProxyClientBuildActions)
+{
+    clientBuildAction(remoteServiceConfigurationName, clientBuilder);
+}
+```
+
+The `ProxyClientBuildActions` list is iterated for *every* proxy client
+the application registers, so adding `AddHttpMessageHandler<AbpInvocationHandler>()`
+once in pre‑configuration is enough to retrofit every named client.
+
+If you forget `PreConfigure<AbpHttpClientBuilderOptions>` and instead
+do `Configure<AbpHttpClientBuilderOptions>` from
+`ConfigureServices`, the action is registered too late: the
+`AddHttpClientFactory` calls inside `AddHttpClientProxies` have already
+materialised their named clients without your handler.
+
+## Module dependencies
+
+```csharp
+[DependsOn(
+    typeof(AbpHttpClientModule),  // The proxy infrastructure
+    typeof(AbpDaprModule)         // AbpDaprOptions binding + Dapr.Client services
+)]
+public class AbpHttpClientDaprModule : AbpModule
+```
+
+`AbpDaprModule` registers `DaprClient` and binds `AbpDaprOptions` from
+configuration. Reference order matters: any consumer module of the
+ABP HTTP proxies must depend on `AbpHttpClientDaprModule` *before* its
+own modules call `AddHttpClientProxy(...)`, because the pre‑configured
+action lives in `AbpHttpClientBuilderOptions` and is read by
+`AddHttpClientFactory` at registration time.
+
+## Caveats
+
+- **Dapr app id, not host name.** The `BaseUrl` of every Dapr‑routed
+  remote service must use the **Dapr app id** as the host. The path
+  remains the same shape (`/api/...`) — the Dapr SDK appends it after
+  `/method/`.
+- **No mTLS termination here.** Mutual TLS happens in the sidecar.
+  This package does not configure certificates. The proxy
+  `HttpClientHandler` retains its default behaviour but always talks
+  to `localhost`.
+- **Discovery endpoints are not Daprised.** The Dapr handler does not
+  touch the `api/abp/api-definition` request used by the dynamic
+  proxy. That request hits whatever `BaseUrl` you configured — in a
+  Dapr deployment this means it too goes through the sidecar, because
+  the same named `HttpClient` is used for both the description fetch
+  and the action calls.
+- **Cookies are off**. As noted on [http-client](/framework/httpclient/http-client),
+  the primary handler disables cookies (`UseCookies = false`) outside
+  the browser. The Dapr handler is unaffected by this — there are no
+  cookies in service‑to‑service invocation in the first place.
+
+## Related pages
+
+- [http-client](/framework/httpclient/http-client) — full coverage of
+  the pipeline that this handler slots into.
+- [identitymodel](/framework/httpclient/identitymodel) — the token
+  acquisition that runs *before* the Dapr rewrite.

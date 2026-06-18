@@ -1,0 +1,406 @@
+---
+title: "Background Jobs · Quartz adapter"
+sidebarTitle: "Jobs · Quartz"
+description: "QuartzBackgroundJobManager, QuartzJobExecutionAdapter, AbpBackgroundJobQuartzOptions, the JobDataMap encoding, retry strategy, and the IsJobExecutionEnabled rewire on AbpQuartzOptions."
+---
+
+`Volo.Abp.BackgroundJobs.Quartz` adapts ABP's `IBackgroundJobManager`
+to a Quartz `IScheduler`. Each call to `EnqueueAsync` builds a new
+`IJobDetail` plus a one‑shot trigger and hands the pair to the
+scheduler. The job class Quartz actually runs is a generic adapter that
+deserializes the args, opens an ABP DI scope, and delegates to
+`IBackgroundJobExecuter`. Retry policy lives on a dedicated options
+class with a customisable strategy delegate.
+
+<CardGroup cols={2}>
+  <Card title="Abstractions" icon="cube" href="/framework/background/background-jobs-abstractions">
+    The IBackgroundJobManager contract this adapter implements.
+  </Card>
+  <Card title="Quartz base module" icon="clock" href="/framework/background/quartz">
+    AbpQuartzModule, IScheduler factory, AbpQuartzOptions.
+  </Card>
+  <Card title="Workers · Quartz" icon="repeat" href="/framework/background/background-workers-quartz">
+    QuartzBackgroundWorkerManager — the sibling adapter for periodic workers.
+  </Card>
+  <Card title="Default engine" icon="gears" href="/framework/background/background-jobs">
+    What the Quartz adapter replaces.
+  </Card>
+</CardGroup>
+
+## File inventory
+
+Source path: `framework/src/Volo.Abp.BackgroundJobs.Quartz/Volo/Abp/BackgroundJobs/Quartz/`.
+
+| File | Purpose |
+| --- | --- |
+| `AbpBackgroundJobsQuartzModule.cs` | Module — registers the adapter, rewires `IsJobExecutionEnabled = false` |
+| `QuartzBackgroundJobManager.cs` | `IBackgroundJobManager` over Quartz `IScheduler.ScheduleJob` |
+| `QuartzJobExecutionAdapter.cs` | The Quartz `IJob` that runs each enqueue |
+| `AbpBackgroundJobQuartzOptions.cs` | `RetryCount`, `RetryIntervalMillisecond`, `RetryStrategy` |
+| `QuartzBackgroundJobManageExtensions.cs` | `EnqueueAsync(args, retryCount, retryInterval, …)` shortcut |
+
+## Module wire‑up
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.Quartz/Volo/Abp/BackgroundJobs/Quartz/AbpBackgroundJobsQuartzModule.cs
+[DependsOn(
+    typeof(AbpBackgroundJobsAbstractionsModule),
+    typeof(AbpQuartzModule)
+)]
+public class AbpBackgroundJobsQuartzModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddTransient(typeof(QuartzJobExecutionAdapter<>));
+    }
+
+    public override void OnPreApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var options = context.ServiceProvider.GetRequiredService<IOptions<AbpBackgroundJobOptions>>().Value;
+        if (!options.IsJobExecutionEnabled)
+        {
+            var quartzOptions = context.ServiceProvider.GetRequiredService<IOptions<AbpQuartzOptions>>().Value;
+            quartzOptions.StartSchedulerFactory = scheduler => Task.CompletedTask;
+        }
+    }
+}
+```
+
+Notable details:
+
+- `QuartzJobExecutionAdapter<>` is registered as an *open generic*
+  transient. Quartz instantiates closed versions per job activation via
+  its `IJobFactory` (the
+  `UseMicrosoftDependencyInjectionScopedJobFactory` factory set in
+  [`AbpQuartzModule`](/framework/background/quartz)).
+- The `IsJobExecutionEnabled = false` path swaps
+  `AbpQuartzOptions.StartSchedulerFactory` for a no‑op. The base Quartz
+  module then *creates* the `IScheduler` instance (so `ScheduleJob`
+  works for enqueue) but never calls `Start()` — exactly the
+  "enqueue‑only" pattern the Hangfire adapter uses.
+
+## `QuartzBackgroundJobManager`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.Quartz/Volo/Abp/BackgroundJobs/Quartz/QuartzBackgroundJobManager.cs
+[Dependency(ReplaceServices = true)]
+public class QuartzBackgroundJobManager : IBackgroundJobManager, ITransientDependency
+{
+    public const string JobDataPrefix = "Abp";
+    public const string RetryIndex = "RetryIndex";
+
+    protected IScheduler Scheduler { get; }
+    protected AbpBackgroundJobQuartzOptions Options { get; }
+    protected IJsonSerializer JsonSerializer { get; }
+
+    public virtual async Task<string> EnqueueAsync<TArgs>(TArgs args, BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+        TimeSpan? delay = null)
+    {
+        return await ReEnqueueAsync(args, Options.RetryCount, Options.RetryIntervalMillisecond, priority, delay);
+    }
+
+    public virtual async Task<string> ReEnqueueAsync<TArgs>(TArgs args, int retryCount, int retryIntervalMillisecond,
+        BackgroundJobPriority priority = BackgroundJobPriority.Normal, TimeSpan? delay = null)
+    {
+        var jobDataMap = new JobDataMap
+            {
+                {nameof(TArgs), JsonSerializer.Serialize(args!)},
+                {JobDataPrefix+ nameof(Options.RetryCount), retryCount.ToString()},
+                {JobDataPrefix+ nameof(Options.RetryIntervalMillisecond), retryIntervalMillisecond.ToString()},
+                {JobDataPrefix+ RetryIndex, "0"}
+            };
+
+        var jobDetail = JobBuilder.Create<QuartzJobExecutionAdapter<TArgs>>().RequestRecovery().SetJobData(jobDataMap).Build();
+        var trigger = !delay.HasValue ? TriggerBuilder.Create().StartNow().Build() : TriggerBuilder.Create().StartAt(new DateTimeOffset(DateTime.Now.Add(delay.Value))).Build();
+        await Scheduler.ScheduleJob(jobDetail, trigger);
+        return jobDetail.Key.ToString();
+    }
+}
+```
+
+| Concern | Implementation |
+| --- | --- |
+| Returned id | `jobDetail.Key.ToString()` — the form `"DEFAULT.6c4f…"` Quartz mints |
+| Storage | Whatever Quartz uses (`UseInMemoryStore()` by default — see the [Quartz base page](/framework/background/quartz)) |
+| Priority parameter | **Ignored.** Quartz triggers have their own integer priority |
+| Delay parameter | `TriggerBuilder.StartAt(new DateTimeOffset(DateTime.Now.Add(delay)))` |
+| Args serialization | `IJsonSerializer.Serialize` (the ABP wrapper around `System.Text.Json`) stored under the key `"TArgs"` |
+
+### `JobDataMap` layout
+
+The `JobDataMap` (Quartz's per‑job KV store, persisted with the
+trigger) holds four entries:
+
+| Key | Value | Read by |
+| --- | --- | --- |
+| `"TArgs"` | JSON of the args object | `QuartzJobExecutionAdapter<TArgs>.Execute` |
+| `"AbpRetryCount"` | `retryCount.ToString()` | `AbpBackgroundJobQuartzOptions.DefaultRetryStrategy` |
+| `"AbpRetryIntervalMillisecond"` | `retryInterval.ToString()` | Same |
+| `"AbpRetryIndex"` | `"0"` initially, incremented after each failure | Same |
+
+The constant `JobDataPrefix = "Abp"` namespaces the retry bookkeeping so
+user code that adds its own `JobDataMap` entries via a custom
+`ReEnqueueAsync` does not collide.
+
+### `RequestRecovery`
+
+`JobBuilder.Create<…>().RequestRecovery()` asks Quartz to re‑fire the
+job if the scheduler crashes mid‑execution. Combined with a durable
+job store (e.g. AdoNet) it gives at‑least‑once semantics across
+restarts. With the default in‑memory store, `RequestRecovery()` has
+no effect — there is nothing to recover from.
+
+### Trigger keys
+
+Every call to `EnqueueAsync` produces a *new* `IJobDetail` with an
+auto‑generated `JobKey` and a *new* `ITrigger` with an auto‑generated
+`TriggerKey`. The keys look like `DEFAULT.<guid>`. There is **no**
+deduplication: enqueuing the same args twice schedules two jobs. If
+you need idempotency, use Quartz's own `StoreJob` with a deterministic
+`JobKey`, or layer your own dedupe key into the args type.
+
+## `QuartzBackgroundJobManageExtensions`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.Quartz/Volo/Abp/BackgroundJobs/Quartz/QuartzBackgroundJobManageExtensions.cs
+public static async Task<string?> EnqueueAsync<TArgs>(this IBackgroundJobManager backgroundJobManager,
+    TArgs args, int retryCount, int retryIntervalMillisecond,
+    BackgroundJobPriority priority = BackgroundJobPriority.Normal, TimeSpan? delay = null)
+{
+    if (backgroundJobManager is QuartzBackgroundJobManager quartzBackgroundJobManager)
+    {
+        return await quartzBackgroundJobManager.ReEnqueueAsync(args, retryCount, retryIntervalMillisecond,
+            priority, delay);
+    }
+
+    return null;
+}
+```
+
+The extension is a *Quartz‑only* enqueue with per‑call retry overrides.
+It safely casts — under a non‑Quartz manager the call returns `null`
+and silently does nothing, so calling code does not need an `#if`.
+
+```csharp Example — override retry budget for one critical job
+var jobKey = await _backgroundJobManager.EnqueueAsync(
+    new SettleInvoiceArgs { InvoiceId = id },
+    retryCount: 10,
+    retryIntervalMillisecond: 30_000);
+```
+
+## `QuartzJobExecutionAdapter<TArgs>`
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.Quartz/Volo/Abp/BackgroundJobs/Quartz/QuartzJobExecutionAdapter.cs
+public class QuartzJobExecutionAdapter<TArgs> : IJob
+{
+    public async Task Execute(IJobExecutionContext context)
+    {
+        using (var scope = ServiceScopeFactory.CreateScope())
+        {
+            var args = JsonSerializer.Deserialize<TArgs>(context.JobDetail.JobDataMap.GetString(nameof(TArgs))!);
+            var jobType = Options.GetJob(typeof(TArgs)).JobType;
+            var jobContext = new JobExecutionContext(scope.ServiceProvider, jobType, args!, cancellationToken: context.CancellationToken);
+            try
+            {
+                await JobExecuter.ExecuteAsync(jobContext);
+            }
+            catch (Exception exception)
+            {
+                var jobExecutionException = new JobExecutionException(exception);
+
+                var retryIndex = context.JobDetail.JobDataMap.GetString(QuartzBackgroundJobManager.JobDataPrefix + QuartzBackgroundJobManager.RetryIndex)!.To<int>();
+                retryIndex++;
+                context.JobDetail.JobDataMap.Put(QuartzBackgroundJobManager.JobDataPrefix + QuartzBackgroundJobManager.RetryIndex, retryIndex.ToString());
+
+                await BackgroundJobQuartzOptions.RetryStrategy.Invoke(retryIndex, context, jobExecutionException);
+
+                throw jobExecutionException;
+            }
+        }
+    }
+}
+```
+
+The execution path:
+
+1. **Open a scope.** Quartz already opens one via the
+   `UseMicrosoftDependencyInjectionScopedJobFactory` factory, but the
+   adapter opens a nested one to keep tenant/`UoW` boundaries
+   predictable.
+2. **Deserialize the args.** The `"TArgs"` key is set by the manager;
+   the adapter uses ABP's `IJsonSerializer` so a custom JSON setting
+   applies symmetrically to enqueue and execute.
+3. **Delegate to the executer.** Same pipeline as every other adapter:
+   tenant from `IMultiTenant`, cancellation through
+   `ICancellationTokenProvider`, exception via `IExceptionNotifier`.
+4. **On failure**, mutate `JobDataMap` (`AbpRetryIndex`++), invoke the
+   strategy delegate, and rethrow a Quartz `JobExecutionException`.
+   That last throw is what tells the scheduler whether to re‑fire — the
+   `RetryStrategy` delegate sets the `RefireImmediately` and
+   `UnscheduleAllTriggers` properties on it before the throw.
+
+## Retry strategy
+
+```csharp framework/src/Volo.Abp.BackgroundJobs.Quartz/Volo/Abp/BackgroundJobs/Quartz/AbpBackgroundJobQuartzOptions.cs
+public class AbpBackgroundJobQuartzOptions
+{
+    public int RetryCount { get; set; }
+    public int RetryIntervalMillisecond { get; set; }
+
+    [NotNull]
+    public Func<int, IJobExecutionContext, JobExecutionException, Task> RetryStrategy { … }
+
+    public AbpBackgroundJobQuartzOptions()
+    {
+        RetryCount = 3;
+        RetryIntervalMillisecond = 3000;
+        _retryStrategy = DefaultRetryStrategy;
+    }
+
+    private async Task DefaultRetryStrategy(int retryIndex, IJobExecutionContext executionContext, JobExecutionException exception)
+    {
+        exception.RefireImmediately = true;
+
+        var retryCount = executionContext.JobDetail.JobDataMap.GetString(QuartzBackgroundJobManager.JobDataPrefix + nameof(RetryCount))!.To<int>();
+        if (retryIndex > retryCount)
+        {
+            exception.RefireImmediately = false;
+            exception.UnscheduleAllTriggers = true;
+            return;
+        }
+
+        var retryInterval = executionContext.JobDetail.JobDataMap.GetString(QuartzBackgroundJobManager.JobDataPrefix + nameof(RetryIntervalMillisecond))!.To<int>();
+        await Task.Delay(retryInterval);
+    }
+}
+```
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `RetryCount` | `3` | Maximum number of retry attempts (so up to 4 total executions) |
+| `RetryIntervalMillisecond` | `3000` | Wait between attempts |
+| `RetryStrategy` | `DefaultRetryStrategy` | Async delegate that mutates the `JobExecutionException` |
+
+The default strategy reads back the per‑job overrides the manager
+stored in `JobDataMap` — so the global option is the **fallback**, not
+a hard limit. Replace the delegate to implement exponential back‑off,
+dead‑letter routing, or even a circuit breaker:
+
+```csharp
+Configure<AbpBackgroundJobQuartzOptions>(options =>
+{
+    options.RetryStrategy = async (retryIndex, ctx, ex) =>
+    {
+        var retryCount = ctx.JobDetail.JobDataMap
+            .GetString(QuartzBackgroundJobManager.JobDataPrefix + nameof(AbpBackgroundJobQuartzOptions.RetryCount))!.To<int>();
+
+        if (retryIndex > retryCount)
+        {
+            ex.RefireImmediately = false;
+            ex.UnscheduleAllTriggers = true;
+            return;
+        }
+
+        // exponential back-off: 1s, 2s, 4s, 8s, …
+        ex.RefireImmediately = true;
+        await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, retryIndex - 1)));
+    };
+});
+```
+
+### Why `RefireImmediately = true` + `Task.Delay`?
+
+Quartz's `JobExecutionException.RefireImmediately` causes the
+scheduler to re‑invoke the same job **on the same thread**, but only
+after `Execute` returns. The strategy uses an `await Task.Delay` to
+inject the desired wait *inside* the failing execution — so the worker
+thread sleeps, then `Execute` rethrows, then Quartz fires immediately.
+That keeps the retry on the same scheduler thread without rescheduling
+through the job store.
+
+When `retryIndex > retryCount`, the strategy flips both flags off and
+sets `UnscheduleAllTriggers = true`, which removes the trigger (and the
+durable record of the job in a persistent store) so it does not fire
+again.
+
+## End‑to‑end flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant Mgr as QuartzBackgroundJobManager
+    participant Sched as IScheduler
+    participant QFac as Quartz JobFactory (DI scoped)
+    participant Adapter as QuartzJobExecutionAdapter&lt;TArgs&gt;
+    participant Exec as BackgroundJobExecuter
+
+    App->>Mgr: EnqueueAsync(args, _, delay?)
+    Mgr->>Mgr: Build JobDataMap (TArgs JSON + AbpRetry*)
+    alt delay null
+        Mgr->>Sched: ScheduleJob(jobDetail, StartNow())
+    else
+        Mgr->>Sched: ScheduleJob(jobDetail, StartAt(now+delay))
+    end
+    Mgr-->>App: jobDetail.Key.ToString()
+    Note over Sched: time/threadpool drives execution
+    Sched->>QFac: NewJob(QuartzJobExecutionAdapter&lt;TArgs&gt;)
+    QFac-->>Sched: scoped adapter
+    Sched->>Adapter: Execute(IJobExecutionContext)
+    Adapter->>Adapter: CreateScope(); deserialize TArgs
+    Adapter->>Exec: ExecuteAsync(JobExecutionContext)
+    alt success
+        Exec-->>Adapter: Task complete
+        Adapter-->>Sched: Task complete
+    else throws
+        Adapter->>Adapter: AbpRetryIndex++
+        Adapter->>Adapter: RetryStrategy.Invoke(retryIndex, ctx, ex)
+        Adapter-->>Sched: throw JobExecutionException
+        alt RefireImmediately
+            Sched->>Adapter: re-fire
+        else UnscheduleAllTriggers
+            Sched->>Sched: remove trigger
+        end
+    end
+```
+
+## Options surface
+
+| Option | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `RetryCount` | `int` | `3` | Maximum retries per job |
+| `RetryIntervalMillisecond` | `int` | `3000` | Wait between retries (default strategy) |
+| `RetryStrategy` | `Func<int, IJobExecutionContext, JobExecutionException, Task>` | `DefaultRetryStrategy` | Custom retry policy |
+| `IsJobExecutionEnabled` | `bool` (on `AbpBackgroundJobOptions`) | `true` | When `false`, the Quartz scheduler is created but never started |
+
+Quartz‑level knobs (thread pool size, persistence, time zone) live on
+`AbpQuartzOptions` — see the [Quartz base page](/framework/background/quartz).
+
+## Gotchas
+
+- **One job detail per enqueue.** Every `EnqueueAsync` schedules a new
+  `IJobDetail` with a brand new key. If you enable persistent storage
+  the job store will hold the row until the trigger fires; a stuck or
+  long‑delayed job stays visible there. There is no built‑in cleanup
+  besides Quartz's own.
+- **`Priority` is ignored.** Set `Trigger.Priority` explicitly via a
+  custom override if you need it. The default builder leaves it at 5.
+- **Args serialization uses `IJsonSerializer` symmetrically.** The
+  Quartz `JobDataMap` is `string` → `object`, so the args land as a
+  string under the key `"TArgs"`. Replacing `IJsonSerializer` swaps
+  both directions.
+- **The retry index is stored in `JobDataMap`, which Quartz persists
+  *only* when the job store is persistent and the job is marked
+  `PersistJobDataAfterExecution`.** `QuartzBackgroundJobManager` does
+  not set that attribute, so with a durable Quartz job store the
+  default in‑memory `RetryIndex` increments are lost between processes.
+  Adopt a custom strategy + `[PersistJobDataAfterExecution]` adapter if
+  you need cross‑restart retry counters.
+- **`RefireImmediately = true` blocks the worker thread.** Long
+  `Task.Delay` values in the strategy starve other jobs in the same
+  Quartz thread pool. Increase
+  `quartz.threadPool.maxConcurrency` (default `10`) accordingly.
+- **`QuartzBackgroundJobManageExtensions.EnqueueAsync` returns `null`
+  when running under a different `IBackgroundJobManager`.** Calling
+  code that needs the id must check for `null` and fall back to the
+  base `IBackgroundJobManager.EnqueueAsync`.
+- **The `IsJobExecutionEnabled = false` rewire happens in
+  `OnPreApplicationInitialization`.** Switching the flag at runtime
+  has no effect; the scheduler has already been (or not been) started.
