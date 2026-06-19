@@ -1,0 +1,344 @@
+---
+title: "Volo.Abp.FeatureManagement.Web: Razor Pages modal and the Setting Management page contributor"
+sidebarTitle: "Web (MVC)"
+description: "FeatureManagementModal.cshtml.cs page model, FeatureSettingGroupViewComponent, the Setting Management page contribution, and the JavaScript event that resets ICurrentApplicationConfigurationCache after save."
+---
+
+`Volo.Abp.FeatureManagement.Web` is the MVC / Razor Pages UI for managing features. It ships:
+
+- a Razor Page (`FeatureManagementModal`) rendered as a Bootstrap modal,
+- a view component (`FeatureSettingGroupViewComponent`) that contributes a button into the Setting Management page,
+- a `SettingPageContributorBase` that registers the button as a settings group.
+
+Module class:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpSettingManagementWebModule))]
+public class AbpFeatureManagementWebModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+        {
+            options.AddAssemblyResource(
+                typeof(AbpFeatureManagementResource),
+                typeof(AbpFeatureManagementWebModule).Assembly);
+        });
+
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpFeatureManagementWebModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpFeatureManagementWebModule>();
+        });
+
+        Configure<RazorPagesOptions>(options =>
+        {
+            // Configure authorization. (Left empty in source — historical placeholder.)
+        });
+
+        Configure<DynamicJavaScriptProxyOptions>(options =>
+        {
+            options.DisableModule(FeatureManagementRemoteServiceConsts.ModuleName);
+        });
+
+        Configure<SettingManagementPageOptions>(options =>
+        {
+            options.Contributors.Add(new FeatureSettingManagementPageContributor());
+        });
+    }
+}
+```
+
+Things worth noting:
+
+- **`AddAssemblyResource`** routes data-annotation localization (`[Display(Name = "...")]` on view models) to `AbpFeatureManagementResource`. Without it, model-bound DTOs would render English-only labels.
+- **`AddEmbedded`** registers the Razor view assembly's embedded `cshtml` / `js` / `css` files into ABP's virtual file system, so the host can serve `/FeatureManagement/FeatureManagementModal.cshtml` even though the page isn't a physical file on disk.
+- **`DisableModule(FeatureManagementRemoteServiceConsts.ModuleName)`** disables the dynamic JS API proxy for `featureManagement`. The MVC UI calls the controller via hand-written jQuery / fetch instead.
+- **`SettingManagementPageOptions.Contributors.Add(...)`** plugs the `FeatureSettingManagementPageContributor` into the Setting Management page — host admins see a "Feature Management" group inside Settings, gated by `ManageHostFeatures`.
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `AbpFeatureManagementWebModule.cs` | Module class — JS proxy opt-out, Setting-Management contributor wiring. |
+| `Pages/FeatureManagement/FeatureManagementModal.cshtml` | Razor view for the modal. |
+| `Pages/FeatureManagement/FeatureManagementModal.cshtml.cs` | Page model — `OnGetAsync` / `OnPostAsync`. |
+| `Pages/FeatureManagement/Components/FeatureSettingGroup/FeatureSettingGroupViewComponent.cs` | View component — renders a button that opens the modal. |
+| `Pages/FeatureManagement/Components/FeatureSettingGroup/Default.cshtml` | View component view. |
+| `Settings/FeatureSettingManagementPageContributor.cs` | Setting Management page contributor. |
+| `Pages/FeatureManagement/...js`/`...css` | Hand-written client JS for the modal — opens `FeatureManagementModal`, builds the `UpdateFeaturesDto` payload, posts via `volo.abp.featureManagement.features.update(...)` (a JS namespace defined locally, not by the dynamic proxy). |
+
+The page route is `/FeatureManagement/FeatureManagementModal` (the area for Razor Pages mirrors the folder structure).
+
+## `FeatureManagementModal` page model
+
+```csharp
+public class FeatureManagementModal : AbpPageModel
+{
+    [Required, HiddenInput, BindProperty(SupportsGet = true)]
+    public string ProviderName { get; set; }
+
+    [HiddenInput, BindProperty(SupportsGet = true)]
+    public string ProviderKey { get; set; }
+
+    [BindProperty]
+    public List<FeatureGroupViewModel> FeatureGroups { get; set; }
+
+    public GetFeatureListResultDto FeatureListResultDto { get; set; }
+
+    protected IFeatureAppService FeatureAppService { get; }
+    protected ILocalEventBus LocalEventBus { get; }
+    public AbpLocalizationOptions LocalizationOptions { get; }
+
+    public FeatureManagementModal(
+        IFeatureAppService featureAppService,
+        ILocalEventBus localEventBus,
+        IOptions<AbpLocalizationOptions> localizationOptions)
+    {
+        ObjectMapperContext = typeof(AbpFeatureManagementWebModule);
+        FeatureAppService = featureAppService;
+        LocalEventBus = localEventBus;
+        LocalizationOptions = localizationOptions.Value;
+    }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        ValidateModel();
+        FeatureListResultDto = await FeatureAppService.GetAsync(ProviderName, ProviderKey);
+        return Page();
+    }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        var features = new UpdateFeaturesDto
+        {
+            Features = FeatureGroups.SelectMany(g => g.Features).Select(f => new UpdateFeatureDto
+            {
+                Name = f.Name,
+                Value = f.Type == nameof(ToggleStringValueType)
+                    ? f.BoolValue.ToString()
+                    : f.Value
+            }).ToList()
+        };
+
+        await FeatureAppService.UpdateAsync(ProviderName, ProviderKey, features);
+        await LocalEventBus.PublishAsync(new CurrentApplicationConfigurationCacheResetEventData());
+        return NoContent();
+    }
+
+    public virtual bool IsDisabled(string providerName)
+    {
+        return providerName != ProviderName && providerName != DefaultValueFeatureValueProvider.ProviderName;
+    }
+
+    public class FeatureGroupViewModel
+    {
+        public List<FeatureViewModel> Features { get; set; }
+    }
+
+    public class FeatureViewModel
+    {
+        public string Name { get; set; }
+        public string Value { get; set; }
+        public bool BoolValue { get; set; }
+        public string Type { get; set; }
+    }
+}
+```
+
+### Routes and binding
+
+`OnGetAsync` accepts `ProviderName` and `ProviderKey` via query string (the `SupportsGet = true` makes the binder honour `?providerName=T&providerKey={tenantId}`). The `[Required]` on `ProviderName` means a missing query parameter renders the modal in an error state — but because this is a server-rendered modal opened via AJAX from the tenants page, malformed requests are rare.
+
+### `OnPostAsync` and the toggle conversion
+
+The view binds `bool` features into `FeatureViewModel.BoolValue` (a checkbox) and free-text features into `FeatureViewModel.Value` (a text input). The page model converts back to the framework's "everything is a string" contract:
+
+```csharp
+Value = f.Type == nameof(ToggleStringValueType) ? f.BoolValue.ToString() : f.Value
+```
+
+`bool.ToString()` produces `"True"` / `"False"` with leading caps — that is the canonical wire format used by `IFeatureChecker.IsEnabledAsync` which does `bool.Parse(value)`. Lower-case `"true"` would still parse, but writing `"True"` keeps round-trip stable.
+
+### `CurrentApplicationConfigurationCacheResetEventData`
+
+After a successful save the page publishes a local event:
+
+```csharp
+await LocalEventBus.PublishAsync(new CurrentApplicationConfigurationCacheResetEventData());
+```
+
+That event is consumed by ASP.NET Core's `AbpApplicationConfigurationCache` handler which invalidates the response cache for `/api/abp/application-configuration` — the endpoint Blazor / SPA clients call to learn the current user's permissions and features. Without this, a Blazor admin who toggled a feature would see the old value for up to a minute (or until cache TTL expired).
+
+### `IsDisabled(providerName)`
+
+```csharp
+public virtual bool IsDisabled(string providerName)
+    => providerName != ProviderName && providerName != DefaultValueFeatureValueProvider.ProviderName;
+```
+
+The view passes `feature.Provider.Name` to this method to grey out values that were granted by a *higher* (more general) scope. If a tenant inherits a feature from the edition, the tenant-management UI shows it as read-only — admins must edit at the edition level. The exception is the default value (`"D"`) — features at the default can always be overridden.
+
+## `FeatureSettingGroupViewComponent`
+
+```csharp
+public class FeatureSettingGroupViewComponent : AbpViewComponent
+{
+    protected IPermissionChecker PermissionChecker { get; }
+
+    public FeatureSettingGroupViewComponent(IPermissionChecker permissionChecker)
+        => PermissionChecker = permissionChecker;
+
+    public virtual async Task<IViewComponentResult> InvokeAsync()
+    {
+        var model = new FeatureSettingViewModel
+        {
+            HasManageHostFeaturesPermission = await PermissionChecker.IsGrantedAsync(
+                FeatureManagementPermissions.ManageHostFeatures)
+        };
+        return View("~/Pages/FeatureManagement/Components/FeatureSettingGroup/Default.cshtml", model);
+    }
+
+    public class FeatureSettingViewModel
+    {
+        public bool HasManageHostFeaturesPermission { get; set; }
+    }
+}
+```
+
+The view itself is a button labelled "Manage Host Features" that opens the modal with `providerName="T"` and `providerKey=null` — the host-defaults branch. The button is hidden when the permission check fails.
+
+## `FeatureSettingManagementPageContributor`
+
+```csharp
+public class FeatureSettingManagementPageContributor : SettingPageContributorBase
+{
+    public FeatureSettingManagementPageContributor()
+    {
+        RequiredPermissions(FeatureManagementPermissions.ManageHostFeatures);
+    }
+
+    public override Task ConfigureAsync(SettingPageCreationContext context)
+    {
+        var l = context.ServiceProvider
+            .GetRequiredService<IStringLocalizer<AbpFeatureManagementResource>>();
+        context.Groups.Add(
+            new SettingPageGroup(
+                "Volo.Abp.FeatureManagement",
+                l["Menu:FeatureManagement"],
+                typeof(FeatureSettingGroupViewComponent)
+            )
+        );
+        return Task.CompletedTask;
+    }
+}
+```
+
+The contributor adds a `SettingPageGroup` to the Setting Management page (a sibling module). When a host admin opens `/SettingManagement`, they see a "Feature Management" tab; clicking it renders `FeatureSettingGroupViewComponent`, which renders a button that opens `FeatureManagementModal`.
+
+The `RequiredPermissions(...)` call gates the entire group — tenant-side users never see it.
+
+## Client-side JavaScript
+
+The module ships hand-written JS at `Pages/FeatureManagement/FeatureManagementModal.js` (embedded resource). Salient behaviour:
+
+- `abp.modals.FeatureManagement = function() { ... }` — a constructor that initialises a Bootstrap modal and wires the save button.
+- The save handler collects `<input type="checkbox" data-feature-name="...">` and `<input type="text" data-feature-name="...">` values, builds `UpdateFeaturesDto`, and `POST`s the model-bound form back to `OnPostAsync`. The conversion from `BoolValue` to string happens server-side (page model) rather than client-side.
+- A parent-child toggle script auto-checks ancestors when a child is checked and auto-unchecks descendants when a parent is unchecked. Matches the Blazor modal's `CheckParents`/`UncheckChildren` behaviour.
+
+## Localization
+
+The module relies on `AbpFeatureManagementResource` for every label except cross-cutting strings inherited from `AbpUiResource` (`"Save"`, `"Cancel"`, `"Close"`). The HTTP API module (a transitive dependency via `AbpFeatureManagementApplicationContractsModule`) added `AbpUiResource` as a base type, so resolution is transparent.
+
+`Menu:FeatureManagement` and `Permission:FeatureManagement.ManageHostFeatures` keys live in `Localization/Domain/{culture}.json` (embedded from Domain.Shared).
+
+## Composition with Tenant Management
+
+The Tenant Management module's tenant list page renders a row action button "Actions → Manage features" that calls:
+
+```javascript
+abp.modals.FeatureManagement.open({
+    providerName: 'T',
+    providerKey: tenantId
+});
+```
+
+That URL hits `/FeatureManagement/FeatureManagementModal?providerName=T&providerKey={id}`. `FeatureAppService.GetAsync` runs in the *host* user's context with `providerName = "T"`, `providerKey = tenantId`. Authorization picks `ProviderPolicies["T"] = "AbpTenantManagement.Tenants.ManageFeatures"`.
+
+The host's "manage default tenant features" link calls the same modal with `providerKey = null`, which routes through `ManageHostFeatures`.
+
+## Theme integration
+
+`AbpAspNetCoreMvcUiThemeSharedModule` is a dependency — that brings in the theme's modal harness (`abp.modals`), tabs, alerts, etc. Theme-specific styling (Basic, LeptonX, …) is up to the theme; the modal itself is theme-agnostic Bootstrap 5.
+
+## Gotchas
+
+- **Empty `Configure<RazorPagesOptions>` callback.** The module class has `Configure<RazorPagesOptions>(options => { /* Configure authorization. */ })` with a no-op body. Don't be misled — there is no Razor Pages convention adding `[Authorize]` here; the modal relies entirely on `[Authorize]` on `FeatureAppService` + `CheckProviderPolicy`. If your host installs a global `RequireAuthenticatedUserConvention`, that does cover the modal.
+- **Dynamic JS proxy is disabled.** Any client code that expects `abp.proxy.featureManagement.features.get(...)` will fail. Use the local `abp.modals.FeatureManagement` instead.
+- **Reset cache on save is essential.** If you customize `OnPostAsync` (e.g. to add a confirmation prompt), keep the `LocalEventBus.PublishAsync(new CurrentApplicationConfigurationCacheResetEventData())` line. Removing it silently breaks SPA clients reading `/api/abp/application-configuration`.
+- **`IsDisabled` does not differentiate provider hierarchy.** Any provider that is not the *current* provider or the default is treated as a parent. If you introduce custom providers between Edition and Tenant, you'll need to override the view to render an explicit "set at: Edition" badge.
+- **Razor page model's `FeatureGroups` binding requires the view to emit indexed `name` attributes.** The default scaffolded view does this correctly; custom views must preserve the `FeatureGroups[0].Features[0].Name` index syntax or model binding silently drops the values.
+- For the framework abstractions (`IFeatureChecker`, `IStringValueType`, `ToggleStringValueType`/`FreeTextStringValueType`/`SelectionStringValueType`), see [framework/cross/features](/framework/cross/features). The MVC modal mirrors the same render branches for each value type.
+
+## Embedded view assets
+
+The module ships these embedded resources (visible to the host via the ABP virtual file system):
+
+| Path | Type |
+| --- | --- |
+| `Pages/FeatureManagement/FeatureManagementModal.cshtml` | Razor view. |
+| `Pages/FeatureManagement/FeatureManagementModal.js` | jQuery client (`abp.modals.FeatureManagement`). |
+| `Pages/FeatureManagement/FeatureManagementModal.css` | Optional theming overrides. |
+| `Pages/FeatureManagement/Components/FeatureSettingGroup/Default.cshtml` | View component view. |
+
+You can override any of these by placing a file at the same relative path under the host project's `wwwroot` / `Pages` folder — the virtual file system gives precedence to physical files. Common overrides:
+
+- Replacing the JS to add custom analytics around save events.
+- Theming the modal header with a brand colour.
+- Adding a "Reset to Default" link next to each feature (the modal ships a single bulk "Reset" button only).
+
+## Razor Pages routing
+
+The page is registered at `/FeatureManagement/FeatureManagementModal` by the ABP convention (folder-based routing). The full URL pattern is:
+
+```
+/FeatureManagement/FeatureManagementModal?providerName={p}&providerKey={k}
+```
+
+When opened via AJAX (the typical flow), only the body content is returned — the modal's outer wrapper is provided by the parent page. The MVC theme's `abp.modals` JavaScript handles the AJAX load.
+
+## SignalR / hub interaction
+
+The Razor Page module doesn't participate in SignalR. If your host uses Blazor Server alongside the MVC modal (mixed-mode), the cache-reset event published by the page reaches Blazor Server's local event bus too — both UIs invalidate together. The event is local-only; cross-node invalidation requires the framework's distributed event bus (Kafka, RabbitMQ, …) which is not part of this module.
+
+## Embedding the modal into a custom page
+
+If you want to open the modal from a custom page (not from the Setting Management tab or the Tenant Management list), include the modal partial and the JS:
+
+```cshtml
+@await Html.PartialAsync("~/Pages/FeatureManagement/FeatureManagementModal.cshtml",
+    new FeatureManagementModalModel { ProviderName = "T", ProviderKey = Model.TenantId.ToString() })
+
+<button onclick="openFeatureModal()">Manage features</button>
+
+<script>
+function openFeatureModal() {
+    new abp.modals.FeatureManagement({
+        providerName: 'T',
+        providerKey: '@Model.TenantId'
+    }).open();
+}
+</script>
+```
+
+The `abp.modals.FeatureManagement` constructor is defined in the embedded `FeatureManagementModal.js`. Include the page's JS bundle in your `_Layout.cshtml` or via the dynamic bundle subsystem.

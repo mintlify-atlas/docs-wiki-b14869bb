@@ -1,0 +1,434 @@
+---
+title: "CLI Command Registry"
+description: "How ICommandSelector, IConsoleCommand and the AbpCliOptions.Commands dictionary turn 'abp foo' into a typed command instance."
+---
+
+`abp foo bar --baz qux` becomes a typed `IConsoleCommand` instance in three
+steps: argument parsing, command selection, and DI-resolved execution.
+This page maps that pipeline against the actual source files in
+`Volo.Abp.Cli.Core` so that you can read, debug or extend any command in
+the codebase.
+
+## The pipeline at a glance
+
+```
+  args[]                 CommandLineArgs              Type           IConsoleCommand
+   │                          │                       │                    │
+   ▼                          ▼                       ▼                    ▼
+CommandLineArgumentParser ── CommandSelector ── ServiceProvider ── command.ExecuteAsync(args)
+   (parser)                  (registry)        (DI scope)            (run)
+```
+
+Each box is one class. The handshake between them is just
+`CommandLineArgs` (input) and `Type` (lookup result).
+
+## File inventory
+
+```text
+framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/
+├── AbpCliCoreModule.cs          # Registers every concrete command into AbpCliOptions
+├── AbpCliOptions.cs             # public Dictionary<string, Type> Commands
+├── CliService.cs                # Orchestrator that calls CommandSelector + DI scope
+├── Args/
+│   ├── CommandLineArgs.cs       # Command, Target, Options
+│   ├── AbpCommandLineOptions.cs # Dictionary<string,string> + GetOrNull helpers
+│   ├── ICommandLineArgumentParser.cs
+│   └── CommandLineArgumentParser.cs
+└── Commands/
+    ├── IConsoleCommand.cs       # Execute / GetUsage / GetShortDescription
+    ├── ICommandSelector.cs      # Type Select(CommandLineArgs)
+    └── CommandSelector.cs       # Dictionary lookup; falls back to HelpCommand
+```
+
+## IConsoleCommand — the contract
+
+Every CLI command implements this 3-method interface:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/IConsoleCommand.cs
+public interface IConsoleCommand
+{
+    Task ExecuteAsync(CommandLineArgs commandLineArgs);
+    string GetUsageInfo();
+    string GetShortDescription();
+}
+```
+
+- `ExecuteAsync` — runs the command. Throw `CliUsageException` to bail
+  with a friendly help dump (it is caught and logged as a warning by
+  `CliService`).
+- `GetUsageInfo()` — the body of `abp help <command>`. Conventionally
+  built with a `StringBuilder` listing usage, options, examples and a
+  docs link.
+- `GetShortDescription()` — the one-liner shown by `abp help` (no
+  arguments).
+
+A typical command skeleton, with the registration constant that
+`AbpCliCoreModule` reads:
+
+```csharp
+public class HelloCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "hello";   // ← matches the dictionary key
+
+    public ILogger<HelloCommand> Logger { get; set; }
+        = NullLogger<HelloCommand>.Instance;
+
+    public Task ExecuteAsync(CommandLineArgs args)
+    {
+        var name = args.Target ?? "world";
+        Logger.LogInformation($"Hello, {name}!");
+        return Task.CompletedTask;
+    }
+
+    public string GetUsageInfo() => "Usage:  abp hello [name]";
+    public string GetShortDescription() => "Demo command.";
+}
+```
+
+Two conventions every built-in command follows:
+
+1. The constant `public const string Name = "…";` is used both as the
+   dictionary key during registration **and** as `CommandName` in
+   `ProxyCommandBase` subclasses. There is no attribute discovery — the
+   registration is fully explicit.
+2. The command is registered as `ITransientDependency` so the
+   `IServiceScopeFactory.CreateScope()` in `CliService.RunInternalAsync`
+   produces a fresh instance per invocation.
+
+## CommandLineArgs and the parser
+
+`CommandLineArgs` is a tiny immutable record:
+
+```csharp
+public class CommandLineArgs
+{
+    public string Command { get; }                  // "add-package"
+    public string Target  { get; }                  // "Volo.Abp.FluentValidation"
+    public AbpCommandLineOptions Options { get; }   // -p / --project / …
+
+    public bool IsCommand(string command)
+        => string.Equals(Command, command, StringComparison.OrdinalIgnoreCase);
+}
+```
+
+`AbpCommandLineOptions : Dictionary<string, string>` adds two helpers used
+everywhere:
+
+```csharp
+options.GetOrNull("p", "project")     // returns value for "p" or "project", null if neither
+options.ContainsKey("preview")        // true even if the flag was given without a value
+```
+
+The parser is purely positional: first token → `Command`, second token →
+`Target` (unless it starts with `-`), then `--flag value` pairs:
+
+```csharp
+public CommandLineArgs Parse(string[] args)
+{
+    if (args.IsNullOrEmpty()) return CommandLineArgs.Empty();
+
+    var argumentList = args.ToList();
+
+    var command = argumentList[0];                       // 1) command
+    argumentList.RemoveAt(0);
+    if (!argumentList.Any()) return new CommandLineArgs(command);
+
+    var target = argumentList[0];                        // 2) optional target
+    if (target.StartsWith("-")) target = null;
+    else                        argumentList.RemoveAt(0);
+
+    var commandLineArgs = new CommandLineArgs(command, target);
+
+    while (argumentList.Any())                           // 3) options
+    {
+        var optionName = ParseOptionName(argumentList[0]);
+        argumentList.RemoveAt(0);
+
+        if (!argumentList.Any() || IsOptionName(argumentList[0]))
+        {
+            commandLineArgs.Options[optionName] = null;  // flag with no value
+            continue;
+        }
+
+        commandLineArgs.Options[optionName] = argumentList[0];
+        argumentList.RemoveAt(0);
+    }
+    return commandLineArgs;
+}
+
+private static string ParseOptionName(string argument)
+{
+    if (argument.StartsWith("--")) return argument.RemovePreFix("--");
+    if (argument.StartsWith("-"))  return argument.RemovePreFix("-");
+    throw new ArgumentException("Option names should start with '-' or '--'.");
+}
+```
+
+Consequences:
+
+- Short and long forms are stored under **different keys**. That's why
+  every command queries `options.GetOrNull(Short, Long)`:
+  `commandLineArgs.Options.GetOrNull("p", "project")`.
+- `--flag` with no following value (or followed by another flag) is
+  stored as `null` — commands check it with `ContainsKey`.
+- Values containing spaces must be quoted; the `Parse(string)` overload
+  honours `"` boundaries (used by `prompt` and `batch`).
+- The parser does not validate flag names — unknown flags are silently
+  added to `Options`. Validation is the command's responsibility.
+
+There is also a string overload that tokenises a single line (used by
+`prompt` and `batch` modes):
+
+```csharp
+public CommandLineArgs Parse(string lineText) => Parse(GetArgsArrayFromLine(lineText));
+```
+
+It walks character-by-character and treats `"` as quote boundaries.
+
+## ICommandSelector and CommandSelector
+
+The selector is a one-line dictionary lookup:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/ICommandSelector.cs
+public interface ICommandSelector
+{
+    Type Select(CommandLineArgs commandLineArgs);
+}
+
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/CommandSelector.cs
+public class CommandSelector : ICommandSelector, ITransientDependency
+{
+    protected AbpCliOptions Options { get; }
+
+    public CommandSelector(IOptions<AbpCliOptions> options) => Options = options.Value;
+
+    public Type Select(CommandLineArgs commandLineArgs)
+    {
+        if (commandLineArgs.Command.IsNullOrWhiteSpace())
+            return typeof(HelpCommand);
+
+        return Options.Commands.GetOrDefault(commandLineArgs.Command)
+               ?? typeof(HelpCommand);
+    }
+}
+```
+
+Both the "no command given" case and the "unknown command" case fall
+through to `HelpCommand`, which is why `abp` (no args) and `abp wat`
+print the same help screen.
+
+## Registration
+
+Every command is added to the dictionary explicitly in
+`AbpCliCoreModule.ConfigureServices`:
+
+```csharp
+Configure<AbpCliOptions>(options =>
+{
+    options.Commands[HelpCommand.Name]          = typeof(HelpCommand);
+    options.Commands[NewCommand.Name]           = typeof(NewCommand);
+    options.Commands[AddPackageCommand.Name]    = typeof(AddPackageCommand);
+    options.Commands[AddModuleCommand.Name]     = typeof(AddModuleCommand);
+    options.Commands[BundleCommand.Name]        = typeof(BundleCommand);
+    options.Commands[InstallLibsCommand.Name]   = typeof(InstallLibsCommand);
+    options.Commands[GenerateProxyCommand.Name] = typeof(GenerateProxyCommand);
+    options.Commands[RemoveProxyCommand.Name]   = typeof(RemoveProxyCommand);
+    options.Commands[SuiteCommand.Name]         = typeof(SuiteCommand);
+    options.Commands[LoginCommand.Name]         = typeof(LoginCommand);
+    options.Commands[LogoutCommand.Name]        = typeof(LogoutCommand);
+    options.Commands[LoginInfoCommand.Name]     = typeof(LoginInfoCommand);
+    options.Commands[UpdateCommand.Name]        = typeof(UpdateCommand);
+    options.Commands[BuildCommand.Name]         = typeof(BuildCommand);
+    options.Commands[CleanCommand.Name]         = typeof(CleanCommand);
+    options.Commands[ListTemplatesCommand.Name] = typeof(ListTemplatesCommand);
+    options.Commands[ListModulesCommand.Name]   = typeof(ListModulesCommand);
+    options.Commands[PromptCommand.Name]        = typeof(PromptCommand);
+    options.Commands[CliCommand.Name]           = typeof(CliCommand);
+    options.Commands[GetSourceCommand.Name]     = typeof(GetSourceCommand);
+    options.Commands[ClearDownloadCacheCommand.Name] = typeof(ClearDownloadCacheCommand);
+    options.Commands[TranslateCommand.Name]     = typeof(TranslateCommand);
+    options.Commands[SwitchToPreviewCommand.Name] = typeof(SwitchToPreviewCommand);
+    options.Commands[SwitchToStableCommand.Name]  = typeof(SwitchToStableCommand);
+    options.Commands[SwitchToNightlyCommand.Name] = typeof(SwitchToNightlyCommand);
+    options.Commands[SwitchToLocal.Name]          = typeof(SwitchToLocal);
+    options.Commands[CreateMigrationAndRunMigratorCommand.Name] =
+        typeof(CreateMigrationAndRunMigratorCommand);
+});
+```
+
+Some observations:
+
+- There is **no attribute-based discovery**. If you see references to a
+  `[CommandName]` attribute in third-party blogs, they're describing an
+  abandoned design — the production CLI uses this dictionary.
+- The dictionary is constructed with
+  `StringComparer.OrdinalIgnoreCase`, so `abp NEW` works just like
+  `abp new`.
+- Each `Name` constant uses a kebab-case verb (`add-package`,
+  `generate-proxy`, `install-libs`, `switch-to-stable`).
+
+## Complete list of built-in commands (v7.4.0)
+
+The table below is generated from the registrations above and the
+`GetShortDescription()` method of each command class.
+
+| `Name` | Source file | Short description |
+| --- | --- | --- |
+| `help` | `Commands/HelpCommand.cs` | Show help. Default when no command is given. |
+| `prompt` | `Commands/PromptCommand.cs` | Enter an interactive REPL. |
+| `new` | `Commands/NewCommand.cs` | Generate a new solution from an ABP startup template. |
+| `update` | `Commands/UpdateCommand.cs` | Update Volo.* NuGet and `@abp/*` NPM packages. |
+| `add-package` | `Commands/AddPackageCommand.cs` | Add a single ABP NuGet/NPM package to a project. |
+| `add-module` | `Commands/AddModuleCommand.cs` | Add a multi-package ABP module to a solution. |
+| `list-templates` | `Commands/ListTemplatesCommand.cs` | List startup template names. |
+| `list-modules` | `Commands/ListModulesCommand.cs` | List installable ABP modules. |
+| `login` / `logout` / `login-info` | `Commands/Login*.cs` | abp.io credential management. |
+| `generate-proxy` / `remove-proxy` | `Commands/{Generate,Remove}ProxyCommand.cs` | Client proxy lifecycle. |
+| `suite` | `Commands/SuiteCommand.cs` | Install/run/update ABP Suite. |
+| `switch-to-stable` / `-preview` / `-nightly` / `-local` | `Commands/SwitchTo*.cs` | Swap NuGet sources for the current solution. |
+| `translate` | `Commands/TranslateCommand.cs` | Round-trip JSON localisation files. |
+| `build` | `Commands/BuildCommand.cs` | Incremental builder for ABP modules. |
+| `bundle` | `Commands/BundleCommand.cs` | Generate Blazor WASM / MAUI Blazor bundles. |
+| `install-libs` | `Commands/InstallLibsCommand.cs` | Refresh `wwwroot/libs` via NPM/Yarn. |
+| `clean` | `Commands/CleanCommand.cs` | Delete `bin/`, `obj/` and similar artefacts. |
+| `cli` | `Commands/CliCommand.cs` | Manage the `abp` global tool itself. |
+| `get-source` | `Commands/GetSourceCommand.cs` | Download an ABP module's source code. |
+| `clear-download-cache` | `Commands/ClearDownloadCacheCommand.cs` | Wipe `~/.abp/templates`. |
+| `create-migration-and-run-migrator` | `Commands/CreateMigrationAndRunMigratorCommand.cs` | Convenience flow for EF Core migrations + DbMigrator. |
+| `batch` | (handled by `CliService` directly) | Run a file of commands. |
+
+## How options are conventionally declared
+
+Most commands nest a `static class Options` to give every flag a typed
+short/long pair. From `AddPackageCommand`:
+
+```csharp
+public static class Options
+{
+    public static class Project          { public const string Short = "p";  public const string Long = "project";          }
+    public static class Solution         { public const string Short = "s";  public const string Long = "solution";         }
+    public static class AngularDirectory { public const string Short = "ad"; public const string Long = "angular-directory";}
+    public static class Version          { public const string Short = "v";  public const string Long = "version";          }
+    public static class SourceCode       {                                   public const string Long = "with-source-code"; }
+}
+```
+
+It is purely a documentation aid — the dictionary keys in `Options` are
+just strings — but reading a command file top-to-bottom is much easier
+when every flag has a stable identifier.
+
+## Execution scope and lifetime
+
+`CliService.RunInternalAsync` creates **one DI scope per command
+invocation**:
+
+```csharp
+private async Task RunInternalAsync(CommandLineArgs commandLineArgs)
+{
+    var commandType = CommandSelector.Select(commandLineArgs);
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var command = (IConsoleCommand)scope.ServiceProvider.GetRequiredService(commandType);
+        await command.ExecuteAsync(commandLineArgs);
+    }
+}
+```
+
+That means scoped dependencies (e.g. a fresh `IUnitOfWork`, a
+`ICurrentTenant` change) work correctly even when several commands run
+back-to-back in `prompt` or `batch` modes.
+
+## Writing a command
+
+Implementing a new command is a four-step process:
+
+1. **Implement `IConsoleCommand` + `ITransientDependency`.**
+2. **Expose a `public const string Name`** that becomes both the CLI verb
+   and the dictionary key.
+3. **Throw `CliUsageException` from `ExecuteAsync`** for any input error
+   — `CliService` catches it and logs `GetUsageInfo()` as a warning.
+4. **Register the command** into `AbpCliOptions.Commands` from your own
+   module.
+
+```csharp
+public class CountCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "count";
+
+    public ILogger<CountCommand> Logger { get; set; } = NullLogger<CountCommand>.Instance;
+
+    public async Task ExecuteAsync(CommandLineArgs args)
+    {
+        if (args.Target.IsNullOrEmpty())
+            throw new CliUsageException("Target folder is missing!" +
+                                        Environment.NewLine + GetUsageInfo());
+
+        var files = Directory.GetFiles(args.Target, "*.*", SearchOption.AllDirectories);
+        Logger.LogInformation($"{files.Length} files under {args.Target}");
+        await Task.CompletedTask;
+    }
+
+    public string GetUsageInfo() =>
+        "Usage:\n  abp count <folder>\n\nCounts files recursively.";
+
+    public string GetShortDescription() => "Count files under a folder.";
+}
+
+[DependsOn(typeof(AbpCliCoreModule))]
+public class MyExtensionsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext ctx)
+    {
+        Configure<AbpCliOptions>(o => o.Commands[CountCommand.Name] = typeof(CountCommand));
+    }
+}
+```
+
+Because the public `abp` tool is shipped as a sealed NuGet tool, you
+cannot add commands to the official binary. You can, however, build your
+own host that depends on `AbpCliCoreModule` and bundle your commands
+alongside — that is precisely what ABP Studio does.
+
+## Help and discovery
+
+`HelpCommand` enumerates `AbpCliOptions.Commands` to print the global
+help screen. Per-command help (`abp help <verb>`) resolves the type via
+`ICommandSelector` and prints `GetUsageInfo()`. There is no separate
+manifest or YAML — the help text lives inside each command's
+`GetUsageInfo()` method.
+
+## Gotchas
+
+- **Short vs long keys.** If a flag is documented as `-p|--project`,
+  always read it as `Options.GetOrNull("p", "project")` — never just
+  `Options["project"]`, because a user passing `-p` will leave that key
+  unset.
+- **`Target` vanishes after the first positional argument.** The parser
+  stores at most one `Target`. If you need multiple positional values,
+  put them after named options or split with commas.
+- **Unknown options are silently accepted.** The parser will happily set
+  `Options["typoo"] = "value"`; this is fine for forward compatibility
+  but means typos won't be flagged.
+- **Don't `return` from `ExecuteAsync` after writing to the console for
+  errors.** Always `throw new CliUsageException(...)` so the exit path
+  also dumps `GetUsageInfo()`.
+- **HelpCommand is the universal fallback.** If your command is missing
+  from `AbpCliOptions.Commands`, `abp my-command` looks like a no-op
+  that just prints help.
+
+## Cross-references
+
+- [CLI host (`Volo.Abp.Cli`)](./cli) — `Program.cs`, `CliService`,
+  Serilog, paths and URLs.
+- [`abp new`](./cli-new-command) — the most complex command in the
+  registry, dissected.
+- [`abp generate-proxy`](./cli-generate-proxy) — example of a command
+  that delegates to a registered generator via a second options
+  dictionary (`AbpCliServiceProxyOptions.Generators`).
+- [`abp suite`](./cli-suite) — a command that drives `dotnet tool` on
+  behalf of the user.
+- Official documentation:
+  [docs.abp.io/en/abp/latest/CLI](https://docs.abp.io/en/abp/latest/CLI).

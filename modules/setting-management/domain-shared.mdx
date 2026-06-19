@@ -1,0 +1,235 @@
+---
+title: "Volo.Abp.SettingManagement.Domain.Shared"
+description: "Constants, localization resources, and the SettingManagementFeatures group that every other setting-management package depends on."
+---
+
+The **Domain.Shared** package is the lowest layer in the module. It contains nothing executable beyond `LocalizableString`s and `FeatureDefinition`s — its job is to expose the *contract* that every higher layer (Domain, Application.Contracts, Web, Blazor) can reference without pulling in EF Core, MVC, or DDD plumbing.
+
+It depends on three framework modules:
+
+```csharp
+[DependsOn(typeof(AbpLocalizationModule),
+    typeof(AbpValidationModule),
+    typeof(AbpFeaturesModule))]
+public class AbpSettingManagementDomainSharedModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpSettingManagementDomainSharedModule>();
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Add<AbpSettingManagementResource>("en")
+                .AddBaseTypes(typeof(AbpValidationResource))
+                .AddVirtualJson("/Volo/Abp/SettingManagement/Localization/Resources/AbpSettingManagement");
+        });
+    }
+}
+```
+
+The dependency on `AbpFeaturesModule` is what allows the package to host `SettingManagementFeatureDefinitionProvider` *before* the Domain layer is loaded — Application.Contracts and the Web/Blazor UI packages can reference the feature names without dragging in repositories.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.Domain.Shared/
+└── Volo/Abp/SettingManagement/
+    ├── AbpSettingManagementDomainSharedModule.cs
+    ├── SettingConsts.cs
+    ├── SettingDefinitionRecordConsts.cs
+    ├── SettingManagementFeatureDefinitionProvider.cs
+    ├── SettingManagementFeatures.cs
+    └── Localization/
+        ├── AbpSettingManagementResource.cs
+        └── Resources/AbpSettingManagement/
+            ├── en.json
+            ├── de.json
+            ├── tr.json
+            └── ... (30+ locales)
+```
+
+## `SettingConsts` — column-length truths
+
+Every length limit applied by the EF Core or MongoDB model builders comes from `SettingConsts`. They are *settable static* properties so applications can override them before the model is built (typical in `PreConfigureServices`).
+
+```csharp
+public static class SettingConsts
+{
+    /// <summary>Default: 128</summary>
+    public static int MaxNameLength { get; set; } = 128;
+
+    /// <summary>Default: 2048</summary>
+    public static int MaxValueLength { get; set; } = 2048;
+
+    public static int MaxValueLengthValue { get; set; } = MaxValueLength;
+
+    /// <summary>Default: 64</summary>
+    public static int MaxProviderNameLength { get; set; } = 64;
+
+    /// <summary>Default: 64</summary>
+    public static int MaxProviderKeyLength { get; set; } = 64;
+}
+```
+
+`MaxValueLengthValue` is a runtime mirror of `MaxValueLength` that EF Core mutates at startup: when the model builder detects Oracle, it forces `MaxValueLengthValue = 2000` because Oracle's `NVARCHAR2` caps at 2000 characters. If you bump `MaxValueLength`, also update `MaxValueLengthValue` to match — the model builder only writes to `MaxValueLengthValue`.
+
+A gotcha around `ProviderKey`: the column is 64 chars, but the providers all pass `Guid.ToString()` (36 chars) or stringified user IDs. If you switch to a custom user-id format longer than 64 characters, raise `MaxProviderKeyLength` *before* the database is migrated.
+
+## `SettingDefinitionRecordConsts` — dynamic-store column lengths
+
+When the dynamic setting store is enabled (`SettingManagementOptions.IsDynamicSettingStoreEnabled = true`) and `SaveStaticSettingsToDatabase = true`, the `SettingDefinitionRecord` entity is persisted with these caps:
+
+```csharp
+public class SettingDefinitionRecordConsts
+{
+    public static int MaxNameLength { get; set; } = 128;
+    public static int MaxDisplayNameLength { get; set; } = 256;
+    public static int MaxDescriptionLength { get; set; } = 512;
+    public static int MaxDefaultValueLength { get; set; } = 256;
+    public static int MaxProvidersLength { get; set; } = 128;
+}
+```
+
+`Providers` is a comma-separated list of provider names (see `SettingDefinitionSerializer.SerializeProviders` in the Domain layer), so 128 characters allows about 25 of the two-letter provider names that ship in `Volo.Abp.Settings`. If you write a custom provider with a long name, expand `MaxProvidersLength` to match.
+
+`MaxDefaultValueLength` is intentionally smaller than `SettingConsts.MaxValueLength`. Default values are baked into code; if you need a 2 KB default consider storing it externally and referencing a path.
+
+## `SettingManagementFeatures` — the two feature keys
+
+```csharp
+public class SettingManagementFeatures
+{
+    public const string GroupName = "SettingManagement";
+
+    public const string Enable = GroupName + ".Enable";
+    public const string AllowChangingEmailSettings = GroupName + ".AllowChangingEmailSettings";
+}
+```
+
+These strings are referenced from at least five places downstream — keep them as `const` so the compiler can verify them in attributes like `[RequiresFeature(SettingManagementFeatures.Enable)]`.
+
+## `SettingManagementFeatureDefinitionProvider`
+
+```csharp
+public class SettingManagementFeatureDefinitionProvider : FeatureDefinitionProvider
+{
+    public override void Define(IFeatureDefinitionContext context)
+    {
+        var group = context.AddGroup(SettingManagementFeatures.GroupName,
+            L("Feature:SettingManagementGroup"));
+
+        var settingEnableFeature = group.AddFeature(
+            SettingManagementFeatures.Enable,
+            "true",
+            L("Feature:SettingManagementEnable"),
+            L("Feature:SettingManagementEnableDescription"),
+            new ToggleStringValueType(),
+            isAvailableToHost: false);
+
+        settingEnableFeature.CreateChild(
+            SettingManagementFeatures.AllowChangingEmailSettings,
+            "false",
+            L("Feature:AllowChangingEmailSettings"),
+            null,
+            new ToggleStringValueType(),
+            isAvailableToHost: false);
+    }
+}
+```
+
+Three things to notice:
+
+1. **Both features are `isAvailableToHost: false`.** The host is always treated as having `Enable = true` because `IFeatureChecker.IsEnabledAsync` short-circuits when no tenant is current. Tenants opt in (or are forced in by the host's edition).
+2. **`Enable` defaults to `"true"`, `AllowChangingEmailSettings` defaults to `"false"`.** A freshly provisioned tenant can see the timezone tab but not the email tab unless the host explicitly grants it. This protects shared SMTP infrastructure from accidental tenant-level overrides.
+3. **`AllowChangingEmailSettings` is a child of `Enable`.** Disabling `Enable` also disables the child — `IFeatureChecker.IsEnabledAsync(child)` walks up the parent chain.
+
+How downstream layers use these:
+
+* **Domain.Shared** itself only declares them.
+* **Application** (`EmailSettingsAppService.CheckFeatureAsync`) gates every `GetAsync`/`UpdateAsync`/`SendTestEmailAsync` call.
+* **Application.Contracts** uses them via `AllowChangingEmailSettingsFeatureSimpleStateChecker`, which is attached to the `Emailing` permission so the permission disappears for tenants that lack the feature.
+* **Web** and **Blazor** menu contributors call `RequireFeatures(SettingManagementFeatures.Enable)` so the navigation entry vanishes when disabled.
+* **Web Index page** has the class-level attribute `[RequiresFeature(SettingManagementFeatures.Enable)]`.
+* **Web/Blazor page contributors** (e.g. `EmailingPageContributor`) call `RequiredTenantSideFeatures(...)` to hide their tabs from tenants.
+
+## Localization
+
+`AbpSettingManagementResource` is an empty marker class:
+
+```csharp
+[LocalizationResourceName("AbpSettingManagement")]
+public class AbpSettingManagementResource
+{
+}
+```
+
+It's wired in the module's `Configure<AbpLocalizationOptions>` block as English-based, with `AbpValidationResource` as a base. `AddVirtualJson("/Volo/Abp/SettingManagement/Localization/Resources/AbpSettingManagement")` picks up every `.json` file embedded under that path — the resource pack ships dozens of language files (Arabic through Vietnamese).
+
+Two more layers extend the resource at *their* module level:
+
+* `AbpSettingManagementHttpApiModule` adds `AbpUiResource` as a base type (so validation messages localize properly in HTTP responses).
+* `AbpSettingManagementBlazorModule` also adds `AbpUiResource`.
+
+This is important when you embed your own resources: if you call `.Get<AbpSettingManagementResource>().AddBaseTypes(...)` in your module, it merges with the existing base list — it does not replace.
+
+### Key localization entries
+
+The `en.json` file you ship contains entries like:
+
+* `Settings` → the page title for the admin UI.
+* `Menu:Emailing`, `Menu:TimeZone` — used as tab headers by the page contributors.
+* `Feature:SettingManagementGroup`, `Feature:SettingManagementEnable`, `Feature:SettingManagementEnableDescription`, `Feature:AllowChangingEmailSettings` — surfaced by the feature management UI.
+* `Permission:SettingManagement`, `Permission:Emailing`, `Permission:EmailingTest`, `Permission:TimeZone` — surfaced by the permission management UI.
+* `TestEmailSubject` (formatted with a random number) and `TestEmailBody` — prefilled into the *Send test email* modal.
+* `SuccessfullySaved`, `SuccessfullySent` — user feedback after writes.
+* SMTP field labels (`SmtpHost`, `SmtpPort`, `SmtpUserName`, …) for the email tab form.
+
+### Adding a locale
+
+Drop a `de.json` (or whatever code) alongside the existing files in your application — anything under the embedded path will be merged after the module's own files because the application's virtual file set wins.
+
+## Virtual file system
+
+`Configure<AbpVirtualFileSystemOptions>` adds an `Embedded<AbpSettingManagementDomainSharedModule>` file set so the localization JSON files travel inside the assembly. If you fork the package and ship your own JSON, leave the `<EmbeddedResource>` MSBuild include in the `.csproj` intact:
+
+```xml
+<ItemGroup>
+  <EmbeddedResource Include="Volo\Abp\SettingManagement\Localization\Resources\**\*.json" />
+  <Content Remove="Volo\Abp\SettingManagement\Localization\Resources\**\*.json" />
+</ItemGroup>
+```
+
+If files are listed under `<Content>` they ship as physical files in `wwwroot`-style output, which the embedded virtual file set won't see.
+
+## Gotchas
+
+* **Don't reference `SettingDefinition` here.** The actual `SettingDefinition` type lives in `Volo.Abp.Settings` (framework). Domain.Shared exposes only the *records* (`SettingDefinitionRecordConsts`) and the *feature/permission names*. The persisted entity (`SettingDefinitionRecord`) lives in the Domain layer.
+* **Don't add `[DependsOn(typeof(AbpAuthorizationModule))]`** here. Permission definitions belong in Application.Contracts. Domain.Shared is meant to be safe for clients that have no notion of authorization (e.g. some non-web background workers).
+* **Setting columns are wider than they look.** Strings are stored in `nvarchar` — for SQL Server, 2048 chars consumes up to 4 KB on disk. If you persist large blobs (JSON snapshots), consider a separate `IRepository<TYourSetting>` instead of stuffing them into `Value`.
+* **`isAvailableToHost: false` is *not* the same as "host can't use the setting".** The host can still call `SettingManager.SetGlobalAsync(...)` even when the feature is host-disabled — the feature only governs the *UI* and the `[RequiresFeature]` decorations. Application services check it explicitly via `FeatureChecker.CheckEnabledAsync` for tenant calls.
+
+## Where each constant ends up
+
+Tracing a constant from `Domain.Shared` to runtime:
+
+| Constant | Declared in | Read by | Effect |
+| --- | --- | --- | --- |
+| `SettingConsts.MaxNameLength` | `SettingConsts.cs` | `SettingManagementDbContextModelBuilderExtensions.ConfigureSettingManagement` | `nvarchar(128)` on `AbpSettings.Name` |
+| `SettingConsts.MaxValueLengthValue` | `SettingConsts.cs` (Oracle override at startup) | same | `nvarchar(2048)` or `nvarchar(2000)` on Oracle |
+| `SettingDefinitionRecordConsts.MaxNameLength` | `SettingDefinitionRecordConsts.cs` | EF Core model builder + `SettingDefinitionRecord` constructor `Check.NotNullOrWhiteSpace(...)` | runtime validation + column length |
+| `SettingDefinitionRecordConsts.MaxProvidersLength` | same | model builder + serializer | caps the comma-joined provider list |
+| `SettingManagementFeatures.Enable` | `SettingManagementFeatures.cs` | `[RequiresFeature]` on the MVC index page, the Blazor index page, both menu contributors, and `EmailSettingsAppService.CheckFeatureAsync` | gates the whole UI for tenants |
+| `SettingManagementFeatures.AllowChangingEmailSettings` | same | `AllowChangingEmailSettingsFeatureSimpleStateChecker` + `EmailSettingsAppService.CheckFeatureAsync` | gates email-related operations for tenants |
+| `SettingManagementFeatures.GroupName` | same | `IFeatureDefinitionContext.AddGroup(...)` in the feature definition provider | logical group in the feature management UI |
+
+The `SettingConsts.MaxValueLengthValue` quirk deserves a final mention: it is *mutated* during EF Core model building when Oracle is detected. If the same process initializes multiple DbContexts targeting different providers, the *last* one wins for the entire AppDomain. Real-world deployments rarely hit this — but a side-by-side dev environment that warms both a SQLite test DB and an Oracle prod DB in the same process needs to pin the value via configuration before model building.
+
+## Cross-links
+
+* For how the framework consumes these constants in its read pipeline, see `framework/cross/settings`.
+* For the runtime classes that use `SettingConsts`/`SettingDefinitionRecordConsts`, see [Domain](/modules/setting-management/domain).
+* For how the `SettingManagementFeatures` keys are surfaced in HTTP services and UI gates, see [Application](/modules/setting-management/application) and [Web](/modules/setting-management/web).

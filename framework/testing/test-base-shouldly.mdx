@@ -1,0 +1,277 @@
+---
+title: "Shouldly testing patterns: ServiceCollection assertions in ABP"
+sidebarTitle: "Shouldly patterns"
+description: "ABP v7.4.0 ships no Volo.Abp.TestBase.Shouldly package — this page covers the ServiceCollectionShouldlyExtensions in framework/test/AbpTestBase and Shouldly idioms used internally."
+---
+
+<Note>
+  As of ABP v7.4.0 there is **no** `Volo.Abp.TestBase.Shouldly` NuGet package. Shouldly is added directly to test projects (`<PackageReference Include="Shouldly" />`) and ABP defines a single internal helper file — `framework/test/AbpTestBase/Microsoft/Extensions/DependencyInjection/ServiceCollectionShouldlyExtensions.cs` — that holds the `ShouldContainTransient`/`ShouldContainSingleton`/`ShouldContainScoped` assertions used across the framework's own test suite. This page documents that file plus the Shouldly idioms you'll see when reading ABP integration tests.
+</Note>
+
+## What's actually in the box
+
+```text framework/test/AbpTestBase/
+AbpTestBase.csproj
+Microsoft/Extensions/DependencyInjection/
+  ServiceCollectionShouldlyExtensions.cs
+Properties/AssemblyInfo.cs
+Volo/Abp/TestBase/Logging/
+  ICanLogOnObject.cs
+```
+
+`AbpTestBase.csproj` is referenced by the framework's own test projects and exposes one Shouldly helper class plus an `ICanLogOnObject` marker interface for in-memory log capture.
+
+## ServiceCollection assertions
+
+```csharp framework/test/AbpTestBase/Microsoft/Extensions/DependencyInjection/ServiceCollectionShouldlyExtensions.cs
+public static class ServiceCollectionShouldlyExtensions
+{
+    public static void ShouldContainTransient(this IServiceCollection services,
+        Type serviceType, Type implementationType = null)
+    {
+        var serviceDescriptor = services.FirstOrDefault(s => s.ServiceType == serviceType);
+
+        serviceDescriptor.ShouldNotBeNull();
+        serviceDescriptor.ImplementationType.ShouldBe(implementationType ?? serviceType);
+        serviceDescriptor.ImplementationFactory.ShouldBeNull();
+        serviceDescriptor.ImplementationInstance.ShouldBeNull();
+        serviceDescriptor.Lifetime.ShouldBe(ServiceLifetime.Transient);
+    }
+
+    public static void ShouldContainSingleton(this IServiceCollection services,
+        Type serviceType, Type implementationType = null) { /* ... same shape ... */ }
+
+    public static void ShouldContainScoped(this IServiceCollection services,
+        Type serviceType, Type implementationType = null) { /* ... same shape ... */ }
+
+    public static void ShouldContain(this IServiceCollection services,
+        Type serviceType, Type implementationType, ServiceLifetime lifetime) { /* ... */ }
+
+    public static void ShouldNotContainService(this IServiceCollection services, Type serviceType)
+    {
+        var serviceDescriptor = services.FirstOrDefault(s => s.ServiceType == serviceType);
+        serviceDescriptor.ShouldBeNull();
+    }
+}
+```
+
+Three properties matter:
+
+1. **First descriptor only** — `FirstOrDefault` means if a module registered both transient and singleton variants of the same `serviceType`, only the first wins this assertion. That's the right behavior because DI itself resolves the first descriptor.
+2. **Implementation type, not factory** — the assertions specifically check `ImplementationType` and assert factory/instance are null. They are useful for verifying *conventional* registrations (`AddTransient<T>()`); they fail for factory-based ones (`AddTransient<T>(sp => …)`). For factories, use `ShouldContain` and pass `null` for `implementationType` is not allowed — you'd write a manual assertion instead.
+3. **No support for keyed services** — v7.4.0 predates `[FromKeyedServices]` patterns; ABP's helpers assume unkeyed registrations.
+
+### Using them
+
+```csharp
+public class MyModule_Tests
+{
+    [Fact]
+    public void Module_Should_Register_Conventional_Services()
+    {
+        var services = new ServiceCollection();
+        new ServiceCollection().AddApplication<MyModule>();
+
+        services.ShouldContainTransient(typeof(IFooService), typeof(FooService));
+        services.ShouldContainSingleton(typeof(IBarCache), typeof(InMemoryBarCache));
+        services.ShouldContainScoped(typeof(ICurrentTenant), typeof(CurrentTenant));
+        services.ShouldNotContainService(typeof(ILegacyThing));
+    }
+}
+```
+
+## ICanLogOnObject
+
+```csharp framework/test/AbpTestBase/Volo/Abp/TestBase/Logging/ICanLogOnObject.cs
+public interface ICanLogOnObject
+{
+    List<string> Logs { get; }
+}
+```
+
+A capture sink interface — fake services implement it to collect emitted log lines in a `List<string>` that tests can assert against. Pattern:
+
+```csharp
+public class FakeNotifier : INotifier, ICanLogOnObject, ITransientDependency
+{
+    public List<string> Logs { get; } = new();
+
+    public Task NotifyAsync(string message)
+    {
+        Logs.Add(message);
+        return Task.CompletedTask;
+    }
+}
+
+[Fact]
+public async Task Should_Notify_Once()
+{
+    var notifier = GetRequiredService<INotifier>() as FakeNotifier;
+    await _useCase.RunAsync();
+    notifier.Logs.Count.ShouldBe(1);
+    notifier.Logs[0].ShouldContain("Order placed");
+}
+```
+
+## Shouldly idioms used across ABP tests
+
+The framework's own test projects use Shouldly heavily. The patterns to know:
+
+### Equality and reference
+
+```csharp
+result.ShouldNotBeNull();
+result.Id.ShouldBe(expectedId);
+result.ShouldBeOfType<BookDto>();
+result.ShouldBeSameAs(_cachedInstance);
+```
+
+### Collections
+
+```csharp
+books.ShouldNotBeEmpty();
+books.Count.ShouldBe(3);
+books.ShouldContain(b => b.Title == "The Hobbit");
+books.ShouldAllBe(b => b.Price > 0);
+```
+
+### Strings
+
+```csharp
+slug.ShouldStartWith("book-");
+html.ShouldContain("<title>Books</title>");
+error.Message.ShouldMatch(@"^Book with id [\w-]+ was not found$");
+```
+
+### Booleans
+
+```csharp
+result.IsValid.ShouldBeTrue();
+result.IsDeleted.ShouldBeFalse();
+```
+
+### Exceptions
+
+```csharp
+await Should.ThrowAsync<EntityNotFoundException>(async () =>
+    await _bookAppService.GetAsync(Guid.NewGuid()));
+
+var ex = Should.Throw<BusinessException>(() => _domain.Reject(input));
+ex.Code.ShouldBe("MyApp:Books:InvalidStatus");
+```
+
+### Async + retry
+
+```csharp
+await Should.CompleteIn(async () =>
+{
+    await _processor.ProcessAsync();
+}, TimeSpan.FromSeconds(5));
+```
+
+## Combining with AbpIntegratedTest
+
+A typical ABP-style domain test:
+
+```csharp
+public class BookManager_Tests : MyDomainTestBase
+{
+    private readonly BookManager _bookManager;
+    private readonly IRepository<Book, Guid> _repo;
+
+    public BookManager_Tests()
+    {
+        _bookManager = GetRequiredService<BookManager>();
+        _repo = GetRequiredService<IRepository<Book, Guid>>();
+    }
+
+    [Fact]
+    public async Task Should_Create_New_Book()
+    {
+        var book = await _bookManager.CreateAsync("The Hobbit", 19.99m);
+
+        book.ShouldNotBeNull();
+        book.Title.ShouldBe("The Hobbit");
+        book.Price.ShouldBe(19.99m);
+
+        var fromDb = await _repo.FindAsync(book.Id);
+        fromDb.ShouldNotBeNull();
+        fromDb.Title.ShouldBe("The Hobbit");
+    }
+
+    [Fact]
+    public async Task Should_Reject_Empty_Title()
+    {
+        var ex = await Should.ThrowAsync<ArgumentException>(async () =>
+            await _bookManager.CreateAsync("", 1m));
+
+        ex.ParamName.ShouldBe("title");
+    }
+}
+```
+
+The `Should.ThrowAsync<T>(Func<Task>)` overload is the right one for asserting against `await` calls — it preserves the test's async context and produces the original stack trace.
+
+## Snapshot assertions on options
+
+A common ABP-test pattern is verifying that a module configured an options class correctly:
+
+```csharp
+[Fact]
+public void Should_Configure_AbpAuditingOptions()
+{
+    var auditOptions = GetRequiredService<IOptions<AbpAuditingOptions>>().Value;
+    auditOptions.IsEnabled.ShouldBeTrue();
+    auditOptions.IgnoredTypes.ShouldContain(typeof(IgnoredEntity));
+    auditOptions.EntityHistorySelectors.ShouldContain(s => s.Name == "MySelector");
+}
+```
+
+You're going through `IOptions<T>.Value` — that triggers the same option-binding pipeline a real app uses.
+
+## Test counter
+
+```csharp framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/Utils/ITestCounter.cs
+public interface ITestCounter
+{
+    int Count { get; }
+    void Increment();
+}
+```
+
+Internal helper used by some ABP framework tests to verify side-effect counts (e.g., "event bus fired the handler exactly twice"). Register a counter-backed fake, run the scenario, assert `counter.Count.ShouldBe(2)`. Tiny but ubiquitous.
+
+## Gotchas
+
+<Warning>
+  `ShouldContainTransient(IFoo, FooImpl)` checks `ImplementationType == typeof(FooImpl)`. If your module registers via factory (`services.AddTransient<IFoo>(sp => new FooImpl(...))`) the assertion fails because `ImplementationType` is `null`. Use a manual `services.Any(s => …)` check instead.
+</Warning>
+
+<Warning>
+  `Should.ThrowAsync<T>(Func<Task>)` and `Should.Throw<T>(Action)` are different methods — using the sync variant on async code silently misses the exception. Always prefer the explicit `Async` overload for `await` calls.
+</Warning>
+
+<Warning>
+  `ICanLogOnObject` uses a non-thread-safe `List<string>`. If your code paths produce log entries concurrently (e.g., parallel event-bus handlers), wrap the access in a lock or use `ConcurrentBag` in your fake.
+</Warning>
+
+<Note>
+  Shouldly's diff output (`actual.ShouldBe(expected)` with two objects) uses `ToString()` by default. For DTOs without `ToString` overrides, the diff is uninformative — `JsonSerializer.Serialize(actual).ShouldBe(JsonSerializer.Serialize(expected))` is a fast workaround.
+</Note>
+
+## Cross-links
+
+<CardGroup cols={2}>
+  <Card title="TestBase fundamentals" icon="flask" href="/framework/testing/test-base">
+    AbpIntegratedTest and the lifecycle hooks.
+  </Card>
+  <Card title="Module lifecycle" icon="layer-group" href="/framework/core/modules">
+    What ShouldContainTransient is verifying about modules.
+  </Card>
+  <Card title="DI registrars" icon="puzzle-piece" href="/framework/di/registration">
+    Conventional registration patterns and assertions.
+  </Card>
+  <Card title="SMS test example" icon="comment-sms" href="/framework/messaging/sms">
+    Real Shouldly+AbpIntegratedTest test in the wild.
+  </Card>
+</CardGroup>

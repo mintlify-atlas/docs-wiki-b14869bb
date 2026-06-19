@@ -1,0 +1,284 @@
+---
+title: "Volo.Abp.SettingManagement.HttpApi"
+description: "MVC controllers that expose IEmailSettingsAppService and ITimeZoneSettingsAppService as REST endpoints under /api/setting-management/*."
+---
+
+The HTTP API package surfaces the module's two app services as conventional MVC controllers. It does not contain Razor Pages or view components — it is a pure REST surface. Web UIs (MVC and Blazor) bind to either these controllers or the generated static client proxies.
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcModule))]
+public class AbpSettingManagementHttpApiModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpSettingManagementHttpApiModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AbpSettingManagementResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+Two things worth highlighting:
+
+* **`AddApplicationPartIfNotExists`** registers the assembly with the MVC application-parts manager. Without this, the controllers would not be discovered if the host application uses `ConfigureApplicationPartManager` with a strict allow-list.
+* The localization resource gains `AbpUiResource` as a base, so validation messages (e.g. `[Range(1, 65535)]` failures on `SmtpPort`) localize correctly in JSON error responses.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.HttpApi/Volo/Abp/SettingManagement/
+├── AbpSettingManagementHttpApiModule.cs
+├── EmailSettingsController.cs
+└── TimeZoneSettingsController.cs
+```
+
+The package has only the two controllers — no DTOs or service classes. Those live in [Application.Contracts](/modules/setting-management/application-contracts).
+
+## `EmailSettingsController`
+
+```csharp
+[RemoteService(Name = SettingManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(SettingManagementRemoteServiceConsts.ModuleName)]
+[Route("api/setting-management/emailing")]
+public class EmailSettingsController : AbpControllerBase, IEmailSettingsAppService
+{
+    private readonly IEmailSettingsAppService _emailSettingsAppService;
+
+    public EmailSettingsController(IEmailSettingsAppService emailSettingsAppService)
+    {
+        _emailSettingsAppService = emailSettingsAppService;
+    }
+
+    [HttpGet]
+    public Task<EmailSettingsDto> GetAsync()
+        => _emailSettingsAppService.GetAsync();
+
+    [HttpPost]
+    public Task UpdateAsync(UpdateEmailSettingsDto input)
+        => _emailSettingsAppService.UpdateAsync(input);
+
+    [HttpPost("send-test-email")]
+    public Task SendTestEmailAsync(SendTestEmailInput input)
+        => _emailSettingsAppService.SendTestEmailAsync(input);
+}
+```
+
+### Routing
+
+| HTTP verb | Path | App service method | Authorization |
+| --- | --- | --- | --- |
+| `GET` | `/api/setting-management/emailing` | `GetAsync` | `SettingManagement.Emailing` (inherited from class-level `[Authorize]` on the app service) |
+| `POST` | `/api/setting-management/emailing` | `UpdateAsync` | `SettingManagement.Emailing` |
+| `POST` | `/api/setting-management/emailing/send-test-email` | `SendTestEmailAsync` | `SettingManagement.Emailing` + `SettingManagement.Emailing.Test` |
+
+The route prefix `api/setting-management` is fixed; there is no convention-based segment generation. If you host the module under a different URL, override the route via `Configure<AbpAspNetCoreMvcOptions>(opt => opt.ConventionalControllers.Create(...))` — but be aware that the static client proxies in `HttpApi.Client` hardcode the same paths.
+
+### Why a *controller* that just forwards?
+
+In ABP, application services can be exposed *directly* via auto-API-controllers (no explicit MVC controller needed) by registering them in `AbpAspNetCoreMvcOptions.ConventionalControllers`. The setting-management module instead ships *explicit* controllers because:
+
+1. **Stable, hand-written URLs** — `/send-test-email` reads cleanly; auto-API would generate `/send-test-email` from the method name but the explicit route is enforceable in tests.
+2. **`[Area]` decoration** — auto-controllers don't set an area, which causes route conflicts when multiple modules expose `…/test-email`-shaped endpoints.
+3. **`[RemoteService(Name = …)]`** — auto-controllers default to the assembly name as the remote-service name; the explicit attribute ties the controllers to the `RemoteServices:SettingManagement` configuration block.
+
+### `[RemoteService(Name = "SettingManagement")]`
+
+The attribute drives client-side resolution. The HTTP API client (`AbpSettingManagementHttpApiClientModule`) registers static proxies with the same name:
+
+```csharp
+context.Services.AddStaticHttpClientProxies(
+    typeof(AbpSettingManagementApplicationContractsModule).Assembly,
+    SettingManagementRemoteServiceConsts.RemoteServiceName
+);
+```
+
+`AbpHttpClientModule` then routes proxy calls to whichever `BaseUrl` is configured under `RemoteServices:SettingManagement:BaseUrl` (or, if absent, `RemoteServices:Default:BaseUrl`).
+
+### `[Area("settingManagement")]`
+
+The MVC Web module disables dynamic JS proxy generation for this area:
+
+```csharp
+Configure<DynamicJavaScriptProxyOptions>(options =>
+{
+    options.DisableModule(SettingManagementRemoteServiceConsts.ModuleName);
+});
+```
+
+The reason: the MVC UI ships a hand-written `Pages/SettingManagement/Index.js` plus `client-proxies/settingManagement-proxy.js`. The dynamic proxy generator (`abp.ServiceProxyGenerator`) would otherwise output a duplicate, larger JS file at `/abp/service-proxy?modules=settingManagement`.
+
+## `TimeZoneSettingsController`
+
+```csharp
+[RemoteService(Name = SettingManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(SettingManagementRemoteServiceConsts.ModuleName)]
+[Route("api/setting-management/timezone")]
+public class TimeZoneSettingsController : AbpControllerBase, ITimeZoneSettingsAppService
+{
+    private readonly ITimeZoneSettingsAppService _timeZoneSettingsAppService;
+
+    public TimeZoneSettingsController(ITimeZoneSettingsAppService timeZoneSettingsAppService)
+    {
+        _timeZoneSettingsAppService = timeZoneSettingsAppService;
+    }
+
+    [HttpGet]
+    public Task<string> GetAsync()
+        => _timeZoneSettingsAppService.GetAsync();
+
+    [HttpGet]
+    [Route("timezones")]
+    public Task<List<NameValue>> GetTimezonesAsync()
+        => _timeZoneSettingsAppService.GetTimezonesAsync();
+
+    [HttpPost]
+    public Task UpdateAsync(string timezone)
+        => _timeZoneSettingsAppService.UpdateAsync(timezone);
+}
+```
+
+| HTTP verb | Path | App service method | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/setting-management/timezone` | `GetAsync` | Returns a JSON-encoded string. |
+| `GET` | `/api/setting-management/timezone/timezones` | `GetTimezonesAsync` | Returns `List<NameValue>`. Pure compute — no DB hit. |
+| `POST` | `/api/setting-management/timezone` | `UpdateAsync(string timezone)` | The body must be a JSON-encoded string. |
+
+`UpdateAsync(string timezone)` accepts a bare string parameter. ABP's input formatter binds it from form data, query string, or JSON body. From `curl`:
+
+```bash
+curl -X POST https://localhost:44300/api/setting-management/timezone \
+  -H "Content-Type: application/json" \
+  -d '"Europe/London"' \
+  -H "Authorization: Bearer …"
+```
+
+Note the *quoted* JSON string in the body — `Europe/London` (without quotes) is not valid JSON and the request will fail with a 400.
+
+## Auth flow at the controller boundary
+
+The controllers don't carry `[Authorize]` attributes themselves; the *app services* (`EmailSettingsAppService`, `TimeZoneSettingsAppService`) do. The forwarding pattern means:
+
+1. The MVC pipeline matches the route.
+2. Model binding produces the DTO and runs DataAnnotations validation (e.g. `[Range(1, 65535)]`).
+3. The controller calls the app service method, which is *intercepted* by ABP's `AbpAuthorizationInterceptor`.
+4. The interceptor evaluates `[Authorize(...)]` on the app service class/method, including the `AllowChangingEmailSettingsFeatureSimpleStateChecker` on the `Emailing` permission.
+5. The interceptor evaluates `FeatureChecker.CheckEnabledAsync(...)` calls inside the methods (e.g. `CheckFeatureAsync()` in the email service).
+
+So a tenant without `AllowChangingEmailSettings` enabled gets a 403 from step 4 before any DB call happens.
+
+## OpenAPI / Swashbuckle
+
+The controllers participate in `AddAbpSwaggerGen` like any other MVC controller. The generated OpenAPI schema:
+
+* Includes `EmailSettingsDto`, `UpdateEmailSettingsDto`, `SendTestEmailInput`, and `List<NameValue>` as schemas.
+* Marks operations with the appropriate `Area` for grouping by tag.
+* Does **not** indicate the feature requirement — there is no standard OpenAPI mechanism for "endpoint disabled when feature off". The 403 response is the only signal.
+
+## Gotchas
+
+* **`Body` of `SendTestEmailInput` is optional but most SMTP servers reject blank bodies.** Pre-fill it in any custom UI to avoid silent test failures.
+* **`UpdateAsync` returns 204 No Content on success.** There is no echoed payload — re-fetch via `GetAsync` if your UI needs to refresh.
+* **Anti-forgery tokens.** The controllers inherit `AbpControllerBase`, which inherits ABP's anti-forgery defaults. `POST` requests from non-MVC clients (Blazor WebAssembly, MAUI) must include `RequestVerificationToken` headers via the HTTP API client — the proxies handle this automatically; raw HTTP calls do not.
+* **`[Route("api/setting-management/emailing")]` is *absolute*.** ABP's MVC convention does not prefix it again. If you host the API behind a path-rewriting proxy (`/setting-management/api/...`), use rewrite rules at the proxy, not at the controller.
+* **The controllers are *thin*.** Don't add business logic here — extend the app service instead. The controller-as-interface forwarding pattern means subclasses pick up changes automatically.
+
+## Request / response samples
+
+### `GET /api/setting-management/emailing`
+
+```http
+GET /api/setting-management/emailing HTTP/1.1
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs…
+__tenant: 7c7e8a3a-1d2b-4d4c-9c8b-2a8e1c0d3f4e
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "smtpHost": "smtp.contoso.com",
+  "smtpPort": 587,
+  "smtpUserName": "noreply",
+  "smtpPassword": "*****",
+  "smtpDomain": "",
+  "smtpEnableSsl": true,
+  "smtpUseDefaultCredentials": false,
+  "defaultFromAddress": "noreply@contoso.com",
+  "defaultFromDisplayName": "Contoso Notifications"
+}
+```
+
+The `__tenant` header (or a `?__tenant=…` query string, depending on the configured `ITenantResolver` chain) is what causes `ICurrentTenant` to be set inside `EmailSettingsAppService.GetAsync`. Without it the service runs as the host and the tenant-specific override path is skipped.
+
+### `POST /api/setting-management/emailing`
+
+```http
+POST /api/setting-management/emailing HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer …
+__tenant: 7c7e8a3a-…
+
+{
+  "smtpHost": "smtp.contoso.com",
+  "smtpPort": 587,
+  "smtpUserName": "noreply",
+  "smtpPassword": "NewS3cret!",
+  "smtpDomain": "",
+  "smtpEnableSsl": true,
+  "smtpUseDefaultCredentials": false,
+  "defaultFromAddress": "noreply@contoso.com",
+  "defaultFromDisplayName": "Contoso Notifications"
+}
+
+HTTP/1.1 204 No Content
+```
+
+### `POST /api/setting-management/emailing/send-test-email`
+
+```http
+POST /api/setting-management/emailing/send-test-email HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer …
+
+{
+  "senderEmailAddress": "noreply@contoso.com",
+  "targetEmailAddress": "admin@contoso.com",
+  "subject": "Test #4823",
+  "body": "Hello from the ABP setting management UI."
+}
+
+HTTP/1.1 204 No Content
+```
+
+A 403 here often means the caller has `Emailing` but not `Emailing.Test` — the child permission is granted independently.
+
+### `GET /api/setting-management/timezone/timezones`
+
+```json
+[
+  { "name": "(GMT) Coordinated Universal Time", "value": "UTC" },
+  { "name": "(GMT-08:00) Pacific Time (US & Canada)", "value": "America/Los_Angeles" },
+  { "name": "(GMT+00:00) London", "value": "Europe/London" },
+  …
+]
+```
+
+The endpoint is anonymous-friendly for performance — but `[Authorize(SettingManagementPermissions.TimeZone)]` on the app service still gates it. There is no caching layer at the controller; the underlying `TimeZoneHelper.GetTimezones(...)` recomputes on every call.
+
+## Cross-links
+
+* For the actual logic these endpoints invoke, see [Application](/modules/setting-management/application).
+* For the generated client proxies and the `RemoteServiceConsts` plumbing, see [HTTP API client](/modules/setting-management/http-api-client).
+* For how the MVC UI consumes these endpoints from JavaScript, see [Web (MVC)](/modules/setting-management/web).

@@ -1,0 +1,571 @@
+---
+title: "Account Web (Razor Pages)"
+description: "Razor Pages, view components and toolbar contributions that drive the browser-facing account UI."
+---
+
+`Volo.Abp.Account.Web` is the MVC / Razor Pages package that hosts the actual sign-in, register,
+forgot-password, reset-password and profile-management screens. It also adds the user menu
+("My account", "Logout") to whatever theme the host uses, plus a top-bar "Login" link rendered by
+`UserLoginLinkViewComponent` when the visitor is anonymous. The package can run side-by-side with
+the [OpenIddict variant](/modules/account/web-openiddict) or the IdentityServer variant — those
+packages do not replace the Razor Pages, they only override `LoginModel` to integrate with the
+authorization server.
+
+## File inventory
+
+```
+Volo.Abp.Account.Web/
+├── AbpAccountWebModule.cs                Module + ConfigureProfileManagementPage
+├── AbpAccountOptions.cs                  WindowsAuthenticationSchemeName
+├── AbpAccountUserMenuContributor.cs      "My account" + "Logout" menu items
+├── AccountModuleToolbarContributor.cs    "Login" toolbar link (anonymous-only)
+├── AbpAccountWebAutomapperProfile.cs
+├── Areas/Account/Controllers/            AJAX /api/account/login, /logout, /change-password
+├── Modules/Account/Components/Toolbar/UserLoginLink/
+├── Pages/Account/
+│   ├── AccountPageModel.cs               base class for all Razor pages
+│   ├── Login.cshtml(.cs) / Register.cshtml(.cs)
+│   ├── ForgotPassword.cshtml(.cs) / PasswordResetLinkSent.cshtml(.cs)
+│   ├── ResetPassword.cshtml(.cs) / ResetPasswordConfirmation.cshtml(.cs)
+│   ├── Logout.cshtml(.cs) / LoggedOut.cshtml(.cs) / AccessDenied.cshtml(.cs)
+│   ├── Manage.cshtml(.cs)
+│   └── Components/ProfileManagementGroup/{Password,PersonalInfo}/*.cs
+├── ProfileManagement/                    Contributor abstractions + default impl
+└── wwwroot/client-proxies/account-proxy.js
+```
+
+## Module declaration
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountApplicationContractsModule),
+    typeof(AbpIdentityAspNetCoreModule),
+    typeof(AbpAutoMapperModule),
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpExceptionHandlingModule))]
+public class AbpAccountWebModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+            options.AddAssemblyResource(typeof(AccountResource), typeof(AbpAccountWebModule).Assembly));
+
+        PreConfigure<IMvcBuilder>(mvc =>
+            mvc.AddApplicationPartIfNotExists(typeof(AbpAccountWebModule).Assembly));
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(o => o.FileSets.AddEmbedded<AbpAccountWebModule>());
+        Configure<AbpNavigationOptions>(o => o.MenuContributors.Add(new AbpAccountUserMenuContributor()));
+        Configure<AbpToolbarOptions>(o => o.Contributors.Add(new AccountModuleToolbarContributor()));
+
+        ConfigureProfileManagementPage();
+
+        context.Services.AddAutoMapperObjectMapper<AbpAccountWebModule>();
+        Configure<AbpAutoMapperOptions>(o => o.AddProfile<AbpAccountWebAutoMapperProfile>(validate: true));
+
+        Configure<DynamicJavaScriptProxyOptions>(o =>
+            o.DisableModule(AccountRemoteServiceConsts.ModuleName));
+    }
+
+    private void ConfigureProfileManagementPage()
+    {
+        Configure<RazorPagesOptions>(o => o.Conventions.AuthorizePage("/Account/Manage"));
+
+        Configure<ProfileManagementPageOptions>(o =>
+            o.Contributors.Add(new AccountProfileManagementPageContributor()));
+
+        Configure<AbpBundlingOptions>(o =>
+        {
+            o.ScriptBundles.Configure(typeof(ManageModel).FullName, c =>
+            {
+                c.AddFiles("/client-proxies/account-proxy.js");
+                c.AddFiles("/Pages/Account/Components/ProfileManagementGroup/Password/Default.js");
+                c.AddFiles("/Pages/Account/Components/ProfileManagementGroup/PersonalInfo/Default.js");
+            });
+        });
+    }
+
+    public override void PostConfigureServices(ServiceConfigurationContext context)
+    {
+        // Run-once: apply user entity extensions to the Manage form
+        ModuleExtensionConfigurationHelper.ApplyEntityConfigurationToUi(
+            IdentityModuleExtensionConsts.ModuleName,
+            IdentityModuleExtensionConsts.EntityNames.User,
+            editFormTypes: new[] { typeof(AccountProfilePersonalInfoManagementGroupViewComponent.PersonalInfoModel) }
+        );
+    }
+}
+```
+
+Highlights:
+
+- **`AbpIdentityAspNetCoreModule`** brings in the `SignInManager<IdentityUser>` and the
+  `IdentityErrorDescriber` that powers `.CheckErrors()` in the page handlers.
+- **`AbpAspNetCoreMvcUiThemeSharedModule`** ensures the Razor pages can use ABP's theme helpers
+  (`<abp-page>`, `<abp-card>`, alert tag-helpers).
+- **`Configure<RazorPagesOptions>(... AuthorizePage("/Account/Manage"))`** is the only auth
+  attribute the package declares — every other page is open by default. Login itself is anonymous so
+  you can `[AllowAnonymous]` only the Manage parent layout.
+- **Bundling.** The Manage page is paired with a script bundle keyed by `typeof(ManageModel).FullName`.
+  When the theme renders the page, ABP's bundling system collects every JS file in that bundle and
+  serves them as a single `account-manage.bundle.js`.
+
+## `AbpAccountOptions`
+
+```csharp
+public class AbpAccountOptions
+{
+    /// <summary>Default value: "Windows".</summary>
+    public string WindowsAuthenticationSchemeName { get; set; }
+
+    public AbpAccountOptions()
+    {
+        WindowsAuthenticationSchemeName = "Windows";
+    }
+}
+```
+
+The only knob is the *scheme name* used when discovering whether Windows / Negotiate authentication
+is configured. The Login page treats the scheme as a "special" external provider — it does not show
+a "DisplayName" and instead is rendered as a separate "Sign in with Windows" button. The OpenIddict
+variant has a dedicated `ProcessWindowsLoginAsync` that bypasses `SignInManager.ExternalLoginSignInAsync`
+and signs the user in through `HttpContext.SignInAsync(IdentityConstants.ExternalScheme, ...)`.
+
+## `AccountPageModel` (base class)
+
+```csharp
+public abstract class AccountPageModel : AbpPageModel
+{
+    public IAccountAppService AccountAppService { get; set; }
+    public SignInManager<IdentityUser> SignInManager { get; set; }
+    public IdentityUserManager UserManager { get; set; }
+    public IdentitySecurityLogManager IdentitySecurityLogManager { get; set; }
+    public IOptions<IdentityOptions> IdentityOptions { get; set; }
+    public IExceptionToErrorInfoConverter ExceptionToErrorInfoConverter { get; set; }
+
+    protected AccountPageModel()
+    {
+        LocalizationResourceType = typeof(AccountResource);
+        ObjectMapperContext = typeof(AbpAccountWebModule);
+    }
+
+    protected virtual void CheckIdentityErrors(IdentityResult identityResult)
+    {
+        if (!identityResult.Succeeded)
+            throw new UserFriendlyException("Operation failed: " +
+                identityResult.Errors.Select(e => $"[{e.Code}] {e.Description}").JoinAsString(", "));
+    }
+
+    protected virtual string GetLocalizeExceptionMessage(Exception exception)
+    {
+        if (exception is ILocalizeErrorMessage || exception is IHasErrorCode)
+            return ExceptionToErrorInfoConverter.Convert(exception, false).Message;
+        return exception.Message;
+    }
+}
+```
+
+Two virtual helpers are reused everywhere: **`CheckIdentityErrors`** converts `IdentityResult.Errors`
+into a single `UserFriendlyException` (the Pages render it via `Alerts.Danger`), and
+**`GetLocalizeExceptionMessage`** runs the exception through ABP's `IExceptionToErrorInfoConverter`
+when it implements `ILocalizeErrorMessage` or `IHasErrorCode` — that is how
+`BusinessException("Volo.Identity:ExternalUserPasswordChange")` shows up as a localized alert. The
+six dependencies are bound via ABP's property-injection (no constructor required).
+
+## `Login.cshtml.cs`
+
+### Inputs and state
+
+```csharp
+[BindProperty(SupportsGet = true)] public string ReturnUrl { get; set; }
+[BindProperty(SupportsGet = true)] public string ReturnUrlHash { get; set; }
+[BindProperty] public LoginInputModel LoginInput { get; set; }
+
+public bool EnableLocalLogin { get; set; }
+public IEnumerable<ExternalProviderModel> ExternalProviders { get; set; }
+public IEnumerable<ExternalProviderModel> VisibleExternalProviders =>
+    ExternalProviders.Where(x => !string.IsNullOrWhiteSpace(x.DisplayName));
+
+public bool IsExternalLoginOnly => EnableLocalLogin == false && ExternalProviders?.Count() == 1;
+public string ExternalLoginScheme => IsExternalLoginOnly ? ExternalProviders?.SingleOrDefault()?.AuthenticationScheme : null;
+```
+
+`IsExternalLoginOnly` deserves attention — if the operator turned off local login *and* exactly one
+external provider is configured, the GET handler short-circuits to a Challenge by calling
+`OnPostExternalLogin(ExternalProviders.First().AuthenticationScheme)` directly. Otherwise
+`OnGetAsync` populates `ExternalProviders` (via `IAuthenticationSchemeProvider`), reads
+`Abp.Account.EnableLocalLogin`, and renders `Login.cshtml`.
+
+### Password sign-in handler
+
+```csharp
+public virtual async Task<IActionResult> OnPostAsync(string action)
+{
+    await CheckLocalLoginAsync();
+    ValidateModel();
+
+    ExternalProviders = await GetExternalProviders();
+    EnableLocalLogin = await SettingProvider.IsTrueAsync(AccountSettingNames.EnableLocalLogin);
+    await ReplaceEmailToUsernameOfInputIfNeeds();
+    await IdentityOptions.SetAsync();
+
+    var result = await SignInManager.PasswordSignInAsync(
+        LoginInput.UserNameOrEmailAddress, LoginInput.Password,
+        LoginInput.RememberMe, lockoutOnFailure: true);
+
+    await IdentitySecurityLogManager.SaveAsync(new IdentitySecurityLogContext
+    {
+        Identity = IdentitySecurityLogIdentityConsts.Identity,
+        Action   = result.ToIdentitySecurityLogAction(),
+        UserName = LoginInput.UserNameOrEmailAddress
+    });
+
+    if (result.RequiresTwoFactor) return await TwoFactorLoginResultAsync();
+    if (result.IsLockedOut)  { Alerts.Warning(L["UserLockedOutMessage"]);     return Page(); }
+    if (result.IsNotAllowed) { Alerts.Warning(L["LoginIsNotAllowed"]);        return Page(); }
+    if (!result.Succeeded)   { Alerts.Danger(L["InvalidUserNameOrPassword"]); return Page(); }
+
+    return RedirectSafely(ReturnUrl, ReturnUrlHash);
+}
+```
+
+Important behaviours:
+
+- **`lockoutOnFailure: true`** counts the failed attempt against
+  `IdentityOptions.Lockout.MaxFailedAccessAttempts`.
+- **`ReplaceEmailToUsernameOfInputIfNeeds`** — if the input looks like a valid email and no user with
+  that *username* exists, replace it with the username belonging to that email. This is what lets a
+  user type either credential.
+- **`TwoFactorLoginResultAsync`** is `NotImplementedException` in the base — application templates
+  override the page model to redirect to a SendCode/VerifyCode flow.
+- **`RedirectSafely`** validates the `ReturnUrl` to prevent open-redirect attacks; it falls back to
+  `~/` if the URL is external and not registered in the app URL provider's whitelist.
+
+### External login
+
+```csharp
+public virtual async Task<IActionResult> OnPostExternalLogin(string provider)
+{
+    var redirectUrl = Url.Page("./Login", pageHandler: "ExternalLoginCallback",
+                               values: new { ReturnUrl, ReturnUrlHash });
+    var properties = SignInManager.ConfigureExternalAuthenticationProperties(provider, redirectUrl);
+    properties.Items["scheme"] = provider;
+    return await Task.FromResult(Challenge(properties, provider));
+}
+```
+
+When the upstream provider redirects back to `OnGetExternalLoginCallbackAsync`, the page calls
+`SignInManager.GetExternalLoginInfoAsync()` and then `ExternalLoginSignInAsync`. The result is
+handled in three branches:
+
+1. **Already linked** — `ExternalLoginSignInAsync` succeeds → `RedirectSafely(returnUrl, ...)`.
+2. **No email claim on the external identity** — `RedirectToPage("./Register", new { IsExternalLogin = true, ExternalLoginAuthSchema = loginInfo.LoginProvider, ReturnUrl })`,
+   forcing the user to supply an email before the local account is provisioned.
+3. **An existing local user owns that email** — auto-link via `UserManager.AddLoginAsync(user, loginInfo)`
+   and `SignInManager.SignInAsync(user, false)`.
+
+If no matching local user exists and the external identity provides an email, the protected
+`CreateExternalUserAsync(loginInfo)` provisions a fresh `IdentityUser`:
+
+```csharp
+protected virtual async Task<IdentityUser> CreateExternalUserAsync(ExternalLoginInfo info)
+{
+    await IdentityOptions.SetAsync();
+    var emailAddress = info.Principal.FindFirstValue(AbpClaimTypes.Email);
+    var user = new IdentityUser(GuidGenerator.Create(), emailAddress, emailAddress, CurrentTenant.Id);
+
+    CheckIdentityErrors(await UserManager.CreateAsync(user));
+    CheckIdentityErrors(await UserManager.SetEmailAsync(user, emailAddress));
+    CheckIdentityErrors(await UserManager.AddLoginAsync(user, info));
+    CheckIdentityErrors(await UserManager.AddDefaultRolesAsync(user));
+
+    user.Name    = info.Principal.FindFirstValue(AbpClaimTypes.Name);
+    user.Surname = info.Principal.FindFirstValue(AbpClaimTypes.SurName);
+
+    var phoneNumber = info.Principal.FindFirstValue(AbpClaimTypes.PhoneNumber);
+    if (!phoneNumber.IsNullOrWhiteSpace())
+    {
+        var phoneNumberConfirmed = string.Equals(
+            info.Principal.FindFirstValue(AbpClaimTypes.PhoneNumberVerified),
+            "true", StringComparison.InvariantCultureIgnoreCase);
+        user.SetPhoneNumber(phoneNumber, phoneNumberConfirmed);
+    }
+
+    await UserManager.UpdateAsync(user);
+    return user;
+}
+```
+
+The new user inherits *every* default role (those marked `IsDefault`), gets the email confirmed
+flag pulled from `phone_number_verified`, and is then signed in by the parent handler.
+
+## `Register.cshtml.cs`
+
+```csharp
+public virtual async Task<IActionResult> OnPostAsync()
+{
+    try
+    {
+        await CheckSelfRegistrationAsync();
+
+        if (IsExternalLogin)
+        {
+            var externalLoginInfo = await SignInManager.GetExternalLoginInfoAsync();
+            if (externalLoginInfo == null) return RedirectToPage("./Login");
+            await RegisterExternalUserAsync(externalLoginInfo, Input.EmailAddress);
+        }
+        else
+        {
+            await RegisterLocalUserAsync();
+        }
+
+        return Redirect(ReturnUrl ?? "~/");
+    }
+    catch (BusinessException e)
+    {
+        Alerts.Danger(GetLocalizeExceptionMessage(e));
+        return Page();
+    }
+}
+
+protected virtual async Task RegisterLocalUserAsync()
+{
+    ValidateModel();
+    var userDto = await AccountAppService.RegisterAsync(new RegisterDto
+    {
+        AppName = "MVC",
+        EmailAddress = Input.EmailAddress,
+        Password = Input.Password,
+        UserName = Input.UserName
+    });
+
+    var user = await UserManager.GetByIdAsync(userDto.Id);
+    await SignInManager.SignInAsync(user, isPersistent: true);
+}
+
+protected virtual async Task CheckSelfRegistrationAsync()
+{
+    if (!await SettingProvider.IsTrueAsync(AccountSettingNames.IsSelfRegistrationEnabled) ||
+        !await SettingProvider.IsTrueAsync(AccountSettingNames.EnableLocalLogin))
+    {
+        throw new UserFriendlyException(L["SelfRegistrationDisabledMessage"]);
+    }
+}
+```
+
+Note that the page-level `CheckSelfRegistrationAsync` requires **both** settings, while the
+[application service](/modules/account/application) only checks `IsSelfRegistrationEnabled`. Disabling
+`EnableLocalLogin` therefore hides the in-page form even if a host operator left self-registration
+on — a small belt-and-braces measure.
+
+The "external login completion" path calls `RegisterExternalUserAsync`, which creates a fresh
+`IdentityUser`, links the external login, and signs in with the explicit scheme.
+
+## `ForgotPassword.cshtml.cs`
+
+```csharp
+public virtual async Task<IActionResult> OnPostAsync()
+{
+    try
+    {
+        await AccountAppService.SendPasswordResetCodeAsync(
+            new SendPasswordResetCodeDto
+            {
+                Email = Email,
+                AppName = "MVC",
+                ReturnUrl = ReturnUrl,
+                ReturnUrlHash = ReturnUrlHash
+            }
+        );
+    }
+    catch (UserFriendlyException e)
+    {
+        Alerts.Danger(GetLocalizeExceptionMessage(e));
+        return Page();
+    }
+
+    return RedirectToPage("./PasswordResetLinkSent",
+        new { returnUrl = ReturnUrl, returnUrlHash = ReturnUrlHash });
+}
+```
+
+A `UserFriendlyException` here can be `Volo.Account:InvalidEmailAddress` — by default the page
+**discloses** that the email is unknown. To switch to an "always show 'email sent'" policy, swap
+`Alerts.Danger` for a redirect or catch & silently `return RedirectToPage(...)`.
+
+## `ResetPassword.cshtml.cs`
+
+```csharp
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    ValidateModel();
+    InvalidToken = !await AccountAppService.VerifyPasswordResetTokenAsync(
+        new VerifyPasswordResetTokenInput { UserId = UserId, ResetToken = ResetToken });
+    return Page();
+}
+
+public virtual async Task<IActionResult> OnPostAsync()
+{
+    try
+    {
+        ValidateModel();
+        await AccountAppService.ResetPasswordAsync(new ResetPasswordDto
+        {
+            UserId = UserId, ResetToken = ResetToken, Password = Password
+        });
+    }
+    catch (AbpIdentityResultException e)
+    {
+        if (!string.IsNullOrWhiteSpace(e.Message))
+        {
+            Alerts.Warning(GetLocalizeExceptionMessage(e));
+            return Page();
+        }
+        throw;
+    }
+    catch (AbpValidationException) { return Page(); }
+
+    return RedirectToPage("./ResetPasswordConfirmation",
+        new { returnUrl = ReturnUrl, returnUrlHash = ReturnUrlHash });
+}
+
+protected override void ValidateModel()
+{
+    if (!Equals(Password, ConfirmPassword))
+        ModelState.AddModelError("ConfirmPassword",
+            L["'{0}' and '{1}' do not match.", "ConfirmPassword", "Password"]);
+    base.ValidateModel();
+}
+```
+
+`OnGetAsync` calls `VerifyPasswordResetTokenAsync` to render an "InvalidToken" view before any
+password is typed. The page deliberately does **not** automatically sign the user in after a
+successful reset (see the `//TODO: Try to automatically login!` comment in source) — hosts that want
+that behaviour can override `OnPostAsync` and append a `SignInManager.PasswordSignInAsync` call
+before redirecting.
+
+## `Manage.cshtml.cs`
+
+```csharp
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    ProfileManagementPageCreationContext = new ProfileManagementPageCreationContext(ServiceProvider);
+
+    foreach (var contributor in Options.Contributors)
+        await contributor.ConfigureAsync(ProfileManagementPageCreationContext);
+
+    if (ReturnUrl != null &&
+        !Url.IsLocalUrl(ReturnUrl) &&
+        !ReturnUrl.StartsWith(UriHelper.BuildAbsolute(Request.Scheme, Request.Host, Request.PathBase).RemovePostFix("/")) &&
+        !AppUrlProvider.IsRedirectAllowedUrl(ReturnUrl))
+    {
+        ReturnUrl = null;
+    }
+
+    return Page();
+}
+```
+
+The Manage page is the **extension point** — every entry in
+`ProfileManagementPageOptions.Contributors` adds a tab. The default contributor
+(`AccountProfileManagementPageContributor`) registers two groups: "Password" (skipped when
+`user.IsExternal`, since external-only users have no local password) and "Personal info":
+
+```csharp
+if (await IsPasswordChangeEnabled(context))   // skip if user.IsExternal
+{
+    context.Groups.Add(new ProfileManagementPageGroup(
+        "Volo.Abp.Account.Password",
+        l["ProfileTab:Password"],
+        typeof(AccountProfilePasswordManagementGroupViewComponent)));
+}
+
+context.Groups.Add(new ProfileManagementPageGroup(
+    "Volo.Abp.Account.PersonalInfo",
+    l["ProfileTab:PersonalInfo"],
+    typeof(AccountProfilePersonalInfoManagementGroupViewComponent)));
+```
+
+Add your own tab — for example "Two-factor auth" — by implementing
+`IProfileManagementPageContributor`, registering the view component, and adding the contributor in
+your host module via `Configure<ProfileManagementPageOptions>(o => o.Contributors.Add(...))`.
+
+## Toolbar & user menu
+
+`AbpAccountUserMenuContributor` adds "My account" → `~/Account/Manage` and "Logout" →
+`~/Account/Logout` to the `StandardMenus.User` menu. The accompanying
+`AccountModuleToolbarContributor` injects a `UserLoginLinkViewComponent` into the main toolbar
+**only when the visitor is anonymous** — once signed in the user menu takes over:
+
+```csharp
+public class AccountModuleToolbarContributor : IToolbarContributor
+{
+    public virtual Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name != StandardToolbars.Main) return Task.CompletedTask;
+        if (!context.ServiceProvider.GetRequiredService<ICurrentUser>().IsAuthenticated)
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(UserLoginLinkViewComponent)));
+        return Task.CompletedTask;
+    }
+}
+```
+
+## `Logout.cshtml.cs`
+
+```csharp
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    await IdentitySecurityLogManager.SaveAsync(new IdentitySecurityLogContext
+    {
+        Identity = IdentitySecurityLogIdentityConsts.Identity,
+        Action   = IdentitySecurityLogActionConsts.Logout
+    });
+    await SignInManager.SignOutAsync();
+
+    if (ReturnUrl != null) return RedirectSafely(ReturnUrl, ReturnUrlHash);
+    if (await SettingProvider.IsTrueAsync(AccountSettingNames.EnableLocalLogin))
+        return RedirectToPage("/Account/Login");
+    return RedirectToPage("/");
+}
+```
+
+Logout is a `GET` (per the user-menu URL above). If local login is disabled, the page redirects to
+the root rather than back to a login form the user can't use.
+
+## Internal `AccountController` (Areas)
+
+`Areas/Account/Controllers/AccountController.cs` exposes a *separate* set of endpoints under
+`/api/account/login` and `/api/account/logout` that the bundled JavaScript proxy
+(`wwwroot/client-proxies/account-proxy.js`) uses for AJAX flows in the Manage page. It is NOT the
+same controller as the `Volo.Abp.Account.HttpApi.AccountController` (which lives at
+`/api/account/register` and friends). The two coexist because the Web project wants AJAX sign-in for
+its own JS components without depending on the HTTP API package.
+
+## Common gotchas
+
+1. **`AppName = "MVC"` is hard-coded in `Register.cshtml.cs` and `ForgotPassword.cshtml.cs`.** If you
+   register a custom app key, the password-reset link points at the wrong host. Subclass the page
+   model and override the value.
+2. **`Login.cshtml.cs` does not honour `SignInResult.RequiresTwoFactor` out of the box** — the base
+   throws `NotImplementedException`. The application templates ship a `LoginModel` override that
+   adds 2FA handling.
+3. **`Manage` requires authentication.** This is configured via the
+   `Conventions.AuthorizePage("/Account/Manage")` call in `ConfigureProfileManagementPage`, not via a
+   `[Authorize]` attribute on the class.
+4. **Adding a profile tab needs both a contributor and a `ScriptBundles` entry** if the tab needs
+   JavaScript. Otherwise the script will not be bundled into `typeof(ManageModel).FullName`'s output.
+5. **Replacing `LoginModel` requires `[ExposeServices(typeof(LoginModel))]`.** Both the OpenIddict and
+   IdentityServer variants do exactly this, and **only one** can be active at runtime — pick a host.
+
+## Cross-references
+
+- [application](/modules/account/application) — the services these pages call.
+- [web-openiddict](/modules/account/web-openiddict) — replacement `LoginModel` for OpenIddict hosts.
+- [Identity AspNetCore](/modules/identity/aspnetcore) — source of `SignInManager`,
+  `IdentitySecurityLogManager`, `IdentityErrorDescriber`.
+- [Theme Shared module](/framework/aspnetcore/theme-shared) — the Razor tag-helpers used in the
+  `.cshtml` files.
+- [Authorization flow](/flows/authorization-flow) — how the `[Authorize]` and `AuthorizePage`
+  conventions are evaluated.

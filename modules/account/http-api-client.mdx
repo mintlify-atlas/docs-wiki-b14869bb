@@ -1,0 +1,326 @@
+---
+title: "Account HTTP API Client"
+description: "Static client proxies that let non-MVC hosts call IAccountAppService and IProfileAppService over HTTP."
+---
+
+`Volo.Abp.Account.HttpApi.Client` is the package a Blazor WebAssembly, console, MAUI or worker
+process references to consume the [Account HTTP API](/modules/account/http-api) without depending
+on the server-side application implementation. It ships two pre-generated proxy classes —
+`AccountClientProxy` and `ProfileClientProxy` — that implement `IAccountAppService` and
+`IProfileAppService` respectively. They translate every interface method into an HTTP request through
+ABP's `IDynamicProxyHttpClientFactory`.
+
+## File inventory
+
+```
+Volo.Abp.Account.HttpApi.Client/
+├── Volo/Abp/Account/AbpAccountHttpApiClientModule.cs
+└── ClientProxies/Volo/Abp/Account/
+    ├── AccountClientProxy.cs              (user-editable partial)
+    ├── AccountClientProxy.Generated.cs    (regenerated)
+    ├── ProfileClientProxy.cs              (user-editable partial)
+    └── ProfileClientProxy.Generated.cs    (regenerated)
+```
+
+The `.Generated.cs` files are produced by the ABP CLI's `generate-proxy` command; the non-generated
+partials let you add hand-written methods (caching, retry policies, etc.) without losing edits on
+regeneration.
+
+## Module declaration
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountApplicationContractsModule),
+    typeof(AbpHttpClientModule))]
+public class AbpAccountHttpApiClientModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddStaticHttpClientProxies(typeof(AbpAccountApplicationContractsModule).Assembly,
+            AccountRemoteServiceConsts.RemoteServiceName);
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAccountHttpApiClientModule>();
+        });
+    }
+}
+```
+
+Two important calls:
+
+1. **`AddStaticHttpClientProxies(...)`** registers every type marked `[Dependency(ReplaceServices = true)]`
+   under the `Volo.Abp.Account.Application.Contracts` assembly with DI. The result is that any class
+   asking for `IAccountAppService` in a WASM host gets `AccountClientProxy`, not a missing-service
+   error. The second argument — `AccountRemoteServiceConsts.RemoteServiceName` (`"AbpAccount"`) — is
+   the name of the `RemoteServices` configuration section in `appsettings.json` whose `BaseUrl`
+   becomes the proxy's target.
+2. **Virtual file system** — embeds the package's strings (it ships an English JSON for any
+   client-side `AccountResource` lookups not provided by the server).
+
+The module depends only on `AbpAccountApplicationContractsModule` and `AbpHttpClientModule`, never on
+`AbpAccountApplicationModule`. That separation is what keeps Blazor WASM bundle size small — the
+application package and its EF Core/SQL dependencies are not pulled in.
+
+## `appsettings.json` configuration
+
+A consumer host typically configures the remote service like this:
+
+```json
+{
+  "RemoteServices": {
+    "Default": {
+      "BaseUrl": "https://api.mycorp.com/"
+    },
+    "AbpAccount": {
+      "BaseUrl": "https://identity.mycorp.com/"
+    }
+  }
+}
+```
+
+Without an `AbpAccount` entry, `Default` is used. Splitting the URL is useful when authentication
+endpoints live on a separate domain from the resource APIs.
+
+## Generated proxy classes
+
+### `AccountClientProxy`
+
+```csharp
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IAccountAppService), typeof(AccountClientProxy))]
+public partial class AccountClientProxy : ClientProxyBase<IAccountAppService>, IAccountAppService
+{
+    public virtual async Task<IdentityUserDto> RegisterAsync(RegisterDto input)
+    {
+        return await RequestAsync<IdentityUserDto>(nameof(RegisterAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(RegisterDto), input }
+        });
+    }
+
+    public virtual async Task SendPasswordResetCodeAsync(SendPasswordResetCodeDto input)
+    {
+        await RequestAsync(nameof(SendPasswordResetCodeAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(SendPasswordResetCodeDto), input }
+        });
+    }
+
+    public virtual async Task<bool> VerifyPasswordResetTokenAsync(VerifyPasswordResetTokenInput input)
+    {
+        return await RequestAsync<bool>(nameof(VerifyPasswordResetTokenAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(VerifyPasswordResetTokenInput), input }
+        });
+    }
+
+    public virtual async Task ResetPasswordAsync(ResetPasswordDto input)
+    {
+        await RequestAsync(nameof(ResetPasswordAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(ResetPasswordDto), input }
+        });
+    }
+}
+```
+
+### `ProfileClientProxy`
+
+```csharp
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IProfileAppService), typeof(ProfileClientProxy))]
+public partial class ProfileClientProxy : ClientProxyBase<IProfileAppService>, IProfileAppService
+{
+    public virtual async Task<ProfileDto> GetAsync()
+        => await RequestAsync<ProfileDto>(nameof(GetAsync));
+
+    public virtual async Task<ProfileDto> UpdateAsync(UpdateProfileDto input)
+        => await RequestAsync<ProfileDto>(nameof(UpdateAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(UpdateProfileDto), input }
+        });
+
+    public virtual async Task ChangePasswordAsync(ChangePasswordInput input)
+        => await RequestAsync(nameof(ChangePasswordAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(ChangePasswordInput), input }
+        });
+}
+```
+
+### How method-name lookup works
+
+`ClientProxyBase<TService>.RequestAsync` reads the API description model (downloaded once and
+cached) and finds the action whose method name matches `nameof(RegisterAsync)`. The description model
+carries the HTTP verb, the route template, the parameter binding sources (body vs route vs query),
+and the response type — which is why the controller and the proxy stay in sync as long as the route
+table doesn't break the convention.
+
+When the cached API description is stale (server controller changed) you must regenerate the proxies
+via `abp generate-proxy -t csharp`. The CLI only rewrites the `.Generated.cs` files, leaving your
+hand-edits in `AccountClientProxy.cs` untouched.
+
+## Hand-written partials
+
+```csharp
+// AccountClientProxy.cs
+namespace Volo.Abp.Account;
+
+public partial class AccountClientProxy
+{
+}
+
+// ProfileClientProxy.cs
+namespace Volo.Abp.Account;
+
+public partial class ProfileClientProxy
+{
+}
+```
+
+The shipped partials are empty — they exist so you can add behaviour without conflicting with the
+generated code. Common additions:
+
+- **Retry/circuit-breaker.** Wrap `RequestAsync` in `Polly` policies.
+- **Local caching.** Override `GetAsync` on `ProfileClientProxy` to return a cached `ProfileDto`
+  invalidated when `UpdateAsync` returns; useful in Blazor WASM where the profile is rendered in a
+  top-bar component on every page.
+- **Tenant injection.** Read a tenant from local state and append the `__tenant` header before the
+  call.
+
+Example:
+
+```csharp
+public partial class ProfileClientProxy
+{
+    private ProfileDto? _cached;
+
+    public override async Task<ProfileDto> GetAsync()
+    {
+        return _cached ??= await base.GetAsync();
+    }
+
+    public override async Task<ProfileDto> UpdateAsync(UpdateProfileDto input)
+    {
+        var result = await base.UpdateAsync(input);
+        _cached = result;
+        return result;
+    }
+}
+```
+
+Be careful with caching in long-running Blazor circuits — pair it with an event subscription so a
+profile change in another tab invalidates the cache.
+
+## Authentication
+
+The proxy package itself does not configure authentication. The host is expected to register a
+delegating handler (`AbpHttpClientAuthenticationOptions`) that adds an `Authorization: Bearer ...`
+header on every outgoing request:
+
+```csharp
+// Program.cs of a Blazor WASM host
+builder.Services.AddOidcAuthentication(options => { /* OIDC settings */ });
+builder.Services.AddTransient<BearerAuthorizationMessageHandler>();
+builder.Services.AddHttpClient("AbpAccount", c => c.BaseAddress = new Uri("https://identity.mycorp.com/"))
+    .AddHttpMessageHandler<BearerAuthorizationMessageHandler>();
+```
+
+The Account endpoints needed for the **anonymous** flow (register, password reset) can be called
+without a bearer token; ABP's pipeline still attempts to add one if the user is signed in, but
+returns happily if there isn't one.
+
+The `ProfileController` endpoints require a valid principal because `ProfileAppService` is
+`[Authorize]`. A 401 surfaces in the client as `AbpRemoteCallException` with `HttpStatusCode = 401`.
+
+## Multi-tenancy
+
+`AbpRemoteCallApiDescriptionProvider` honors any `__tenant` header set by the host. In a WASM
+application using `Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme`, the tenant resolution
+middleware on the *server* side reads either the cookie or the header. Set both during the bootstrap
+sign-in to keep the same tenant across browser tabs.
+
+## Wiring example — Blazor WebAssembly
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountHttpApiClientModule),       // <-- adds the proxies
+    typeof(AbpAccountApplicationContractsModule), // already transitively required
+    typeof(AbpAspNetCoreComponentsWebAssemblyModule),
+    typeof(AbpAutofacWebAssemblyModule)
+)]
+public class MyAppHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        context.Services.AddHttpClient("AbpAccount", c =>
+        {
+            c.BaseAddress = new Uri(configuration["RemoteServices:AbpAccount:BaseUrl"]!);
+        });
+    }
+}
+```
+
+After this, any component can simply ask for the contract:
+
+```razor
+@inject IAccountAppService AccountService
+
+<EditForm Model="_dto" OnValidSubmit="OnRegisterAsync">
+    ...
+</EditForm>
+
+@code {
+    private readonly RegisterDto _dto = new() { AppName = "BlazorWasm" };
+
+    private async Task OnRegisterAsync()
+    {
+        var user = await AccountService.RegisterAsync(_dto);
+        Navigation.NavigateTo("/login");
+    }
+}
+```
+
+DI resolves `IAccountAppService` to `AccountClientProxy`, which posts to
+`https://identity.mycorp.com/api/account/register`.
+
+## Gotchas
+
+1. **`AppName` must match an entry in the server's `AppUrlOptions.Applications`.** When the Blazor
+   WASM host triggers a password reset with `AppName = "BlazorWasm"`, the server must have
+   `options.Applications["BlazorWasm"].Urls[AccountUrlNames.PasswordReset] = "..."` registered.
+   Otherwise `AppUrlProvider.GetResetPasswordUrlAsync` throws and the user sees an error.
+2. **Static proxies vs dynamic proxies.** ABP also supports *dynamic* HTTP proxies via
+   `AddHttpClientProxies`. The Account module ships the static flavour; if you accidentally call
+   `AddHttpClientProxies(typeof(AbpAccountApplicationContractsModule).Assembly, "AbpAccount")` it
+   will register a second, conflicting registration.
+3. **Token-handler scope.** A bearer token attached by a delegating handler is the *user's* token;
+   the password-reset endpoint is anonymous and runs cross-tenant. If your delegating handler
+   throws when there is no signed-in user, register a variant that no-ops on anonymous requests.
+4. **`AbpRemoteCallException`** wraps every non-2xx response. The wrapped `Error` is the same
+   `RemoteServiceErrorInfo` ABP produces server-side — so localized messages survive the round
+   trip.
+5. **HEAD-only health probes don't work.** ABP's client proxy always sends the verb declared in the
+   API description (always `POST` for Account endpoints). Use a separate health-check controller.
+
+## Customization checklist
+
+- Add Polly retry: override `RequestAsync` in the partial.
+- Override route base: don't (use config); the proxy honors `RemoteServices:AbpAccount:BaseUrl`.
+- Disable a single endpoint: subclass and throw `NotSupportedException`; remember to register the
+  override with `[Dependency(ReplaceServices = true)]`.
+- Strong-typed extra properties: `RegisterDto` is `ExtensibleObject` — call
+  `.SetProperty(name, value)` before posting; the server's `MapExtraPropertiesTo(user)` will pick
+  them up.
+
+## Cross-references
+
+- [http-api](/modules/account/http-api) — the controllers these proxies target.
+- [application-contracts](/modules/account/application-contracts) — DTO/interface definitions used
+  by both sides.
+- [Dynamic HTTP proxy flow](/flows/dynamic-http-proxy) — internals of `IDynamicProxyHttpClientFactory`
+  and the API description model.
+- [blazor](/modules/account/blazor) — the Blazor WASM/Server UI that consumes these proxies.

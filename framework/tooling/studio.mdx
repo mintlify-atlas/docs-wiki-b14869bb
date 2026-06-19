@@ -1,0 +1,263 @@
+---
+title: "ABP Studio"
+description: "ABP Studio — the cross-platform desktop app and CLI that sits next to the abp tool, what it ships, and how it reuses Volo.Abp.Cli.Core under the hood."
+---
+
+ABP Studio is the next-generation tooling for ABP solutions. It is **not
+part of the open-source `abp` package** and its source code does not
+live in the `abpframework/abp` repository — it ships as a separate
+desktop installer and CLI binary from [abp.io](https://abp.io). This
+page summarises what Studio is, how it relates to the `abp` CLI and the
+ABP framework, and where to go for the official docs.
+
+> This page is intentionally lighter than the others in this section
+> because the implementation sits in a closed repository. The cross-cuts
+> with `Volo.Abp.Cli.Core` are real, however, and worth knowing.
+
+## What ABP Studio is
+
+ABP Studio bundles three things:
+
+1. **A desktop application** (Electron + .NET) that visualises a
+   solution graph, creates new solutions, scaffolds entities and CRUD
+   pages, runs builds and tests, and manages modules. The UI is the
+   successor to ABP Suite.
+2. **A CLI** (`abp-studio` or, on most installs, `abp` itself when the
+   Studio installer registers it as a tool override) that exposes most
+   of the same workflows as commands you can run in CI or in a
+   terminal.
+3. **A licensing/sign-in flow** tied to the same abp.io account that
+   powers `abp login`, `abp suite` and the commercial templates.
+
+ABP Studio is the recommended starting point for new commercial ABP
+projects. For the open-source flow, the original `abp` global tool
+documented in [CLI host](./cli) remains fully supported.
+
+## File inventory (from the OSS repo)
+
+There is **no `Studio/` folder in `abpframework/abp`**. The integration
+points are limited to:
+
+```text
+framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/
+├── CliConsts.cs       # DocsLink = "https://docs.abp.io"
+├── CliUrls.cs         # WwwAbpIo + AccountAbpIo
+├── Auth/AuthService.cs # OAuth password grant — shared with Studio
+└── Commands/SuiteCommand.cs  # The pattern Studio's installer mimics
+```
+
+Anything more specific (`Volo.Abp.Studio.*`) lives in private
+repositories and is shipped only through `nuget.abp.io` to authenticated
+customers.
+
+## Relationship to the open-source `abp` CLI
+
+The `Volo.Abp.Cli.Core` library — the same one that defines
+`AbpCliCoreModule`, `IConsoleCommand`, `ICommandSelector`,
+`AbpCliOptions.Commands`, the `ServiceProxying` generators and the
+`Bundling`, `LIbs`, `ProjectBuilding`, `ProjectModification` services —
+**is reused by ABP Studio**. Specifically:
+
+- Studio embeds `AbpCliCoreModule` so it can resolve and invoke the
+  same `NewCommand`, `AddPackageCommand`, `AddModuleCommand`,
+  `BundleCommand`, `InstallLibsCommand`, `GenerateProxyCommand`
+  classes that you reach from the `abp` global tool.
+- Studio's "Run DbMigrator" action shells out to the same console
+  project documented in [DbMigrator](./dbmigrator).
+- Studio's "Generate proxy" panel posts the user input into the same
+  `GenerateProxyArgs` structure that `ProxyCommandBase` builds.
+- Studio's login state is persisted in the same
+  `~/.abp/cli/access-token.bin` blob (see `CliPaths` in [CLI host](./cli)),
+  so `abp login` and "Sign in" inside Studio share credentials.
+
+This means that adopting Studio does not require giving up the CLI: the
+same NuGet sources, the same `nuget.abp.io` API key, the same
+`access-token.bin`, the same templates.
+
+## Studio's own CLI verbs
+
+When the Studio installer is present, an `abp studio …` verb dispatches
+into Studio-specific workflows. As of v7.4 the publicly-documented
+verbs include:
+
+- **`abp studio new`** — same as `abp new`, but defaults to Studio's
+  project layout and offers the new "Solution Templates" gallery.
+- **`abp studio open`** — opens a solution inside the desktop app.
+- **`abp studio build`** — Studio's incremental builder (caches across
+  Visual Studio / Rider builds).
+- **`abp studio run`** — launches everything described by the solution
+  graph (web hosts, gateways, microservices, Angular dev server,
+  Tye/Aspire-style).
+
+These verbs are not registered in `AbpCliOptions.Commands` in the OSS
+codebase; they are registered by Studio's own module that depends on
+`AbpCliCoreModule`. The dispatch mechanism is identical to the pattern
+described in [Command registry](./cli-commands).
+
+You can confirm Studio is on `PATH` by running:
+
+```bash
+abp studio --help
+```
+
+If you see `'studio' is not a recognised command`, you have the OSS
+`abp` tool but not Studio; see the Studio install guide on
+[docs.abp.io](https://docs.abp.io/en/abp-studio/latest/).
+
+## How Studio installs
+
+Just like ABP Suite, the Studio bits are shipped as a global .NET tool.
+The Studio desktop UI is a separate Electron installer that downloads
+the tool on first run. Internally, the install command boils down to:
+
+```bash
+dotnet tool install -g Volo.Abp.Studio.Cli \
+    --add-source https://nuget.abp.io/<your-private-key>/v3/index.json
+```
+
+The `<your-private-key>` part is fetched from `account.abp.io` after
+login — the same flow as `abp suite install` (see [`abp suite`](./cli-suite)).
+That is why `abp login` is a prerequisite for Studio.
+
+## File and configuration layout
+
+Studio reuses much of the open-source CLI's layout:
+
+| Path | Owner | Purpose |
+| --- | --- | --- |
+| `~/.abp/cli/access-token.bin` | Shared | OAuth access token. Refreshed on login. |
+| `~/.abp/cli/computer-id.bin` | Shared | Stable per-machine ID for license activation. |
+| `~/.abp/templates/` | Shared | Cached solution templates. |
+| `~/.abp/studio/` | Studio | Workspace state, recent solutions, editor settings. |
+| `~/.abp/cli/logs/abp-cli-logs.txt` | Shared | Serilog output (both Studio and CLI append here). |
+
+Anything not under `~/.abp/studio/` is shared with the open-source CLI
+— uninstalling Studio doesn't invalidate the access token, and
+upgrading the CLI doesn't break Studio's recent-solutions list.
+
+## What Studio adds beyond the CLI
+
+The differentiators (as of v7.4) are:
+
+- **Solution graph view.** Visualises module dependencies, including
+  cross-project `[DependsOn]` chains, EF Core DbContext mapping,
+  Angular ↔ HTTP API binding.
+- **Integrated terminal & build cache.** Reuses `dotnet build /m`
+  output across reboots; the open-source CLI does not cache.
+- **CRUD page generator with live preview.** The successor to
+  Suite's generator: same JSON entity descriptor that `abp suite
+  generate -e <file>.json` consumes (see [`abp suite`](./cli-suite)).
+- **Solution Wizard.** Drives `NewCommand` with a richer flag set than
+  the CLI exposes — for example, microservice templates can be
+  configured visually.
+- **Integrated debugging & telemetry.** Surfaces logs and metrics from
+  every host in one place.
+- **Built-in tunneling / proxy.** Useful for local OAuth callbacks
+  against `account.abp.io`.
+
+What it does **not** add: any new framework primitive. ABP Studio is
+strictly a tooling layer; runtime modules (`Volo.Abp.*`) are unchanged.
+
+## Programmatic embedding (advanced)
+
+Because the heavy lifting lives in `Volo.Abp.Cli.Core`, you can build
+your own tool that mimics Studio's behaviour:
+
+```csharp
+[DependsOn(typeof(AbpCliCoreModule), typeof(AbpAutofacModule))]
+public class MyToolModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpCliOptions>(options =>
+        {
+            options.Commands["mytool-run"] = typeof(MyRunCommand);
+        });
+    }
+}
+
+public class MyRunCommand : IConsoleCommand, ITransientDependency
+{
+    private readonly NewCommand _new;
+    private readonly AddModuleCommand _addModule;
+    private readonly InstallLibsCommand _installLibs;
+
+    public MyRunCommand(NewCommand @new, AddModuleCommand addModule,
+                        InstallLibsCommand installLibs)
+    {
+        _new = @new; _addModule = addModule; _installLibs = installLibs;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs args)
+    {
+        await _new.ExecuteAsync(new CommandLineArgs("new", "Acme.Studio"));
+        await _addModule.ExecuteAsync(new CommandLineArgs("add-module", "Volo.Blogging"));
+        await _installLibs.ExecuteAsync(new CommandLineArgs("install-libs"));
+    }
+
+    public string GetUsageInfo() => "Usage: mytool-run";
+    public string GetShortDescription() => "Composite Studio-like flow.";
+}
+```
+
+Studio is essentially "this script, but inside a polished desktop UI."
+
+## Studio vs Suite
+
+Studio supersedes Suite for new projects, but Suite remains supported.
+Practical differences:
+
+| Capability | ABP Suite | ABP Studio |
+| --- | --- | --- |
+| CRUD page generator | ✅ | ✅ (richer preview) |
+| Solution wizard | Limited | Full |
+| Solution graph | ❌ | ✅ |
+| Multi-runtime debugging | ❌ | ✅ |
+| Background services dashboard | ❌ | ✅ |
+| Headless CLI for CI | `abp suite generate -e …` | `abp studio generate …` |
+| Open source backend? | No (commercial) | No (commercial) |
+
+Both share the `nuget.abp.io` API key and `~/.abp/cli/access-token.bin`.
+
+## Gotchas
+
+- **Studio is commercial.** You need an ABP commercial subscription to
+  install it. The OSS `abp` tool is unaffected.
+- **`abp studio` shadows the OSS verb if both are installed.** If you
+  scripted around `abp <something>` and Studio has registered the same
+  verb, Studio wins. Use explicit paths in CI scripts:
+  `~/.dotnet/tools/abp` for the OSS tool, `~/.dotnet/tools/abp-studio`
+  for Studio's CLI alias.
+- **Token sharing can surprise you.** Logging out from Studio also
+  invalidates `abp suite` and `abp add-module` against commercial
+  modules — they share the same token file.
+- **Templates cache is shared.** Studio and `abp new` both pull from
+  `~/.abp/templates`. If you upgraded Studio and CLI templates seem
+  stale, run `abp clear-download-cache` (see
+  [Command registry](./cli-commands)).
+- **Studio does not vendor `Volo.Abp.Cli.Core`.** It picks up whatever
+  version was published; pin both with `dotnet tool update -g
+  Volo.Abp.Cli` and the Studio installer in sync to avoid mismatched
+  command signatures.
+- **The desktop app uses Electron.** Linux users need an X server or
+  Wayland socket; SSH-tunnelled X works but is sluggish. The CLI half
+  of Studio runs headless and is the recommended path for CI.
+
+## Cross-references
+
+- [CLI host](./cli) — the OSS `abp` tool whose internals Studio
+  reuses.
+- [Command registry](./cli-commands) — pattern for registering Studio's
+  own commands.
+- [`abp new`](./cli-new-command) — the verb behind Studio's "Create new
+  solution" wizard.
+- [`abp add-package` / `add-module`](./cli-add-package) — what Studio's
+  "Add module" / "Add package" panels call into.
+- [`abp suite`](./cli-suite) — predecessor to Studio for CRUD
+  generation.
+- [DbMigrator](./dbmigrator) — what Studio's "Run DbMigrator" button
+  launches.
+- Official ABP Studio documentation:
+  [docs.abp.io/en/abp-studio/latest](https://docs.abp.io/en/abp-studio/latest).
+- ABP product pages: [abp.io](https://abp.io),
+  [commercial.abp.io](https://commercial.abp.io).

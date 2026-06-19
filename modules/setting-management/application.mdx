@@ -1,0 +1,246 @@
+---
+title: "Volo.Abp.SettingManagement.Application"
+description: "EmailSettingsAppService and TimeZoneSettingsAppService — the only two app services the module exposes — plus the SettingManagementAppServiceBase pattern."
+---
+
+The Application layer holds two thin app services that implement the contracts declared in [Application.Contracts](/modules/setting-management/application-contracts). It does not expose generic CRUD for `Setting` rows — clients are expected to interact with settings through these two narrow services, the framework's `ISettingProvider` (read-only), or server-side via `ISettingManager`.
+
+```csharp
+[DependsOn(
+    typeof(AbpDddApplicationModule),
+    typeof(AbpSettingManagementDomainModule),
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpEmailingModule),
+    typeof(AbpTimingModule))]
+public class AbpSettingManagementApplicationModule : AbpModule
+{
+}
+```
+
+The dependencies on `AbpEmailingModule` and `AbpTimingModule` are what give the services access to `IEmailSender` (for the test-email button) and `ITimezoneProvider` (for the dropdown of valid IANA zones).
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.Application/Volo/Abp/SettingManagement/
+├── AbpSettingManagementApplicationModule.cs
+├── EmailSettingsAppService.cs
+├── SettingManagementAppServiceBase.cs
+└── TimeZoneSettingsAppService.cs
+```
+
+## `SettingManagementAppServiceBase`
+
+```csharp
+public abstract class SettingManagementAppServiceBase : ApplicationService
+{
+    protected SettingManagementAppServiceBase()
+    {
+        ObjectMapperContext = typeof(AbpSettingManagementApplicationModule);
+        LocalizationResource = typeof(AbpSettingManagementResource);
+    }
+}
+```
+
+Two assignments matter:
+
+* **`ObjectMapperContext`** binds `IObjectMapper` resolution to the module's own AutoMapper profile (registered downstream in the Web/Blazor layers). The Application layer itself doesn't ship a profile; if you write a custom contributor for the admin UI, it inherits the same context.
+* **`LocalizationResource`** makes `L["…"]` calls inside derived classes resolve against `AbpSettingManagementResource` automatically — useful for `BusinessException` messages thrown from a custom service.
+
+## `EmailSettingsAppService`
+
+```csharp
+[Authorize(SettingManagementPermissions.Emailing)]
+public class EmailSettingsAppService : SettingManagementAppServiceBase, IEmailSettingsAppService
+{
+    protected ISettingManager SettingManager { get; }
+    protected IEmailSender EmailSender { get; }
+
+    public EmailSettingsAppService(ISettingManager settingManager, IEmailSender emailSender)
+    {
+        SettingManager = settingManager;
+        EmailSender = emailSender;
+    }
+    // ...
+}
+```
+
+`[Authorize(SettingManagementPermissions.Emailing)]` is on the class itself, so every method inherits it; `SendTestEmailAsync` adds `[Authorize(SettingManagementPermissions.EmailingTest)]` as an extra gate.
+
+### `GetAsync` — mix of inherited and overridden values
+
+```csharp
+public virtual async Task<EmailSettingsDto> GetAsync()
+{
+    await CheckFeatureAsync();
+
+    var settingsDto = new EmailSettingsDto
+    {
+        SmtpHost = await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.Host),
+        SmtpPort = Convert.ToInt32(await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.Port)),
+        SmtpUserName = await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.UserName),
+        SmtpPassword = await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.Password),
+        SmtpDomain = await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.Domain),
+        SmtpEnableSsl = Convert.ToBoolean(await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.EnableSsl)),
+        SmtpUseDefaultCredentials = Convert.ToBoolean(await SettingProvider.GetOrNullAsync(EmailSettingNames.Smtp.UseDefaultCredentials)),
+        DefaultFromAddress = await SettingProvider.GetOrNullAsync(EmailSettingNames.DefaultFromAddress),
+        DefaultFromDisplayName = await SettingProvider.GetOrNullAsync(EmailSettingNames.DefaultFromDisplayName),
+    };
+
+    if (CurrentTenant.IsAvailable)
+    {
+        settingsDto.SmtpHost = await SettingManager.GetOrNullForTenantAsync(EmailSettingNames.Smtp.Host, CurrentTenant.GetId(), false);
+        settingsDto.SmtpUserName = await SettingManager.GetOrNullForTenantAsync(EmailSettingNames.Smtp.UserName, CurrentTenant.GetId(), false);
+        settingsDto.SmtpPassword = await SettingManager.GetOrNullForTenantAsync(EmailSettingNames.Smtp.Password, CurrentTenant.GetId(), false);
+        settingsDto.SmtpDomain = await SettingManager.GetOrNullForTenantAsync(EmailSettingNames.Smtp.Domain, CurrentTenant.GetId(), false);
+    }
+
+    return settingsDto;
+}
+```
+
+The flow:
+
+1. Read every field via `SettingProvider` (the framework's read-only resolver). This returns the *effective* value with all fallback in place. Default values, configuration overrides, and decryption are applied automatically.
+2. If a tenant is in scope, **overwrite four fields** (`SmtpHost`, `SmtpUserName`, `SmtpPassword`, `SmtpDomain`) with values fetched via `SettingManager.GetOrNullForTenantAsync(..., fallback: false)`. The `false` is critical — it returns `null` when the tenant has no override, so the UI can show "inheriting" vs. "overridden" semantics for these four fields.
+
+`SmtpPort`, `SmtpEnableSsl`, `SmtpUseDefaultCredentials`, `DefaultFromAddress` and `DefaultFromDisplayName` are *not* overwritten — they always show the effective value. The historical reason: ports and TLS flags rarely vary per tenant, and the default-from fields are required (the UI would render empty).
+
+`Convert.ToInt32(null)` returns 0 and `Convert.ToBoolean(null)` returns false, so freshly seeded tenants see plausible defaults rather than null reference exceptions.
+
+### `UpdateAsync` — `SetForTenantOrGlobalAsync`
+
+```csharp
+public virtual async Task UpdateAsync(UpdateEmailSettingsDto input)
+{
+    await CheckFeatureAsync();
+
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Host, input.SmtpHost);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Port, input.SmtpPort.ToString());
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.UserName, input.SmtpUserName);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Password, input.SmtpPassword);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.Domain, input.SmtpDomain);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.EnableSsl, input.SmtpEnableSsl.ToString());
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.Smtp.UseDefaultCredentials, input.SmtpUseDefaultCredentials.ToString().ToLowerInvariant());
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.DefaultFromAddress, input.DefaultFromAddress);
+    await SettingManager.SetForTenantOrGlobalAsync(CurrentTenant.Id, EmailSettingNames.DefaultFromDisplayName, input.DefaultFromDisplayName);
+}
+```
+
+`SetForTenantOrGlobalAsync(tenantId, name, value)` lives in `TenantSettingManagerExtensions`:
+
+```csharp
+public static Task SetForTenantOrGlobalAsync(this ISettingManager settingManager, Guid? tenantId, ...)
+{
+    if (tenantId.HasValue)
+    {
+        return settingManager.SetForTenantAsync(tenantId.Value, name, value, forceToSet);
+    }
+    return settingManager.SetGlobalAsync(name, value);
+}
+```
+
+So writing as the host updates the global row; writing as a tenant updates the tenant row. The "set value equals fallback => delete" rule in `SettingManager.SetAsync` still applies: if a tenant submits the form unchanged, the underlying rows might be *deleted* rather than rewritten, because the saved value matches the global fallback.
+
+Two formatting quirks:
+
+* **`SmtpPort.ToString()`** uses the current culture by default. For numeric port values this is safe, but custom integer settings should use `ToString(CultureInfo.InvariantCulture)`.
+* **`SmtpUseDefaultCredentials.ToString().ToLowerInvariant()`** — explicit lower-casing because some downstream parsers (e.g. JavaScript `Boolean(...)`) treat `"True"` as truthy and `"False"` as truthy too (any non-empty string is truthy). The `ToggleStringValueType` and framework boolean parsers compare against `"true"`/`"false"` case-insensitively, but the value stored in the DB is now `"true"`/`"false"` lower-cased, which is what the UI expects to read back.
+
+### `SendTestEmailAsync`
+
+```csharp
+[Authorize(SettingManagementPermissions.EmailingTest)]
+public virtual async Task SendTestEmailAsync(SendTestEmailInput input)
+{
+    await CheckFeatureAsync();
+    await EmailSender.SendAsync(input.SenderEmailAddress, input.TargetEmailAddress, input.Subject, input.Body);
+}
+```
+
+The sender is `IEmailSender`, configured by `AbpEmailingModule`. It reads the *current effective* email settings via `ISettingProvider` — meaning if you `UpdateAsync` and *immediately* call `SendTestEmailAsync` in the same HTTP request, the test uses the new values because the value cache is unit-of-work-aware (`considerUow: true` inside `SettingManagementStore`).
+
+### `CheckFeatureAsync`
+
+```csharp
+protected virtual async Task CheckFeatureAsync()
+{
+    await FeatureChecker.CheckEnabledAsync(SettingManagementFeatures.Enable);
+    if (CurrentTenant.IsAvailable)
+    {
+        await FeatureChecker.CheckEnabledAsync(SettingManagementFeatures.AllowChangingEmailSettings);
+    }
+}
+```
+
+`CheckEnabledAsync` throws an `AbpAuthorizationException` (mapped to HTTP 403) when the feature is off. The host is allowed even without the feature because `FeatureChecker` short-circuits when `CurrentTenant.Id == null`. This is the **second** enforcement layer for `AllowChangingEmailSettings`; the first is the permission's state checker, which removes the permission entirely. If you bypass the permission system, the feature check still fires.
+
+## `TimeZoneSettingsAppService`
+
+```csharp
+[Authorize(SettingManagementPermissions.TimeZone)]
+public class TimeZoneSettingsAppService : SettingManagementAppServiceBase, ITimeZoneSettingsAppService
+{
+    protected ISettingManager SettingManager { get; }
+    protected ITimezoneProvider TimezoneProvider { get; }
+
+    public TimeZoneSettingsAppService(ISettingManager settingManager, ITimezoneProvider timezoneProvider) { ... }
+
+    public virtual async Task<string> GetAsync()
+    {
+        if (CurrentTenant.GetMultiTenancySide() == MultiTenancySides.Host)
+        {
+            return await SettingManager.GetOrNullGlobalAsync(TimingSettingNames.TimeZone);
+        }
+
+        return await SettingManager.GetOrNullForCurrentTenantAsync(TimingSettingNames.TimeZone);
+    }
+
+    public virtual Task<List<NameValue>> GetTimezonesAsync()
+    {
+        return Task.FromResult(TimeZoneHelper.GetTimezones(TimezoneProvider.GetWindowsTimezones()));
+    }
+
+    public virtual async Task UpdateAsync(string timezone)
+    {
+        if (CurrentTenant.GetMultiTenancySide() == MultiTenancySides.Host)
+        {
+            await SettingManager.SetGlobalAsync(TimingSettingNames.TimeZone, timezone);
+        }
+        else
+        {
+            await SettingManager.SetForCurrentTenantAsync(TimingSettingNames.TimeZone, timezone);
+        }
+    }
+}
+```
+
+The timezone service is intentionally *not* feature-gated — `TimingSettingNames.TimeZone` is core to the framework's `IClock` and disabling it would make the UI useless. It is still permission-gated (`SettingManagementPermissions.TimeZone`).
+
+The shape of `GetTimezonesAsync` is a `List<NameValue>` (framework type — `Volo.Abp.NameValue` from `Volo.Abp.Core`). `Value` is the IANA timezone ID (e.g. `Europe/London`); `Name` is a Windows display name converted by `TimeZoneHelper.GetTimezones`. The helper merges OS-native data with a curated mapping so identifiers work cross-platform.
+
+### Why two read paths instead of `SettingProvider.GetOrNullAsync`?
+
+Note that this service uses `ISettingManager.GetOrNullForCurrentTenantAsync`, not `ISettingProvider`. The reason is the same as for the email service — the UI wants to show the *override* explicitly. A tenant that hasn't set its own timezone should see "(inherited from host)" rather than the host's value silently filling in.
+
+## Wire-up
+
+Both services register automatically because `[Authorize]` triggers `ApplicationService` conventional registration. They are reachable via:
+
+* The HTTP API controllers in [`Volo.Abp.SettingManagement.HttpApi`](/modules/setting-management/http-api).
+* The static client proxies in [`Volo.Abp.SettingManagement.HttpApi.Client`](/modules/setting-management/http-api-client).
+* Direct DI injection — your own services can `IEmailSettingsAppService` for tooling like data-seeders, with the caveat that `[Authorize]` still fires unless you set up `AlwaysAllowAuthorizationOverride`.
+
+## Gotchas
+
+* **Bool serialization mismatch.** `SmtpUseDefaultCredentials` is stored lower-cased but `SmtpEnableSsl` is stored title-cased (`"True"`/`"False"`) because the code path goes `input.SmtpEnableSsl.ToString()` without `.ToLowerInvariant()`. Both round-trip through `Convert.ToBoolean(...)` fine, but if you compare raw `Setting.Value` strings, normalize.
+* **`SendTestEmailAsync` uses the live `IEmailSender`.** That sender is constructed with the *current* settings — if you've used `[UnitOfWork]` to wrap the call in a transaction, the cache uses the unit-of-work-staged values, but the SMTP socket is opened immediately and will send out before the transaction commits. Don't rely on rollback to "un-send" a test email.
+* **No bulk write API.** Each setting is a separate `await SettingManager.SetForTenantOrGlobalAsync(...)`, each of which opens its own `[UnitOfWork]` block on the store. For nine fields this is nine round-trips to the database. Wrap the whole `UpdateAsync` in an outer `[UnitOfWork]` (or rely on the ambient one from the HTTP request) so they all share a transaction.
+* **`CurrentTenant.GetId()` throws when no tenant.** The `GetAsync` method guards with `if (CurrentTenant.IsAvailable)` before calling it. If you copy this pattern, keep the guard — `GetId()` is the throwing variant.
+* **`SettingProvider` is the *framework* provider, not the management one.** Inside the app services, `SettingProvider` (inherited from `ApplicationService`) reads via the layered `ISettingValueProvider` chain. `SettingManager` writes through the corresponding `ISettingManagementProvider` chain. Don't mix the two on the same field within a single operation.
+
+## Cross-links
+
+* For the underlying DTO shapes, see [Application.Contracts](/modules/setting-management/application-contracts).
+* For the `ISettingManager` extension methods used here (`SetForTenantOrGlobalAsync`, `GetOrNullForCurrentTenantAsync`, `SetGlobalAsync`), see [Domain](/modules/setting-management/domain).
+* For the framework-level `SettingProvider` and `EmailSettingNames`, see `framework/cross/settings` and `framework/messaging/emailing`.

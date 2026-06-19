@@ -1,0 +1,296 @@
+---
+title: "Volo.Abp.FeatureManagement.Blazor.Server: Blazor Server theming shim"
+sidebarTitle: "Blazor Server"
+description: "The thin Blazor Server packaging module — depends on AbpFeatureManagementBlazorModule plus AbpAspNetCoreComponentsServerThemingModule. Why this exists separately from the Blazor WASM variant and what differs at the integration boundary."
+---
+
+`Volo.Abp.FeatureManagement.Blazor.Server` is the smallest interesting package in the module. It contains exactly one class — the module shim — and exists to compose the shared Blazor UI (`AbpFeatureManagementBlazorModule`) with the Blazor *Server* hosting model.
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementBlazorModule),
+    typeof(AbpAspNetCoreComponentsServerThemingModule))]
+public class AbpFeatureManagementBlazorServerModule : AbpModule
+{
+}
+```
+
+That is the entire content of `AbpFeatureManagementBlazorServerModule.cs`. There is no `ConfigureServices`, no options, no extra services. The dependencies do all the work:
+
+- `AbpFeatureManagementBlazorModule` — the shared UI (FeatureManagementModal, FeatureSettingManagementComponent, contributors, localization). See [blazor](/modules/feature-management/blazor).
+- `AbpAspNetCoreComponentsServerThemingModule` — the Blazor Server flavour of the theming abstractions (`ABlazoriseThemeManager`, the `_Host.cshtml`-side wiring, the Razor Component routes).
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `AbpFeatureManagementBlazorServerModule.cs` | Module class — depends on Blazor UI module + Server theming. |
+
+That's it. No additional `.razor` files, no `.cshtml`, no static assets beyond what the dependencies provide.
+
+## Why the package exists
+
+Blazor has two hosting models:
+
+- **Blazor Server** — components run on the ASP.NET Core server; UI updates are pushed over a SignalR circuit.
+- **Blazor WebAssembly** — components run in the browser; all I/O happens over HTTP.
+
+The framework's theming abstractions split along the same axis:
+
+| Theming module | Hosting model |
+| --- | --- |
+| `Volo.Abp.AspNetCore.Components.Server.Theming` | Blazor Server |
+| `Volo.Abp.AspNetCore.Components.WebAssembly.Theming` | Blazor WebAssembly |
+
+Each delivers a different `Volo.Abp.AspNetCore.Components.Theming` implementation (icons, theming, layout selection). A Feature Management Blazor UI in Server mode needs the Server theming module; in WASM mode it needs the WASM theming module. Rather than pollute the shared `AbpFeatureManagementBlazorModule` with both, the framework provides two paper-thin host-specific packaging modules:
+
+| Package | Adds |
+| --- | --- |
+| `Volo.Abp.FeatureManagement.Blazor.Server` | `AbpAspNetCoreComponentsServerThemingModule`. |
+| `Volo.Abp.FeatureManagement.Blazor.WebAssembly` | `AbpAspNetCoreComponentsWebAssemblyThemingModule` + `AbpFeatureManagementHttpApiClientModule`. |
+
+A Blazor Server host references the `Server` package; a Blazor WASM host references the `WebAssembly` package. Both transitively pull in `AbpFeatureManagementBlazorModule`.
+
+## What Blazor Server gives the modal
+
+The `AbpFeatureManagementBlazorServerModule` dependency on `AbpAspNetCoreComponentsServerThemingModule` provides:
+
+| Service | Role |
+| --- | --- |
+| Server-side theme manager | Lets the modal pick up the host's chosen theme (Basic, LeptonX, …) for things like icon registration, toast service binding. |
+| `_Host.cshtml` integration | The standard `_Host.cshtml` includes the theme's CSS/JS bundles which the modal relies on (Blazorise CSS, Bootstrap 5). |
+| Circuit-aware exception handling | When the modal throws inside `OpenAsync`/`SaveAsync`, the framework's `AbpComponentBase.HandleErrorAsync` displays a toast via `IUiMessageService` — the Server theming module wires the messaging service for an active circuit. |
+
+In Blazor Server the modal runs entirely on the server. `IFeatureAppService` is the in-proc `FeatureAppService` (assuming the host references `AbpFeatureManagementApplicationModule` — typical for Blazor Server). No HTTP hop, direct `IFeatureManager.SetAsync` calls.
+
+## Typical host module composition
+
+A Blazor Server host's module class:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiLeptonXThemeBundlingModule),   // theme
+    typeof(AbpFeatureManagementBlazorServerModule),         // feature mgmt UI (Server flavour)
+    typeof(AbpFeatureManagementApplicationModule),          // feature mgmt application
+    typeof(AbpFeatureManagementEntityFrameworkCoreModule),  // feature mgmt persistence
+    typeof(AbpTenantManagementBlazorServerModule),
+    typeof(AbpAuditLoggingEntityFrameworkCoreModule),
+    // ... etc
+)]
+public class MyBlazorServerModule : AbpModule { /* ... */ }
+```
+
+Two things to notice:
+
+- The Application + EF Core modules are referenced directly, not through HTTP. Blazor Server is co-located with the data.
+- `AbpFeatureManagementBlazor*Server*Module` is referenced — not the WebAssembly variant. They conflict (different theming implementations).
+
+A Blazor *WebAssembly* host's module class would instead reference `AbpFeatureManagementBlazorWebAssemblyModule`, and the application-side modules would live in a separate API host.
+
+## Cache reset on save in Server vs. WASM
+
+Both flavours call `ICurrentApplicationConfigurationCacheResetService.ResetAsync()` after `FeatureAppService.UpdateAsync` (see [blazor](/modules/feature-management/blazor)). The concrete implementations differ:
+
+| Mode | Reset behaviour |
+| --- | --- |
+| Blazor Server | Server-side `ConfigurationCacheResetService` invalidates the per-user in-memory cache of `ApplicationConfigurationDto`. The next `BlazorComponent.OnInitializedAsync` re-fetches it. |
+| Blazor WASM | `localStorage`-backed cache reset; next `HttpClient` call to `/api/abp/application-configuration` refreshes the SPA's permission/feature view. |
+
+The shared modal code is the same. The dispatch difference is in the DI registration done by the theming module.
+
+## Composition with Setting Management
+
+The Blazor module registers `FeatureSettingManagementComponentContributor` (see [blazor](/modules/feature-management/blazor)). In a Blazor Server host the contributor runs on the server during component construction; the permission check (`IAuthorizationService.IsGrantedAsync(ManageHostFeatures)`) hits the locally registered authorization handler. In Blazor WASM the same contributor runs in the browser; the permission check reads claims from the locally-cached principal (no extra HTTP).
+
+The contributor itself is identical between flavours — only the *execution context* differs.
+
+## Connection-lifetime considerations (Blazor Server only)
+
+Blazor Server hosts the modal inside a SignalR circuit. If the circuit drops mid-save (network glitch), the user sees a "Reconnecting…" overlay and the modal state is preserved. After reconnect, the `OpenAsync`/`SaveAsync` Task continues from where it was — provided the server kept the circuit state in memory.
+
+If the circuit was disposed (e.g. the host restarted), the modal's in-memory `Groups`/`ToggleValues` state is lost. The user must reopen the modal. This is a Blazor Server fact-of-life, not specific to Feature Management.
+
+## What if you reference both Server and WebAssembly?
+
+The framework's module loader will throw on a `DependsOn` cycle — but **Server** and **WebAssembly** modules don't cycle, they both depend on `AbpFeatureManagementBlazorModule`. So referencing both *compiles* but produces two theming roots fighting for the same `IUiMessageService` registration. The last one wins, and the loser's theme-specific UI breaks silently (modals open into the wrong root, toasts go to the wrong host).
+
+**Reference one and only one.** Server hosts use the Server module; WebAssembly hosts use the WebAssembly module. If you're running Blazor in "interactive auto" mode (Server first, WASM after handshake), the framework template wires the Server module into the Server project and the WebAssembly module into the WebAssembly project — never both in the same project.
+
+## NuGet package versioning
+
+Like all module satellites, the version is locked to the Domain.Shared package — bumping `Volo.Abp.FeatureManagement.Blazor.Server` to a new minor implicitly bumps `Volo.Abp.FeatureManagement.Blazor` and `Volo.Abp.FeatureManagement.Application.Contracts` and `Volo.Abp.FeatureManagement.Domain.Shared`. The framework's `Directory.Packages.props` convention keeps versions aligned.
+
+## Gotchas
+
+- **Don't reference `AbpFeatureManagementBlazorServerModule` from a WASM project.** It pulls in Server theming, which references ASP.NET Core types not available in browser AOT.
+- **The package is a shim — don't add code here.** If you need to inject behaviour that differs between Server and WASM, do it in your host's module class. Adding code to this package downstream causes maintenance pain when the framework adds new dependencies.
+- **Theming changes propagate transitively.** A new theme version that requires additional JS bundles must be added to your `_Host.cshtml`; the Feature Management Server module won't pick them up automatically. The Setting Management page contribution mechanism is theme-agnostic.
+- **Circuit state and tenant context.** If a host admin switches tenants mid-circuit (rare, but possible in some custom flows), the modal opened *before* the switch retains the original `CurrentTenant.Id`. Closing and reopening picks up the new context.
+- **Persisting unsaved edits across disconnects.** The modal does not persist edits to `localStorage` (that's a WebAssembly thing) — circuit reconnect preserves them, full reload loses them. For a kiosk scenario consider extending `OpenAsync` to dump intermediate state to the browser via JSInterop.
+- For the shared modal mechanics, the Blazorise integration, and the parent-child toggle cascade, see [modules/feature-management/blazor](/modules/feature-management/blazor).
+- For the upstream framework abstractions consumed by the modal (`IFeatureChecker`, `IStringValueType`, validator factories), see [framework/cross/features](/framework/cross/features).
+
+## Diagnostic notes
+
+When debugging a misconfigured host, the signs you've referenced the wrong Blazor flavour are usually subtle:
+
+- "Modal opens but has no styling" — typically means the WebAssembly theming bundle is referenced from a Server host. The modal uses Blazorise styles loaded as embedded resources by the *Server* theming module; the WASM equivalent loads them differently.
+- "IUiMessageService throws inside `HandleErrorAsync`" — both flavours register the messaging service, but the lifetime is `Scoped` per circuit (Server) or `Singleton` (WASM). Mixing them inside the same DI container causes the wrong instance to be resolved.
+- "Settings tab is missing entirely" — `ISettingComponentContributor` registration happens in `AbpFeatureManagementBlazorModule.ConfigureServices`. If you reference only `AbpFeatureManagementBlazorServerModule` *and* forget to depend on `AbpSettingManagementBlazorServerModule`, the contributor runs but the host page never renders.
+
+## Composition with Blazor United / Interactive Auto (.NET 8+)
+
+.NET 8's interactive-auto mode runs Server components until the WASM payload is ready, then transitions to WASM. The framework supports this via *two* projects:
+
+- `MyApp.Blazor` (the WASM payload) — references `AbpFeatureManagementBlazorWebAssemblyModule`.
+- `MyApp.Blazor.Server` (the Server host) — references `AbpFeatureManagementBlazorServerModule`.
+
+The `FeatureManagementModal` component itself is identical across both projects (it lives in the shared `Volo.Abp.FeatureManagement.Blazor` package). The transition is handled by the framework's component-cache reset logic — when the user clicks "Manage features" during the Server phase, the modal opens against the Server-side `IFeatureAppService`; if the user navigates after the WASM phase has taken over, the same click opens the modal against the WASM-side `FeaturesClientProxy`.
+
+## Test surface
+
+The framework ships `Volo.Abp.AspNetCore.Components.Server.BasicTheme.Tests` and similar test bases for Server theming. A typical integration test for the modal looks like:
+
+```csharp
+public class FeatureManagementModal_Tests : MyAppBlazorServerTestBase
+{
+    [Fact]
+    public async Task Should_Open_For_Tenant()
+    {
+        var ctx = CreateTestContext<FeatureManagementModal>();
+        var modal = ctx.Component;
+
+        // Arrange a tenant Id
+        var tenantId = Guid.NewGuid();
+        await modal.OpenAsync(TenantFeatureValueProvider.ProviderName, tenantId.ToString());
+
+        // Assert
+        ctx.Render(); // re-render
+        ctx.Markup.ShouldContain("FeatureGroup_MyApp.Reporting");
+    }
+}
+```
+
+Reusing the in-proc `FeatureAppService` means the test verifies end-to-end behaviour without an HTTP host.
+
+## Package size
+
+Concretely, `Volo.Abp.FeatureManagement.Blazor.Server` ships approximately one IL class. The total NuGet payload is around a few KB. The dependency closure (`Volo.Abp.FeatureManagement.Blazor` + theming + `Volo.Abp.SettingManagement.Blazor`) brings several MB — most of it Blazorise CSS and JS. Don't be fooled by the package size; the closure matters.
+
+## Boot-time module ordering
+
+Because `AbpFeatureManagementBlazorServerModule` depends on both `AbpFeatureManagementBlazorModule` *and* `AbpAspNetCoreComponentsServerThemingModule`, its `ConfigureServices` runs after both. The shared Blazor module's `SettingManagementComponentOptions.Contributors.Add(new FeatureSettingManagementComponentContributor())` is already registered before the Server theming module wires the host-component framework. Practically: by the time the user navigates to `/SettingManagement`, the contributor list is fully populated and the host renders the Feature Management group.
+
+If your host overrides Setting Management page composition (e.g. to reorder tabs), do it in your host module's `ConfigureServices` — which runs *after* this module — so your reordering applies to the already-populated list.
+
+## Authorization in Server mode
+
+The host admin's principal is the active principal on the Server circuit. `IAuthorizationService.IsGrantedAsync(FeatureManagementPermissions.ManageHostFeatures)` calls the framework's `PermissionChecker` which evaluates against the user's permission grants. No HTTP hop, no token marshalling — the check is a single in-proc dictionary lookup once the user's permission set is loaded.
+
+If the host runs behind a reverse proxy that strips the principal headers (a misconfigured `UseForwardedHeaders`), the modal opens but every operation throws `AbpAuthorizationException` because `CurrentUser.IsAuthenticated == false`. Verify the proxy forwards the SignalR upgrade headers correctly.
+
+## Component lifecycle gotchas
+
+- **`OnInitializedAsync` runs once per component instance.** A Blazor Server circuit reuses component instances across navigations until disposed. If you navigate away from the Settings page and back, the `FeatureSettingManagementComponent` may or may not be re-initialised — depending on whether Blazor's component cache retains it.
+- **`Modal.Show()` requires the circuit to be active.** During pre-rendering (`_Host.cshtml` with `render-mode="ServerPrerendered"`), `Modal.Show()` is a no-op. The framework's modal is designed to be opened only after `OnAfterRenderAsync(firstRender: true)`. The Feature Management modal opens from a button click, so this is rarely a concern.
+- **Disposing the modal cancels in-flight saves.** If the user navigates away mid-save, the `HttpClient`/`IFeatureAppService` call is bound to the component's `CancellationToken`. Don't rely on partial saves — wrap your batches in a UoW server-side if you need atomicity.
+
+## Concurrency under high circuit count
+
+Each connected user maintains a circuit. If 500 admins simultaneously open the Feature Management modal across 500 circuits, each circuit triggers an independent `IFeatureAppService.GetAsync` call. The fan-out warm pattern in `FeatureManagementStore` makes the first one slow (single DB fetch for all feature values for that tenant) and the rest fast (cache hits). The cache key includes `providerName` and `providerKey`, so 500 admins editing 500 different tenants would trigger 500 separate fan-outs — manageable but worth knowing if you scale this many users.
+
+The framework's distributed cache (Redis in production) absorbs the cross-circuit traffic. In-memory dev/test runs serialise through a single `ConcurrentDictionary` and stay fast.
+
+## Compatibility with Lepton / LeptonX themes
+
+The standard host templates compose:
+
+- LeptonX Lite (free) — works with the Feature Management modal out of the box.
+- LeptonX (premium) — same shape, themed differently.
+- Basic theme — works but lacks the styled tabs.
+
+If you use a custom theme, ensure the theme's `_Layout.razor` provides Blazorise's `<MessageProvider>`, `<NotificationProvider>`, and `<ModalProvider>` at the root — the Feature Management modal relies on them.
+
+## Logging surface
+
+Enabling the framework's debug logging surfaces:
+
+```
+dbug: Volo.Abp.FeatureManagement.FeatureManagementStore[0]
+      Loading features for providerName=T, providerKey=5a47abc1-... (cache miss)
+dbug: Volo.Abp.FeatureManagement.FeatureManager[0]
+      Setting feature 'MyApp.Reports' = 'True' on T:5a47abc1-...
+```
+
+These are useful for debugging "I changed the toggle and it didn't stick" reports. The most common cause is the redundant-value collapse in `FeatureManager.SetAsync` — setting a value equal to the fallback clears the override instead of persisting it. Use `forceToSet: true` (custom code) or simply expect the behaviour.
+
+## Summary
+
+`Volo.Abp.FeatureManagement.Blazor.Server` is a packaging convenience — it exists so a Blazor Server host can reference one NuGet package and pick up both the shared UI module and the Server-flavoured theming module in one go. There is no Server-specific business logic — everything happens in the shared module. The page exists to document the why, not the what.
+
+## Comparing to the WebAssembly variant
+
+For completeness, the WebAssembly module:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementBlazorModule),
+    typeof(AbpAspNetCoreComponentsWebAssemblyThemingModule),
+    typeof(AbpFeatureManagementHttpApiClientModule))]
+public class AbpFeatureManagementBlazorWebAssemblyModule : AbpModule
+{
+}
+```
+
+The differences from this Server module:
+
+| Aspect | Server | WebAssembly |
+| --- | --- | --- |
+| Theming dependency | `AbpAspNetCoreComponentsServerThemingModule` | `AbpAspNetCoreComponentsWebAssemblyThemingModule` |
+| `IFeatureAppService` resolution | In-proc `FeatureAppService` (assuming the host depends on the application module) | `FeaturesClientProxy` (via the HttpApi.Client dependency) |
+| Authorization context | SignalR circuit, server-side principal | Browser, claims from cached JWT |
+| Cache reset scope | Server in-memory cache for `/api/abp/application-configuration` | Browser `localStorage` cache |
+| Network failure mode | Circuit drops → SignalR reconnect attempt | HTTP retries via `IHttpClientFactory` policies |
+| AOT compatibility | N/A (Server runs JIT) | Required — static client proxy + framework AOT path |
+
+A Blazor Server host that references the WebAssembly variant (a common mistake during a migration) gets the wrong theming module, the wrong `IFeatureAppService` registration (HTTP proxy), and a circular HTTP call (Server calls itself via the proxy). Symptoms: `OperationCanceledException` after 5 s timeout, or `404` on `/api/feature-management/features` if the API surface isn't actually mapped in the Server host.
+
+## .NET version pinning
+
+The Blazor packages are tightly coupled to the `Microsoft.AspNetCore.Components.Server` (or `WebAssembly`) version. ABP releases a new pair of `Blazor.Server` / `Blazor.WebAssembly` packages for each major .NET version. Mixing .NET 7 and .NET 8 assemblies in the same host throws at startup because the `RouteAttribute` from `Microsoft.AspNetCore.Components` has different layouts between framework versions.
+
+Pin to a single framework version across all ABP packages and verify `Directory.Packages.props` has no version drift.
+
+## When a host needs both Server and WASM rendering
+
+For .NET 8 interactive-auto, the framework's templates split into a *Server* host project and a *Blazor* client project. The Server project references `AbpFeatureManagementBlazorServerModule`; the client project references `AbpFeatureManagementBlazorWebAssemblyModule`. The *components* (the modal itself) live in the shared Razor Class Library project that references `AbpFeatureManagementBlazorModule`.
+
+Each project's `Program.cs` calls its own ABP module loader, so the right theming module gets wired per host. Routing rules in the Server project's `App.razor` decide which interactive mode the page boots into; once interactivity is established, `IFeatureAppService` is resolved against the active circuit/JS-runtime and dispatches to either the in-proc service or the static proxy.
+
+## What this module deliberately does *not* do
+
+- It does **not** register `IFeatureAppService`. That's the responsibility of `AbpFeatureManagementApplicationModule` (in-proc) or `AbpFeatureManagementHttpApiClientModule` (HTTP). A Blazor Server host without either ends up with `IFeatureAppService` unresolvable — the modal throws at construction.
+- It does **not** ship a Razor component. Everything renderable lives in `AbpFeatureManagementBlazorModule`.
+- It does **not** add a route or endpoint mapping. The modal is opened programmatically from other UI surfaces.
+- It does **not** alter authorization. The shared module's contributor checks `FeatureManagementPermissions.ManageHostFeatures`; this module doesn't override the check.
+
+## Trace of a typical Server-side modal session
+
+A walkthrough of what happens when a Blazor Server admin opens the modal:
+
+1. The admin clicks "Manage features" on the tenant list page.
+2. The parent component captures the `FeatureManagementModal` instance via `@ref` and calls `OpenAsync(TenantFeatureValueProvider.ProviderName, tenantId.ToString())`.
+3. `OpenAsync` calls `FeatureAppService.GetAsync` in-proc (no HTTP). The call enters the framework's audit interceptor — an audit row is queued.
+4. `FeatureAppService.CheckProviderPolicy` resolves to `AbpTenantManagement.Tenants.ManageFeatures`; `AuthorizationService.CheckAsync` evaluates against the current circuit's principal.
+5. Per-feature `IFeatureManager.GetOrNullWithProviderAsync` calls populate `Groups`. The first one triggers `FeatureManagementStore` cache warm — a single DB query for all values for that tenant.
+6. The modal is rendered. The user toggles values; component state mutates.
+7. The user clicks Save → `SaveAsync` builds `UpdateFeaturesDto`, calls `FeatureAppService.UpdateAsync`.
+8. Each `IFeatureManager.SetAsync` call writes through the providers; `EntityChangedEventData<FeatureValue>` fires per row; `FeatureValueCacheItemInvalidator` clears the cache key.
+9. `ICurrentApplicationConfigurationCacheResetService.ResetAsync()` invalidates the server-side per-user cache for `/api/abp/application-configuration`.
+10. The modal closes; the parent page may want to refresh — that's outside this module's scope.
+
+Steps 4 and 9 are the security-relevant ones — both depend on the circuit's principal being correctly populated, which in turn depends on the Server theming module's authentication wiring.
+
+## Closing thoughts
+
+If you only remember one thing from this page: **`AbpFeatureManagementBlazorServerModule` exists for theming, not for business logic.** Reference it from your Blazor Server host; reference `AbpFeatureManagementBlazorWebAssemblyModule` from your WASM host; never both. The shared `AbpFeatureManagementBlazorModule` carries the actual UI behaviour.

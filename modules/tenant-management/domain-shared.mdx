@@ -1,0 +1,220 @@
+---
+title: "Volo.Abp.TenantManagement.Domain.Shared"
+sidebarTitle: "Domain.Shared"
+description: "Constants, ETOs, the localization resource, and the extension-config hooks shared by every layer of the Tenant Management module."
+---
+
+`Volo.Abp.TenantManagement.Domain.Shared` is the package every other Tenant Management assembly references — directly via `[DependsOn(typeof(AbpTenantManagementDomainSharedModule))]` or transitively through `Application.Contracts`. It deliberately ships no behaviour: just constants, the localization resource, the `TenantEto` distributed-event payload, and the `ConfigureTenant` extension hook. Keeping it tiny is what lets DTOs, the WASM client, and the Blazor UI reference the constants without dragging in `Tenant` or any persistence types.
+
+## Files
+
+```
+Volo/Abp/TenantManagement/
+├── AbpTenantManagementDomainSharedModule.cs
+├── TenantConsts.cs
+├── TenantConnectionStringConsts.cs
+├── TenantEto.cs
+└── Localization/
+    └── AbpTenantManagementResource.cs
+Volo/Abp/ObjectExtending/
+├── TenantManagementModuleExtensionConfiguration.cs
+├── TenantManagementModuleExtensionConfigurationDictionaryExtensions.cs
+└── TenantManagementModuleExtensionConsts.cs
+```
+
+Resource JSONs sit under `Volo/Abp/TenantManagement/Localization/Resources/` and are mounted into the virtual file system at module init.
+
+## The module class
+
+```csharp
+[DependsOn(typeof(AbpValidationModule))]
+public class AbpTenantManagementDomainSharedModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpTenantManagementDomainSharedModule>();
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Add<AbpTenantManagementResource>("en")
+                .AddBaseTypes(typeof(AbpValidationResource))
+                .AddVirtualJson("/Volo/Abp/TenantManagement/Localization/Resources");
+        });
+
+        Configure<AbpExceptionLocalizationOptions>(options =>
+        {
+            options.MapCodeNamespace("Volo.Abp.TenantManagement", typeof(AbpTenantManagementResource));
+        });
+    }
+}
+```
+
+Three things happen here:
+
+1. Embedded resources for the assembly (Resource JSONs, etc.) are added to the virtual file system. Every other module that depends on this one inherits the file set automatically.
+2. `AbpTenantManagementResource` is registered with `"en"` as the default culture, with `AbpValidationResource` as a base type — so validation messages flow through unmodified, and tenant-specific keys override only where defined.
+3. The exception-code namespace mapping means any `BusinessException("Volo.Abp.TenantManagement:DuplicateTenantName")` thrown by `TenantManager.ValidateNameAsync` is localized through `AbpTenantManagementResource` without further setup.
+
+Note the single dependency: `AbpValidationModule`. Domain.Shared deliberately sits at the bottom of the module graph so it is safe to reference from anywhere.
+
+## Constants
+
+### `TenantConsts`
+
+```csharp
+public static class TenantConsts
+{
+    public static int MaxNameLength { get; set; } = 64;
+    public static int MaxPasswordLength { get; set; } = 128;
+    public static int MaxAdminEmailAddressLength { get; set; } = 256;
+}
+```
+
+Mutable statics, not `const` — host applications can override them in `PreConfigureServices` before EF migrations are scaffolded. `MaxNameLength` flows two ways:
+
+- `Tenant.SetName` calls `Check.NotNullOrWhiteSpace(name, nameof(name), TenantConsts.MaxNameLength)` so the domain enforces it.
+- `AbpTenantManagementDbContextModelCreatingExtensions.ConfigureTenantManagement` reads it as `b.Property(t => t.Name).HasMaxLength(TenantConsts.MaxNameLength)` so EF Core writes the right `nvarchar(64)` column.
+- DTOs use `[DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxNameLength))]` so changing the value also changes client-side and server-side validation.
+
+`MaxPasswordLength` and `MaxAdminEmailAddressLength` decorate `TenantCreateDto` and the Razor Pages / Blazor form models. They are not persisted to `AbpTenants` — the credentials are forwarded as event properties to the Identity module which owns the user store.
+
+### `TenantConnectionStringConsts`
+
+```csharp
+public static class TenantConnectionStringConsts
+{
+    public static int MaxNameLength { get; set; } = 64;
+    public static int MaxValueLength { get; set; } = 1024;
+}
+```
+
+Same dynamic-length pattern. `MaxValueLength = 1024` is generous enough for an Azure SQL connection string with TLS options, AAD auth, and a long server name, but you can raise it if you embed certificates.
+
+`TenantConnectionString.SetValue` enforces it as the only validation on the value — the module does not parse or sanitize the connection string. A bad value will only surface when a `DbContext` tries to open it.
+
+## `TenantEto`
+
+```csharp
+[Serializable]
+public class TenantEto : IHasEntityVersion
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; }
+    public int EntityVersion { get; set; }
+}
+```
+
+The Event Transfer Object the distributed entity-event pipeline publishes for any `Tenant` change. The mapping from `Tenant` to `TenantEto` is registered in `AbpTenantManagementDomainModule`:
+
+```csharp
+Configure<AbpDistributedEntityEventOptions>(options =>
+{
+    options.EtoMappings.Add<Tenant, TenantEto>();
+});
+```
+
+Only `Id`, `Name`, and `EntityVersion` cross the bus — connection strings stay host-side. Downstream services (Identity, SaaS, Audit Logging) can subscribe to `EntityCreatedEto<TenantEto>` / `EntityUpdatedEto<TenantEto>` / `EntityDeletedEto<TenantEto>` and react to lifecycle changes without coupling to the aggregate.
+
+`IHasEntityVersion` lets consumers compare `EntityVersion` between events and drop stale ones; the same field on `Tenant` is bumped automatically by `AbpDbContext.SaveChanges`.
+
+## The localization resource
+
+```csharp
+[LocalizationResourceName("AbpTenantManagement")]
+public class AbpTenantManagementResource { }
+```
+
+A marker type — its only job is to be a generic argument for `IStringLocalizer<AbpTenantManagementResource>` and `LocalizableString.Create<AbpTenantManagementResource>(name)`. The actual translations live in JSON files under `Volo/Abp/TenantManagement/Localization/Resources/{culture}.json`, all embedded into the assembly and surfaced through the virtual file system. `en.json` is the canonical source; other cultures fall back through it and ultimately through `AbpValidationResource`.
+
+Both the MVC `Web` package and the `Blazor` package further re-decorate the resource with `AbpFeatureManagementResource` and `AbpUiResource` as base types so feature-management text and UI verbs (Save, Cancel, …) resolve.
+
+## Object-extension hooks
+
+ABP's object-extension system lets a host application add custom properties to module entities without forking the module. Tenant Management exposes that hook through three Domain.Shared types.
+
+### `TenantManagementModuleExtensionConsts`
+
+```csharp
+public class TenantManagementModuleExtensionConsts
+{
+    public const string ModuleName = "TenantManagement";
+
+    public static class EntityNames
+    {
+        public const string Tenant = "Tenant";
+    }
+}
+```
+
+String keys for the extension registry. Using constants instead of magic strings means a typo in a host extension never silently fails.
+
+### `TenantManagementModuleExtensionConfiguration`
+
+```csharp
+public class TenantManagementModuleExtensionConfiguration : ModuleExtensionConfiguration
+{
+    public TenantManagementModuleExtensionConfiguration ConfigureTenant(
+        Action<EntityExtensionConfiguration> configureAction)
+    {
+        return this.ConfigureEntity(
+            TenantManagementModuleExtensionConsts.EntityNames.Tenant,
+            configureAction);
+    }
+}
+```
+
+A fluent wrapper around `ModuleExtensionConfiguration` that gives you a single method — `ConfigureTenant` — instead of repeating the entity name string. It is reached via the dictionary extensions:
+
+```csharp
+ObjectExtensionManager.Instance.ConfigureTenantManagement(tenantMgmt =>
+{
+    tenantMgmt.ConfigureTenant(tenant =>
+    {
+        tenant.AddOrUpdateProperty<string>("Region",
+            options => options.Attributes.Add(new RequiredAttribute()));
+    });
+});
+```
+
+After the call, every layer picks the new property up:
+
+| Layer | Where the property surfaces |
+| --- | --- |
+| Domain | `tenant.GetProperty("Region")` / `SetProperty("Region", …)` on the aggregate. |
+| EF Core | `b.ApplyObjectExtensionMappings()` adds a `Region` column to `AbpTenants`. |
+| Application | `TenantCreateDto`/`TenantUpdateDto` accept it via `ExtraProperties`. |
+| HTTP API | `ApplyEntityConfigurationToApi` registers it on the action descriptor so swagger sees it. |
+| Web / Blazor | `ApplyEntityConfigurationToUi` makes the create/edit modals render an input. |
+
+All of this comes from one Domain.Shared registration.
+
+### `TenantManagementModuleExtensionConfigurationDictionaryExtensions`
+
+Pure plumbing — extends `IDictionary<string, ModuleExtensionConfiguration>` with `ConfigureTenantManagement(this dict, Action<TenantManagementModuleExtensionConfiguration>)` so you do not have to look up the module name. Generated boilerplate; you call it, you do not touch it.
+
+## Localization keys to know
+
+Selected keys from `en.json` that appear repeatedly in the codebase and tests:
+
+| Key | Used by |
+| --- | --- |
+| `Menu:TenantManagement` | Both menu contributors. |
+| `Tenants`, `TenantName`, `NewTenant` | All UI surfaces. |
+| `DisplayName:AdminEmailAddress`, `DisplayName:AdminPassword` | `TenantCreateDto`, Razor Pages, Blazor modal. |
+| `TenantDeletionConfirmationMessage` | Blazor `GetDeleteConfirmationMessage` (formatted with the tenant name). |
+| `Permission:TenantManagement`, `Permission:Create`, `Permission:Edit`, `Permission:Delete`, `Permission:ManageFeatures`, `Permission:ManageConnectionStrings` | `AbpTenantManagementPermissionDefinitionProvider`. |
+| `Volo.Abp.TenantManagement:DuplicateTenantName` | Exception code thrown by `TenantManager.ValidateNameAsync`. |
+
+The duplicate-tenant key is exception-scoped, mapped through `AbpExceptionLocalizationOptions.MapCodeNamespace`; the others are normal `L["..."]` calls. Override either set in the host by adding a higher-priority resource or by overriding the JSON keys in a custom virtual file.
+
+## What it is *not*
+
+- No `Tenant` aggregate — that is in `Volo.Abp.TenantManagement.Domain`.
+- No DTOs — those live in `Application.Contracts`.
+- No `ITenantStore`/`ICurrentTenant` — those are framework primitives in `Volo.Abp.MultiTenancy.Abstractions`.
+
+Keeping Domain.Shared empty of behaviour is what allows a Blazor WebAssembly client (which references `Application.Contracts` → `Domain.Shared`) to ship without a single line of EF Core or domain logic loaded.

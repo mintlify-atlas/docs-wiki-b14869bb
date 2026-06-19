@@ -1,0 +1,289 @@
+---
+title: "Blazor Server over SignalR: MapBlazorHub and circuit wiring"
+sidebarTitle: "Server & SignalR"
+description: "How AbpAspNetCoreComponentsServerModule maps the /_blazor SignalR hub, suppresses UoW/auditing on the hub, and serves static web assets."
+---
+
+A Blazor Server app is a SignalR app with a UI on top. When ABP's `AbpAspNetCoreComponentsServerModule` is referenced, the framework takes over four things that you'd normally wire by hand in `Program.cs`: registering server-side Blazor with detailed errors in development, mapping the `/_blazor` hub, telling the UoW and auditing middleware to **ignore** that hub, and composing static web assets from the theming packages so CSS/JS/images shipped inside Razor class libraries are reachable at runtime.
+
+Reading this module top to bottom shows you exactly which seams ABP claims and which it leaves open — knowing that lets you customize hub options (idle timeout, max message size, JS interop call limits) without fighting the framework.
+
+## Package layout
+
+```text framework/src/Volo.Abp.AspNetCore.Components.Server/
+Microsoft/AspNetCore/Authentication/Cookies/
+  CookieAuthenticationOptionsExtensions.cs
+Volo/Abp/AspNetCore/Components/Server/
+  AbpAspNetCoreComponentsServerModule.cs
+  Configuration/
+    BlazorServerCurrentApplicationConfigurationCacheResetService.cs
+  Extensibility/
+    BlazorServerLookupApiRequestService.cs
+```
+
+Four C# files. Themes (`Volo.Abp.AspNetCore.Components.Server.Theming`) live in a sibling package; cross-host UI primitives (cookie service, claims cache, handlers) live in `Volo.Abp.AspNetCore.Components.Web`.
+
+## Key abstractions
+
+| Type | Role |
+|------|------|
+| `AbpAspNetCoreComponentsServerModule` | Top-level module — `AddServerSideBlazor`, `MapBlazorHub`, ignore-list `/_blazor`. |
+| `BlazorServerCurrentApplicationConfigurationCacheResetService` | Replaces the default cache reset to publish a `CurrentApplicationConfigurationCacheResetEventData` local event so per-circuit caches drop. |
+| `BlazorServerLookupApiRequestService` | The remote/tiered-mode bridge for lookup-property API calls — falls back to in-process headers when the server runs the API too. |
+| `CookieAuthenticationOptionsExtensions.IntrospectAccessToken` | Optional extension on `CookieAuthenticationOptions` for OIDC introspection on every cookie validate. |
+
+## The module's ConfigureServices
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Server/AbpAspNetCoreComponentsServerModule.cs
+[DependsOn(
+    typeof(AbpHttpClientModule),
+    typeof(AbpAspNetCoreComponentsWebModule),
+    typeof(AbpAspNetCoreSignalRModule),
+    typeof(AbpEventBusModule),
+    typeof(AbpAspNetCoreMvcContractsModule)
+    )]
+public class AbpAspNetCoreComponentsServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        StaticWebAssetsLoader.UseStaticWebAssets(
+            context.Services.GetHostingEnvironment(),
+            context.Services.GetConfiguration());
+
+        context.Services.AddHttpClient();
+
+        var serverSideBlazorBuilder = context.Services.AddServerSideBlazor(options =>
+        {
+            if (context.Services.GetHostingEnvironment().IsDevelopment())
+            {
+                options.DetailedErrors = true;
+            }
+        });
+        context.Services.ExecutePreConfiguredActions(serverSideBlazorBuilder);
+
+        Configure<AbpAspNetCoreUnitOfWorkOptions>(options =>
+        {
+            options.IgnoredUrls.AddIfNotContains("/_blazor");
+        });
+
+        Configure<AbpAspNetCoreAuditingOptions>(options =>
+        {
+            options.IgnoredUrls.AddIfNotContains("/_blazor");
+        });
+
+        var preConfigureActions = context.Services.GetPreConfigureActions<HttpConnectionDispatcherOptions>();
+        Configure<AbpEndpointRouterOptions>(options =>
+        {
+            options.EndpointConfigureActions.Add(endpointContext =>
+            {
+                endpointContext.Endpoints.MapBlazorHub(httpConnectionDispatcherOptions =>
+                {
+                    preConfigureActions.Configure(httpConnectionDispatcherOptions);
+                });
+                endpointContext.Endpoints.MapFallbackToPage("/_Host");
+            });
+        });
+    }
+}
+```
+
+Five distinct decisions are encoded here:
+
+1. **`StaticWebAssetsLoader.UseStaticWebAssets`** — even in published mode (where it is normally only honored in Development by default), ABP enables static web assets so files shipped inside referenced Razor class libraries (themes, modules) are served from `/_content/{packageId}/…`.
+2. **`AddServerSideBlazor`** with `DetailedErrors = true` in Development. Production keeps the default opaque circuit error.
+3. **`ExecutePreConfiguredActions`** lets you pre-configure the `IServerSideBlazorBuilder` from another module (for example to call `.AddCircuitOptions(o => …)` or `.AddHubOptions(o => …)`).
+4. **Ignored URLs** — `/_blazor` is added to both `AbpAspNetCoreUnitOfWorkOptions.IgnoredUrls` and `AbpAspNetCoreAuditingOptions.IgnoredUrls`. The hub negotiation/transport must **not** be wrapped in a UoW or audited as an MVC request; UoW boundaries belong to your application service calls inside the circuit.
+5. **Endpoint map** — `MapBlazorHub` is registered through `AbpEndpointRouterOptions` (so your own endpoints can register in any order) and `MapFallbackToPage("/_Host")` is added so deep-link refreshes don't 404.
+
+## Configuring hub options
+
+Use ABP's pre-configure mechanism in a module that depends on `AbpAspNetCoreComponentsServerModule`:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.PreConfigure<IServerSideBlazorBuilder>(builder =>
+    {
+        builder.AddHubOptions(options =>
+        {
+            options.MaximumReceiveMessageSize = 32 * 1024; // 32 KiB
+            options.HandshakeTimeout = TimeSpan.FromSeconds(15);
+        });
+
+        builder.AddCircuitOptions(options =>
+        {
+            options.DetailedErrors = false;
+            options.JSInteropDefaultCallTimeout = TimeSpan.FromMinutes(1);
+            options.MaxBufferedUnacknowledgedRenderBatches = 10;
+        });
+    });
+
+    context.Services.PreConfigure<HttpConnectionDispatcherOptions>(options =>
+    {
+        options.ApplicationMaxBufferSize = 64 * 1024;
+        options.TransportMaxBufferSize = 64 * 1024;
+    });
+}
+```
+
+`PreConfigure<HttpConnectionDispatcherOptions>` flows into the lambda the module passes to `MapBlazorHub`, so transport-level tuning happens without re-mapping the hub.
+
+## The cache reset service
+
+When a setting, feature, or permission changes at runtime, every Blazor Server circuit caches the application-configuration DTO. The default reset only invalidates the in-process MVC cache; on the Blazor host you also need per-circuit caches to drop:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Server/Configuration/BlazorServerCurrentApplicationConfigurationCacheResetService.cs
+[Dependency(ReplaceServices = true)]
+public class BlazorServerCurrentApplicationConfigurationCacheResetService :
+    ICurrentApplicationConfigurationCacheResetService, ITransientDependency
+{
+    public async Task ResetAsync()
+    {
+        await _localEventBus.PublishAsync(new CurrentApplicationConfigurationCacheResetEventData());
+    }
+}
+```
+
+The `ApplicationConfigurationChangedService` in `Volo.Abp.AspNetCore.Components.Web.Security` subscribes to that local event and re-fetches the configuration for the current circuit.
+
+## Lookup API requests in tiered vs. non-tiered mode
+
+ABP Suite's lookup widgets (e.g., for navigation properties) issue HTTP calls to fetch related entity options. The dispatcher distinguishes two topologies:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Server/Extensibility/BlazorServerLookupApiRequestService.cs
+public async Task<string> SendAsync(string url)
+{
+    var client = HttpClientFactory.CreateClient();
+    var requestMessage = new HttpRequestMessage(HttpMethod.Get, url);
+
+    var uri = new Uri(url, UriKind.RelativeOrAbsolute);
+    if (!uri.IsAbsoluteUri)
+    {
+        var baseUrl = string.Empty;
+        try
+        {
+            //Blazor tiered -- mode
+            var remoteServiceConfig = await RemoteServiceConfigurationProvider
+                .GetConfigurationOrDefaultAsync("Default");
+            baseUrl = remoteServiceConfig.BaseUrl;
+            client.BaseAddress = new Uri(baseUrl);
+            AddHeaders(requestMessage);
+            await HttpClientAuthenticator.Authenticate(
+                new RemoteServiceHttpClientAuthenticateContext(
+                    client, requestMessage, new RemoteServiceConfiguration(baseUrl), string.Empty));
+        }
+        catch (AbpException) // Blazor-Server mode.
+        {
+            baseUrl = NavigationManager.BaseUri;
+            client.BaseAddress = new Uri(baseUrl);
+            foreach (var header in HttpContextAccessor.HttpContext!.Request.Headers)
+            {
+                requestMessage.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
+            }
+        }
+    }
+
+    var response = await client.SendAsync(requestMessage);
+    return await response.Content.ReadAsStringAsync();
+}
+```
+
+- **Tiered mode** — Blazor Server is a *separate* process from the HTTP API. Remote service configuration has a real `BaseUrl`; the lookup uses `IRemoteServiceHttpClientAuthenticator` (the same one the typed client proxies use) to attach a bearer token.
+- **Non-tiered (Blazor Server hosts the API)** — `GetConfigurationOrDefaultAsync` throws `AbpException` because no `Default` remote service is configured. The catch falls back to `NavigationManager.BaseUri` and replays the current HTTP context headers (cookie, anti-forgery, language) so the call hits localhost with the same identity.
+
+## Optional: access token introspection on cookie
+
+The `CookieAuthenticationOptionsExtensions` extension lets you re-validate the cookie's stored `access_token` on every request:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Server/Microsoft/AspNetCore/Authentication/Cookies/CookieAuthenticationOptionsExtensions.cs
+public static CookieAuthenticationOptions IntrospectAccessToken(
+    this CookieAuthenticationOptions options, string oidcAuthenticationScheme = "oidc")
+{
+    options.Events.OnValidatePrincipal = async principalContext =>
+    {
+        var accessToken = principalContext.Properties.GetTokenValue("access_token");
+        if (!accessToken.IsNullOrWhiteSpace())
+        {
+            var openIdConnectOptions = await GetOpenIdConnectOptions(
+                principalContext, oidcAuthenticationScheme);
+
+            var response = await openIdConnectOptions.Backchannel.IntrospectTokenAsync(
+                new TokenIntrospectionRequest
+                {
+                    Address = openIdConnectOptions.Configuration?.IntrospectionEndpoint
+                              ?? openIdConnectOptions.Authority!.EnsureEndsWith('/')
+                                 + "connect/introspect",
+                    ClientId = openIdConnectOptions.ClientId,
+                    ClientSecret = openIdConnectOptions.ClientSecret,
+                    Token = accessToken
+                });
+
+            if (response.IsError || !response.IsActive)
+            {
+                principalContext.RejectPrincipal();
+                await principalContext.HttpContext.SignOutAsync(principalContext.Scheme.Name);
+            }
+        }
+    };
+
+    return options;
+}
+```
+
+Wire it from your host's `AddAuthentication` chain:
+
+```csharp
+services.AddAuthentication(options => { /* … */ })
+    .AddCookie("Cookies", options => options.IntrospectAccessToken("oidc"))
+    .AddOpenIdConnect("oidc", options => { /* … */ });
+```
+
+<Warning>
+  Introspection costs one HTTP round-trip per validated cookie. For long-lived circuits, ensure `OpenIdConnectOptions.SaveTokens = true`; otherwise the `access_token` claim is absent and introspection signs the user out.
+</Warning>
+
+## Composite static web assets
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    context.GetEnvironment().WebRootFileProvider =
+        new CompositeFileProvider(
+            new ManifestEmbeddedFileProvider(typeof(IServerSideBlazorBuilder).Assembly),
+            context.GetEnvironment().WebRootFileProvider
+        );
+}
+```
+
+The Blazor framework assembly contributes `_framework/blazor.server.js` and friends through a manifest-embedded file provider; the application's `wwwroot` is layered on top.
+
+## Gotchas
+
+<Warning>
+  Adding endpoints in `Program.cs` *after* `app.UseConfiguredEndpoints()` runs will not register them — ABP's endpoint router options is what `MapBlazorHub` is plugged into. Always extend `AbpEndpointRouterOptions` from a module.
+</Warning>
+
+<Warning>
+  `/_blazor` is in both the UoW and auditing ignore lists. If you build a custom endpoint that piggybacks on the SignalR transport (e.g., `/_blazor/myhub`) you must add its URL to those ignore lists or you'll see audit log noise and UoW commits on every negotiate.
+</Warning>
+
+<Note>
+  In v7.4.0 the module enables static web assets unconditionally — including in Production. This is what lets module Razor class libraries serve their CSS without an extra publish step.
+</Note>
+
+## Cross-links
+
+<CardGroup cols={2}>
+  <Card title="Circuits & lifetime" icon="bolt" href="/framework/ui-blazor/blazor-server-circuits">
+    DI scope, disconnects, and per-circuit cache invalidation.
+  </Card>
+  <Card title="Authentication" icon="key" href="/framework/ui-blazor/blazor-authentication">
+    Cookie + OIDC patterns including IntrospectAccessToken.
+  </Card>
+  <Card title="Components.Web primitives" icon="layer-group" href="/framework/ui-blazor/blazor-components-web">
+    Where the SimpleUiMessageService and cookie service live.
+  </Card>
+  <Card title="AbpComponentBase" icon="puzzle-piece" href="/framework/ui-blazor/blazor">
+    The component base class every page derives from.
+  </Card>
+</CardGroup>

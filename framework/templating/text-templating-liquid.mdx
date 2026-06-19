@@ -1,0 +1,518 @@
+---
+title: "Liquid templates — building a third rendering engine on Volo.Abp.TextTemplating"
+sidebarTitle: "Liquid engine (custom)"
+description: "ABP 7.4.0 ships Scriban and Razor engines out of the box. This page shows how to plug a Liquid engine into the same abstractions — file inventory, options, registration, sequence and gotchas — using Fluid as the worked example."
+---
+
+ABP 7.4.0 does **not** ship a Liquid rendering engine in the `Volo.Abp.TextTemplating.*` family. The text-templating system is, however, explicitly designed to host additional engines: the engine map on `AbpTextTemplatingOptions`, the `ITemplateRenderingEngine` contract, and the `TemplateRenderingEngineBase` helper class together form a small, stable SPI that you can use to wire up [Liquid](https://shopify.github.io/liquid/) — or any other template language — alongside the built-in [Scriban](/framework/templating/text-templating-scriban) and [Razor](/framework/templating/text-templating-razor) engines.
+
+This page is a deep dive into **what an in-process Liquid engine should look like** when implemented against ABP's abstractions, using the [Fluid](https://github.com/sebastienros/fluid) library (Sébastien Ros's `.liquid` interpreter) as the concrete example. Read it the way you would read a design RFC: every API mentioned on the ABP side is real and present in the 7.4.0 source; the engine code shown is the pattern you would put in your own module.
+
+If you only need one of the shipped engines, jump to [Scriban](/framework/templating/text-templating-scriban) (recommended default — sandboxed, no compile step) or [Razor](/framework/templating/text-templating-razor) (recommended when you need full C# inside templates).
+
+## Why the engine is pluggable
+
+The `AbpTemplateRenderer` does **not** know how to parse a template — it only knows how to look one up by name and forward the call to whichever engine the template declares. From `AbpTemplateRenderer.RenderAsync`:
+
+```csharp
+var templateDefinition = await TemplateDefinitionManager.GetAsync(templateName);
+
+var renderEngine = templateDefinition.RenderEngine;
+
+if (renderEngine.IsNullOrWhiteSpace())
+{
+    renderEngine = Options.DefaultRenderingEngine;
+}
+
+var providerType = Options.RenderingEngines.GetOrDefault(renderEngine);
+
+if (providerType != null && typeof(ITemplateRenderingEngine).IsAssignableFrom(providerType))
+{
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var templateRenderingEngine = (ITemplateRenderingEngine)scope.ServiceProvider.GetRequiredService(providerType);
+        return await templateRenderingEngine.RenderAsync(templateName, model, cultureName, globalContext);
+    }
+}
+
+throw new AbpException("There is no rendering engine found with template name: " + templateName);
+```
+
+That logic — and only that logic — decides which engine handles a render call. So a Liquid engine becomes a real first-class peer of Scriban/Razor as soon as it:
+
+1. Implements `ITemplateRenderingEngine` (or derives from `TemplateRenderingEngineBase`).
+2. Is registered in DI (the `[ITransientDependency]` interface marker is enough).
+3. Is added to `AbpTextTemplatingOptions.RenderingEngines` under a string key (e.g. `"Liquid"`).
+4. Is opted into per-template via `TemplateDefinition.WithRenderEngine("Liquid")`.
+
+There is no other extension point you need to reach for. No reflection, no source-generator, no Razor-style assembly compile.
+
+## File inventory for a custom Liquid module
+
+The module you would write follows the same shape as `Volo.Abp.TextTemplating.Scriban`. The proposed file list:
+
+| File | Role |
+| --- | --- |
+| `MyApp.TextTemplating.Liquid/AbpTextTemplatingLiquidModule.cs` | Module that registers the engine in `AbpTextTemplatingOptions.RenderingEngines`. Optionally claims `DefaultRenderingEngine` if no other engine has. |
+| `MyApp.TextTemplating.Liquid/LiquidTemplateRenderingEngine.cs` | The `ITemplateRenderingEngine` implementation — derives from `TemplateRenderingEngineBase`, owns Fluid parser/options, handles layout chaining. |
+| `MyApp.TextTemplating.Liquid/LiquidTemplateContextFactory.cs` | Builds the per-render `TemplateContext` (Fluid's): registers model, global context, the `L` filter, culture. |
+| `MyApp.TextTemplating.Liquid/LiquidTemplateLocalizer.cs` | An `IFluidCustomFilter` that wraps `IStringLocalizer` — the equivalent of `ScribanTemplateLocalizer`. |
+| `MyApp.TextTemplating.Liquid/AbpLiquidTemplateRenderingOptions.cs` | Options bag exposing the Fluid `TemplateOptions` (allowed member types, custom filters, time zone). |
+| `MyApp.TextTemplating.Liquid/LiquidTemplateDefinitionExtensions.cs` | `WithLiquidEngine()` extension that calls `WithRenderEngine("Liquid")`. |
+
+The package would depend on `AbpTextTemplatingCoreModule` and the upstream `Fluid.Core` NuGet package.
+
+## The ABP-side anchors
+
+These four files in `Volo.Abp.TextTemplating.Core` are the only pieces the Liquid module needs to bind against — every one of them is part of the public 7.4.0 surface.
+
+### `ITemplateRenderingEngine`
+
+The engine contract (verbatim):
+
+```csharp
+public interface ITemplateRenderingEngine
+{
+    string Name { get; }
+
+    Task<string> RenderAsync(
+        [NotNull] string templateName,
+        [CanBeNull] object model = null,
+        [CanBeNull] string cultureName = null,
+        [CanBeNull] Dictionary<string, object> globalContext = null);
+}
+```
+
+`Name` is the dictionary key in `AbpTextTemplatingOptions.RenderingEngines`. It is matched with default (case-sensitive) string equality.
+
+### `TemplateRenderingEngineBase`
+
+The convenience base class that supplies the four collaborators every engine needs:
+
+```csharp
+public abstract class TemplateRenderingEngineBase : ITemplateRenderingEngine
+{
+    public abstract string Name { get; }
+
+    protected readonly ITemplateDefinitionManager TemplateDefinitionManager;
+    protected readonly ITemplateContentProvider   TemplateContentProvider;
+    protected readonly IStringLocalizerFactory    StringLocalizerFactory;
+
+    public TemplateRenderingEngineBase(
+        ITemplateDefinitionManager templateDefinitionManager,
+        ITemplateContentProvider templateContentProvider,
+        IStringLocalizerFactory stringLocalizerFactory) { /* ... */ }
+
+    public abstract Task<string> RenderAsync(string templateName, object model = null,
+        string cultureName = null, Dictionary<string, object> globalContext = null);
+
+    protected virtual async Task<string> GetContentOrNullAsync(TemplateDefinition templateDefinition)
+        => await TemplateContentProvider.GetContentOrNullAsync(templateDefinition);
+
+    protected virtual IStringLocalizer GetLocalizerOrNull(TemplateDefinition templateDefinition)
+    {
+        if (templateDefinition.LocalizationResourceName != null)
+        {
+            return StringLocalizerFactory.CreateByResourceName(templateDefinition.LocalizationResourceName);
+        }
+
+        return StringLocalizerFactory.CreateDefaultOrNull();
+    }
+}
+```
+
+Inherit from it, and `GetContentOrNullAsync` handles the entire culture-fallback chain (`tr-TR` → `tr` → inline → `DefaultCultureName`) on your behalf, while `GetLocalizerOrNull` gives you back the `IStringLocalizer` the template should use.
+
+### `AbpTextTemplatingOptions.RenderingEngines`
+
+The map an engine module mutates:
+
+```csharp
+public class AbpTextTemplatingOptions
+{
+    public IDictionary<string, Type> RenderingEngines { get; }
+    public string DefaultRenderingEngine { get; set; }
+    /* ... */
+}
+```
+
+### `TemplateDefinition.WithRenderEngine`
+
+The opt-in for individual templates:
+
+```csharp
+public virtual TemplateDefinition WithRenderEngine(string renderEngine)
+{
+    RenderEngine = renderEngine;
+    return this;
+}
+```
+
+## The `AbpLiquidTemplateRenderingOptions` bag
+
+The shipped engines each take a different approach to extensibility:
+
+- The Scriban engine has **no options bag**; everything is hard-coded in the engine.
+- The Razor engine has **two**: `AbpRazorTemplateCSharpCompilerOptions` (Roslyn references) and `AbpCompiledViewProviderOptions` (per-template references).
+
+For a Liquid engine, the natural surface is Fluid's `TemplateOptions`, which controls member-access whitelisting, custom filters and time-zone behaviour. A minimal options bag:
+
+| Member | Purpose |
+| --- | --- |
+| `TemplateOptions Options` | The Fluid `TemplateOptions` instance the engine uses for every render. Pre-populated with `MemberAccessStrategy.MemberNameStrategy = MemberNameStrategies.CamelCase` so that `Model.Name` works in templates. |
+| `bool CacheParsedTemplates` | When `true`, parsed `IFluidTemplate` instances are cached by `(templateName, culture)` to avoid re-parsing identical content. |
+| `Action<TemplateContext, TemplateDefinition> ConfigureContext` | Last-chance hook to mutate the `TemplateContext` per render — e.g. to add a tenant-scoped object before the engine renders. |
+
+Concrete shape:
+
+```csharp
+public class AbpLiquidTemplateRenderingOptions
+{
+    public TemplateOptions Options { get; }
+    public bool CacheParsedTemplates { get; set; }
+    public Action<TemplateContext, TemplateDefinition> ConfigureContext { get; set; }
+
+    public AbpLiquidTemplateRenderingOptions()
+    {
+        Options = new TemplateOptions
+        {
+            MemberAccessStrategy = new UnsafeMemberAccessStrategy() // tighten in production
+        };
+        CacheParsedTemplates = true;
+    }
+}
+```
+
+## The engine
+
+`LiquidTemplateRenderingEngine` mirrors `ScribanTemplateRenderingEngine` line-for-line; the only thing that changes is the parser/runtime.
+
+```csharp
+public class LiquidTemplateRenderingEngine : TemplateRenderingEngineBase, ITransientDependency
+{
+    public const string EngineName = "Liquid";
+    public override string Name => EngineName;
+
+    protected readonly AbpLiquidTemplateRenderingOptions Options;
+    protected readonly LiquidTemplateContextFactory ContextFactory;
+    protected static readonly ConcurrentDictionary<string, IFluidTemplate> ParsedCache = new();
+
+    public LiquidTemplateRenderingEngine(
+        ITemplateDefinitionManager templateDefinitionManager,
+        ITemplateContentProvider templateContentProvider,
+        IStringLocalizerFactory stringLocalizerFactory,
+        IOptions<AbpLiquidTemplateRenderingOptions> options,
+        LiquidTemplateContextFactory contextFactory)
+        : base(templateDefinitionManager, templateContentProvider, stringLocalizerFactory)
+    {
+        Options        = options.Value;
+        ContextFactory = contextFactory;
+    }
+
+    public override async Task<string> RenderAsync(
+        string templateName, object model = null,
+        string cultureName = null, Dictionary<string, object> globalContext = null)
+    {
+        Check.NotNullOrWhiteSpace(templateName, nameof(templateName));
+        globalContext ??= new Dictionary<string, object>();
+
+        if (cultureName == null)
+        {
+            return await RenderInternalAsync(templateName, globalContext, model);
+        }
+
+        using (CultureHelper.Use(cultureName))
+        {
+            return await RenderInternalAsync(templateName, globalContext, model);
+        }
+    }
+
+    protected virtual async Task<string> RenderInternalAsync(
+        string templateName, Dictionary<string, object> globalContext, object model = null)
+    {
+        var def = await TemplateDefinitionManager.GetAsync(templateName);
+        var rendered = await RenderSingleTemplateAsync(def, globalContext, model);
+
+        if (def.Layout != null)
+        {
+            globalContext["content"] = rendered;
+            rendered = await RenderInternalAsync(def.Layout, globalContext);
+        }
+
+        return rendered;
+    }
+
+    protected virtual async Task<string> RenderSingleTemplateAsync(
+        TemplateDefinition def, Dictionary<string, object> globalContext, object model = null)
+    {
+        var raw = await GetContentOrNullAsync(def);
+        if (raw == null)
+        {
+            throw new AbpException($"Liquid template content of {def.Name} is null!");
+        }
+
+        var fluid = GetOrParseTemplate(def, raw);
+        var ctx   = ContextFactory.Create(def, globalContext, model, GetLocalizerOrNull(def), Options);
+        Options.ConfigureContext?.Invoke(ctx, def);
+
+        return await fluid.RenderAsync(ctx);
+    }
+
+    protected virtual IFluidTemplate GetOrParseTemplate(TemplateDefinition def, string content)
+    {
+        if (!Options.CacheParsedTemplates)
+        {
+            return ParseOrThrow(content);
+        }
+
+        return ParsedCache.GetOrAdd(def.Name + CultureInfo.CurrentUICulture.Name, _ => ParseOrThrow(content));
+    }
+
+    private static IFluidTemplate ParseOrThrow(string content)
+    {
+        var parser = new FluidParser();
+        if (!parser.TryParse(content, out var template, out var error))
+        {
+            throw new AbpException($"Liquid parse error: {error}");
+        }
+        return template;
+    }
+}
+```
+
+The engine deliberately copies Scriban's layout convention — push the rendered child into `globalContext["content"]` and render the layout. That makes the same template-definition pattern work across engines:
+
+```csharp
+new TemplateDefinition("MyApp.EmailLayout", isLayout: true)
+    .WithVirtualFilePath("/Emails/EmailLayout.liquid", isInlineLocalized: true)
+    .WithLiquidEngine();
+
+new TemplateDefinition("MyApp.WelcomeEmail", layout: "MyApp.EmailLayout")
+    .WithVirtualFilePath("/Emails/WelcomeEmail.liquid", isInlineLocalized: true)
+    .WithLiquidEngine();
+```
+
+`EmailLayout.liquid`:
+
+```liquid
+<html><body>{{ content }}</body></html>
+```
+
+## The context factory
+
+Splitting the `TemplateContext` construction out into its own class mirrors what the Razor engine does with `IAbpCompiledViewProvider` — it keeps the engine class focused on orchestration and lets you replace the per-render wiring without subclassing the engine.
+
+```csharp
+public class LiquidTemplateContextFactory : ITransientDependency
+{
+    public virtual TemplateContext Create(
+        TemplateDefinition definition,
+        Dictionary<string, object> globalContext,
+        object model,
+        IStringLocalizer localizer,
+        AbpLiquidTemplateRenderingOptions options)
+    {
+        var ctx = new TemplateContext(options.Options);
+
+        // Import the global context as top-level identifiers (mirrors Scriban).
+        foreach (var kv in globalContext)
+        {
+            ctx.SetValue(kv.Key, kv.Value);
+        }
+
+        if (model != null)
+        {
+            ctx.SetValue("model", model);
+        }
+
+        if (localizer != null)
+        {
+            // Expose L as a Fluid filter: {{ "HelloText" | L: model.name }}
+            ctx.Options.Filters.AddFilter("L", new LiquidTemplateLocalizer(localizer).Invoke);
+        }
+
+        ctx.CultureInfo = CultureInfo.CurrentCulture;
+        return ctx;
+    }
+}
+```
+
+And the localizer filter, modelled on `ScribanTemplateLocalizer`:
+
+```csharp
+public class LiquidTemplateLocalizer
+{
+    private readonly IStringLocalizer _localizer;
+    public LiquidTemplateLocalizer(IStringLocalizer localizer) { _localizer = localizer; }
+
+    public ValueTask<FluidValue> Invoke(FluidValue input, FilterArguments args, TemplateContext context)
+    {
+        var key = input.ToStringValue();
+        if (string.IsNullOrWhiteSpace(key)) return new ValueTask<FluidValue>(StringValue.Empty);
+
+        var values = new object[args.Count];
+        for (var i = 0; i < args.Count; i++)
+        {
+            values[i] = args.At(i).ToObjectValue();
+        }
+
+        var localized = values.Length > 0 ? _localizer[key, values] : _localizer[key];
+        return new ValueTask<FluidValue>(new StringValue(localized.Value));
+    }
+}
+```
+
+Templates then use `L` as a filter rather than as a function — that is idiomatic Liquid, and it keeps the template language unchanged for authors familiar with Shopify:
+
+```liquid
+{{ "HelloText" | L: model.name }}, {{ "HowAreYou" | L }}.
+```
+
+## Module wiring
+
+```csharp
+[DependsOn(typeof(AbpTextTemplatingCoreModule))]
+public class AbpTextTemplatingLiquidModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpTextTemplatingOptions>(options =>
+        {
+            // Only claim the default slot if nobody else has — mirrors Razor's behaviour.
+            if (options.DefaultRenderingEngine.IsNullOrWhiteSpace())
+            {
+                options.DefaultRenderingEngine = LiquidTemplateRenderingEngine.EngineName;
+            }
+            options.RenderingEngines[LiquidTemplateRenderingEngine.EngineName] = typeof(LiquidTemplateRenderingEngine);
+        });
+    }
+}
+```
+
+If you also depend on `AbpTextTemplatingScribanModule`, Scriban will still win the default (it sets the slot unconditionally). Force Liquid in your own host module:
+
+```csharp
+public override void PostConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpTextTemplatingOptions>(options =>
+    {
+        options.DefaultRenderingEngine = LiquidTemplateRenderingEngine.EngineName;
+    });
+}
+```
+
+And the per-template opt-in:
+
+```csharp
+public static class LiquidTemplateDefinitionExtensions
+{
+    public static TemplateDefinition WithLiquidEngine(this TemplateDefinition def)
+        => def.WithRenderEngine(LiquidTemplateRenderingEngine.EngineName);
+}
+```
+
+## End-to-end render sequence
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant Renderer as AbpTemplateRenderer
+    participant Mgr as TemplateDefinitionManager
+    participant Liquid as LiquidTemplateRenderingEngine
+    participant Content as TemplateContentProvider
+    participant Factory as LiquidTemplateContextFactory
+    participant Localizer as IStringLocalizer
+    participant Fluid as Fluid IFluidTemplate
+
+    App->>Renderer: RenderAsync("WelcomeEmail", model, "tr-TR")
+    Renderer->>Mgr: GetAsync("WelcomeEmail")
+    Mgr-->>Renderer: TemplateDefinition (RenderEngine = "Liquid")
+    Renderer->>Renderer: pick engine from Options.RenderingEngines["Liquid"]
+    Renderer->>Liquid: RenderAsync(...)
+    Liquid->>Liquid: using CultureHelper.Use("tr-TR")
+    Liquid->>Content: GetContentOrNullAsync(def)
+    Content-->>Liquid: raw .liquid text (culture-resolved)
+    Liquid->>Fluid: parse (cache by name+culture)
+    Liquid->>Factory: Create(def, globalContext, model, localizer, options)
+    Factory->>Localizer: bind L filter
+    Factory-->>Liquid: TemplateContext
+    Liquid->>Fluid: RenderAsync(context)
+    Fluid-->>Liquid: rendered text
+    alt def.Layout != null
+        Liquid->>Liquid: globalContext["content"] = rendered; RenderInternalAsync(layoutName)
+    end
+    Liquid-->>Renderer: final string
+    Renderer-->>App: final string
+```
+
+## Worked example — registering a Liquid template
+
+Once the module above is referenced, a definition provider for a Liquid template looks identical to its Scriban/Razor cousins:
+
+```csharp
+public class MyEmailTemplateDefinitionProvider : TemplateDefinitionProvider
+{
+    public override void Define(ITemplateDefinitionContext context)
+    {
+        context.Add(
+            new TemplateDefinition(
+                name: "MyApp.WelcomeEmail",
+                localizationResource: typeof(MyAppResource))
+            .WithVirtualFilePath("/Emails/WelcomeEmail.liquid", isInlineLocalized: true)
+            .WithLiquidEngine()
+        );
+    }
+}
+```
+
+`WelcomeEmail.liquid`:
+
+```liquid
+{{ "HelloText" | L: model.name }}!
+{% if model.isTrial %}
+  {{ "TrialReminder" | L: model.trialDaysRemaining }}
+{% endif %}
+```
+
+Calling site:
+
+```csharp
+var html = await _templateRenderer.RenderAsync(
+    templateName: "MyApp.WelcomeEmail",
+    model: new { Name = "Alice", IsTrial = true, TrialDaysRemaining = 7 },
+    cultureName: "en");
+```
+
+The same `ITemplateRenderer` you use for Scriban or Razor templates — ABP routes the call to the Liquid engine because the definition declared `WithLiquidEngine()`.
+
+## Choosing an engine
+
+| Concern | Scriban | Razor | Liquid (custom) |
+| --- | --- | --- | --- |
+| Shipped in ABP 7.4.0 | ✅ default | ✅ | ❌ (this page is the pattern) |
+| Sandboxed (no arbitrary CLR calls) | ✅ | ❌ (full C#) | ✅ (Fluid restricts member access by default) |
+| Compile step | None — parse per render | Roslyn compile + assembly cache | None — parse per render (you can cache the AST) |
+| Localization helper | `{{ L "Key" arg }}` (function) | `@Localizer["Key", arg]` | `{{ "Key" \| L: arg }}` (filter — Liquid idiom) |
+| Layout passes child as | `{{ content }}` (in `globalContext`) | `@Body` (property) | `{{ content }}` (in `globalContext`) |
+| Model name in template | `model.X` | `Model.X` | `model.X` |
+| Use when | Emails / SMS / non-HTML, mistrusted authors | HTML emails / docs with C# logic, trusted authors | Existing Shopify-style templates, multi-tenant content authoring |
+
+## Gotchas
+
+- **There is no `Volo.Abp.TextTemplating.Liquid` package on NuGet.** Anything that imports `using Volo.Abp.TextTemplating.Liquid;` is either a custom internal package or copy-paste of the pattern shown here — verify the source before depending on it.
+- **The engine name is a string and case-sensitive.** `Options.RenderingEngines` is a plain `Dictionary<string, Type>`. `def.WithRenderEngine("liquid")` falls through to `DefaultRenderingEngine`. Always go through `WithLiquidEngine()` / `LiquidTemplateRenderingEngine.EngineName`.
+- **The folder reader only recognises `.tpl` and `.cshtml` extensions.** `LocalizedTemplateContentReaderFactory.CreateInternalAsync` hard-codes `new[] { ".tpl", ".cshtml" }`. If you want to use the folder layout (`/Emails/WelcomeEmail/en.liquid`) you must either reuse a `.tpl` extension or implement a custom `ILocalizedTemplateContentReader` that strips `.liquid`. Single-file inline-localized templates (`/Emails/WelcomeEmail.liquid`) work without any modification.
+- **Fluid's `MemberAccessStrategy` is restrictive by default.** Plain POCO models bind, but anonymous types and dynamic objects do not without registering their member access. Configure `AbpLiquidTemplateRenderingOptions.Options.MemberAccessStrategy` (e.g. `Register<MyModel>()`).
+- **Layouts share the Scriban convention, not Razor's.** The example engine pushes the child into `globalContext["content"]` so a layout looks like `<html>{{ content }}</html>`. If you'd rather use a property like `@Body`, model your engine on `RazorTemplateRenderingEngine` and pass the child as a method argument instead.
+- **`DefaultRenderingEngine` is a single slot.** With Scriban + Razor + your Liquid module all loaded, the last writer wins — but as long as you set `RenderEngine` explicitly on each `TemplateDefinition`, the default doesn't matter at render time.
+- **Parser caching is your responsibility.** `TemplateRenderingEngineBase` does not cache anything. The example caches `IFluidTemplate` keyed by `(name, culture)`. If you allow runtime template edits, key on `(name, culture, hash(content))` instead — the Razor engine uses `MD5(name + content)` for the same reason.
+- **`L` is unavailable when the definition lacks a localization resource.** `GetLocalizerOrNull` falls back to `StringLocalizerFactory.CreateDefaultOrNull()` and that may itself return `null`. The example engine simply does not register the `L` filter in that case; templates that use it would fail with Fluid's "filter not found" error.
+- **The engine is `ITransientDependency`.** Don't store request-scoped state on the engine itself — `AbpTemplateRenderer` creates a fresh DI scope and resolves the engine inside it on every call.
+
+## Related pages
+
+- [Text templating core](/framework/templating/text-templating) — the abstractions every engine builds on.
+- [Scriban rendering engine](/framework/templating/text-templating-scriban) — closest stylistically; same `L`-function pattern, same `content`-based layouts.
+- [Razor rendering engine](/framework/templating/text-templating-razor) — the alternative pattern, with Roslyn compilation and an injected `ServiceProvider` inside templates.
+- [Modularity](/framework/core/modularity) — how `[DependsOn(typeof(AbpTextTemplatingCoreModule))]` makes the abstractions available to your engine module.
+- [Localization](/framework/core/localization) — `IStringLocalizerFactory.CreateByResourceName`, the source of the strings the `L` filter resolves.

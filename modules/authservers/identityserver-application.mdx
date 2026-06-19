@@ -1,0 +1,248 @@
+---
+title: "Volo.Abp.IdentityServer.Application — Pro management implementation"
+sidebarTitle: "IdentityServer Application"
+description: "Pro-only application layer for the IdentityServer4 module — how the app services implement the contracts on top of the OSS repositories, ETO publishing, AutoMapper profile, authorization policies, and what the equivalent OSS-only path looks like."
+---
+
+`Volo.Abp.IdentityServer.Application` is the **Pro / Commercial** implementation of the [Application.Contracts](/modules/authservers/identityserver-application-contracts) interfaces. Like its sister contracts package, it is not part of the OSS monorepo at v7.4.0. This page documents:
+
+1. The implementation pattern Pro app services follow on top of the OSS Domain layer.
+2. The AutoMapper profile pattern aggregates ↔ DTOs round-trip through.
+3. ETO publishing for cache invalidation across nodes.
+4. Authorization-policy hookup.
+5. The OSS-only path you can take if you don't license Pro.
+
+## Expected file inventory (Pro)
+
+```
+Volo.Abp.IdentityServer.Application/
+└── Volo/Abp/IdentityServer/
+    ├── AbpIdentityServerApplicationModule.cs
+    ├── IdentityServerApplicationAutoMapperProfile.cs
+    ├── ApiResources/ApiResourceAppService.cs
+    ├── ApiScopes/ApiScopeAppService.cs
+    ├── Clients/ClientAppService.cs
+    └── IdentityResources/IdentityResourceAppService.cs
+```
+
+The module class is the standard `AbpModule` shape, depending on `AbpIdentityServerDomainModule` (OSS), `AbpIdentityServerApplicationContractsModule` (Pro contracts), and the standard `AbpDddApplicationModule`, `AbpAutoMapperModule`, `AbpAuthorizationModule`.
+
+## Service implementation pattern
+
+The Pro `ClientAppService` is essentially the minimal example shown in [`identityserver-application-contracts`](/modules/authservers/identityserver-application-contracts) plus three additional features:
+
+1. **Permission-checked CRUD** via `[Authorize(AbpIdentityServerPermissions.Clients.…)]` on the interface methods.
+2. **Aggregate-rooted child management** — separate `AddSecretAsync`, `UpdateSecretAsync`, `DeleteSecretAsync` actions, each `[UnitOfWork]`-scoped and re-validating the parent client.
+3. **Extra-property round-trip** through the `IObjectExtensionManager` registry.
+
+A representative pattern:
+
+```csharp
+[Authorize(AbpIdentityServerPermissions.Clients.Default)]
+public class ClientAppService :
+    CrudAppService<Client, ClientWithDetailsDto, ClientDto, Guid,
+        GetClientListInput, ClientCreateDto, ClientUpdateDto>,
+    IClientAppService
+{
+    protected IClientRepository ClientRepository { get; }
+    protected IPermissionDataSeeder PermissionSeeder { get; }
+
+    public ClientAppService(IClientRepository repository) : base(repository)
+    {
+        ClientRepository = repository;
+        GetPolicyName    = AbpIdentityServerPermissions.Clients.Default;
+        GetListPolicyName= AbpIdentityServerPermissions.Clients.Default;
+        CreatePolicyName = AbpIdentityServerPermissions.Clients.Create;
+        UpdatePolicyName = AbpIdentityServerPermissions.Clients.Update;
+        DeletePolicyName = AbpIdentityServerPermissions.Clients.Delete;
+    }
+
+    public override async Task<ClientWithDetailsDto> CreateAsync(ClientCreateDto input)
+    {
+        if (await ClientRepository.CheckClientIdExistAsync(input.ClientId))
+            throw new BusinessException(/* localised */);
+
+        var client = new Client(GuidGenerator.Create(), input.ClientId);
+        UpdateClientByInput(client, input);
+        input.MapExtraPropertiesTo(client);            // ← ExtraProperties bag
+        await ClientRepository.InsertAsync(client);
+        return ObjectMapper.Map<Client, ClientWithDetailsDto>(client);
+    }
+
+    protected virtual void UpdateClientByInput(Client client, ClientCreateOrUpdateDto input)
+    {
+        client.ClientName  = input.ClientName;
+        client.Description = input.Description;
+        client.Enabled     = input.Enabled;
+        // … the other 30+ scalars …
+
+        client.RemoveAllAllowedGrantTypes();
+        foreach (var g in input.AllowedGrantTypes) client.AddGrantType(g);
+
+        client.RemoveAllScopes();
+        foreach (var s in input.AllowedScopes) client.AddScope(s);
+
+        // …the other child collections…
+    }
+
+    public virtual async Task<ClientWithDetailsDto> CloneAsync(ClientCloneInput input)
+    {
+        var source = await ClientRepository.GetAsync(input.SourceClientId);
+        var clone  = new Client(GuidGenerator.Create(), input.ClientId);
+        clone.CopyAllScalars(source);                  // helper
+
+        if (input.CopyAllowedScopes)
+            foreach (var s in source.AllowedScopes) clone.AddScope(s.Scope);
+        if (input.CopyClientSecrets)
+            foreach (var s in source.ClientSecrets)
+                clone.AddSecret(s.Value, s.Expiration, s.Type, s.Description);
+        // … one branch per child collection …
+
+        await ClientRepository.InsertAsync(clone);
+        return ObjectMapper.Map<Client, ClientWithDetailsDto>(clone);
+    }
+}
+```
+
+The sister services (`ApiResourceAppService`, `ApiScopeAppService`, `IdentityResourceAppService`) follow the same template, each with its own permission constants and aggregate-specific mutation methods.
+
+## AutoMapper profile
+
+`IdentityServerApplicationAutoMapperProfile` (Pro) is separate from the Domain layer's `IdentityServerAutoMapperProfile` (OSS, used to map aggregates ↔ IS4 in-memory models). The application profile declares the **aggregate ↔ DTO** maps. A typical pair:
+
+```csharp
+public class IdentityServerApplicationAutoMapperProfile : Profile
+{
+    public IdentityServerApplicationAutoMapperProfile()
+    {
+        CreateMap<Client, ClientDto>();
+        CreateMap<Client, ClientWithDetailsDto>()
+            .ForMember(d => d.AllowedScopes,
+                       o => o.MapFrom(s => s.AllowedScopes.Select(x => x.Scope).ToList()))
+            .ForMember(d => d.AllowedGrantTypes,
+                       o => o.MapFrom(s => s.AllowedGrantTypes.Select(x => x.GrantType).ToList()))
+            .ForMember(d => d.RedirectUris,
+                       o => o.MapFrom(s => s.RedirectUris.Select(x => x.RedirectUri).ToList()))
+            // … etc.
+            ;
+
+        CreateMap<ClientSecret, ClientSecretDto>();
+        CreateMap<ApiResource, ApiResourceDto>();
+        CreateMap<ApiResource, ApiResourceWithDetailsDto>()
+            .ForMember(d => d.UserClaims,
+                       o => o.MapFrom(s => s.UserClaims.Select(x => x.Type).ToList()))
+            .ForMember(d => d.Scopes,
+                       o => o.MapFrom(s => s.Scopes.Select(x => x.Scope).ToList()));
+        // … and so on for ApiScope, IdentityResource …
+    }
+}
+```
+
+The DTOs inherit from `ExtensibleAuditedEntityDto<Guid>` so AutoMapper picks up the `ExtraProperties` dictionary automatically — the Domain `ApplyObjectExtensionMappings` call (see EF Core configuration) registers the matching JSON column on the EF side.
+
+## ETO publishing and cache invalidation
+
+The `AbpIdentityServerDomainModule` registers the `ClientEto`, `ApiResourceEto`, `IdentityResourceEto`, `DeviceFlowCodesEto` mappings in `AbpDistributedEntityEventOptions.EtoMappings`:
+
+```csharp
+Configure<AbpDistributedEntityEventOptions>(options =>
+{
+    options.EtoMappings.Add<ApiResource,       ApiResourceEto>(typeof(AbpIdentityServerDomainModule));
+    options.EtoMappings.Add<Client,            ClientEto>(typeof(AbpIdentityServerDomainModule));
+    options.EtoMappings.Add<DeviceFlowCodes,   DeviceFlowCodesEto>(typeof(AbpIdentityServerDomainModule));
+    options.EtoMappings.Add<IdentityResource,  IdentityResourceEto>(typeof(AbpIdentityServerDomainModule));
+});
+```
+
+That means **every Insert / Update / Delete an app service performs on these aggregates fires an `EntityCreatedEto<TEto>` / `EntityUpdatedEto<TEto>` / `EntityDeletedEto<TEto>` distributed event automatically**. `IdentityServerCacheItemInvalidator` (Domain layer) subscribes to those events and removes the `IDistributedCache<IdentityServer4.Models.Client>` entry the `ClientStore` populated — so a client edit in node A is honoured by node B on the next token request without re-deploying.
+
+```mermaid
+sequenceDiagram
+    participant Admin as Admin UI
+    participant Svc as ClientAppService (Pro)
+    participant Repo as IClientRepository
+    participant DB as DB
+    participant Bus as Distributed Event Bus
+    participant Cache as IDistributedCache&lt;IS4.Client&gt;
+    participant Other as Other host instance
+
+    Admin->>Svc: UpdateAsync(id, dto)
+    Svc->>Repo: UpdateAsync(client)
+    Repo->>DB: UPDATE Client + child tables
+    DB-->>Repo: ok
+    Note over Svc,Bus: UoW completes
+    Bus-->>Other: EntityUpdatedEto&lt;ClientEto&gt;
+    Other->>Cache: Remove(clientId)
+    Other-->>Other: next /connect/token re-reads client
+```
+
+## Authorization policies
+
+Permission group `AbpIdentityServer` is registered by `AbpIdentityServerPermissionDefinitionProvider` (Pro). The permission tree maps onto the OSS aggregates:
+
+| Permission key | Operation |
+| --- | --- |
+| `AbpIdentityServer.Clients` | List / Get |
+| `AbpIdentityServer.Clients.Create` | Insert |
+| `AbpIdentityServer.Clients.Update` | Update |
+| `AbpIdentityServer.Clients.Delete` | Delete |
+| `AbpIdentityServer.Clients.ManageClaims` | Add/Update/Delete `ClientClaim` |
+| `AbpIdentityServer.Clients.ManageScopes` | Add/Remove `ClientScope` |
+| `AbpIdentityServer.Clients.ManageSecrets` | Add/Update/Delete `ClientSecret` |
+| `AbpIdentityServer.Clients.ManageGrantTypes` | Add/Remove `ClientGrantType` |
+| `AbpIdentityServer.Clients.ManageCorsOrigins` | Add/Remove `ClientCorsOrigin` |
+| `AbpIdentityServer.Clients.ManageProperties` | Add/Update/Delete `ClientProperty` |
+| `AbpIdentityServer.IdentityResources.*` | CRUD over `IdentityResource` |
+| `AbpIdentityServer.ApiResources.*` | CRUD over `ApiResource` |
+| `AbpIdentityServer.ApiScopes.*` | CRUD over `ApiScope` |
+
+The app services consume them via `CrudAppService.<Get|GetList|Create|Update|Delete>PolicyName` plus `[Authorize(...)]` on the bespoke methods.
+
+## What the OSS-only path looks like
+
+Without Pro you can produce equivalent behaviour by:
+
+1. **Writing your own `IClientAppService` interface** in your `*.Application.Contracts` project against `IClientRepository` from the OSS Domain.
+2. **Registering your own permission group** (don't reuse `AbpIdentityServer` — that name is reserved for the Pro packages).
+3. **Reusing the OSS `IdentityServerCacheItemInvalidator`** by simply including `Volo.Abp.IdentityServer.Domain` — its event handlers are already registered.
+4. **Calling `IIdentityResourceDataSeeder.CreateStandardResourcesAsync()`** from your own `IDataSeedContributor` to seed `openid`, `profile`, `email`, `phone`, `address`, `role`.
+
+The Domain layer's `IdentityResourceDataSeeder` shows the seed shape you should copy when seeding clients:
+
+```csharp
+public virtual async Task CreateStandardResourcesAsync()
+{
+    var resources = new[]
+    {
+        new IdentityServer4.Models.IdentityResources.OpenId(),
+        new IdentityServer4.Models.IdentityResources.Profile(),
+        new IdentityServer4.Models.IdentityResources.Email(),
+        new IdentityServer4.Models.IdentityResources.Address(),
+        new IdentityServer4.Models.IdentityResources.Phone(),
+        new IdentityServer4.Models.IdentityResource("role", "Roles of the user", new[] {"role"})
+    };
+    foreach (var resource in resources)
+    {
+        foreach (var claimType in resource.UserClaims)
+            await AddClaimTypeIfNotExistsAsync(claimType);
+        await AddIdentityResourceIfNotExistsAsync(resource);
+    }
+}
+```
+
+You can stitch a similar client seeder around `Client.AddGrantType / AddScope / AddRedirectUri / AddSecret`.
+
+## Gotchas
+
+- **Child-collection updates must clear-and-re-add.** EF Core's owned collections don't merge nicely; `UpdateClientByInput` calls `client.RemoveAllAllowedGrantTypes()` before re-adding. The mutation helpers exposed by `Client` (`RemoveAllScopes`, `RemoveAllCorsOrigins`, `RemoveAllRedirectUris`, …) are there for exactly this.
+- **Cloning copies hashes literally.** `Client.AddSecret(s.Value, …)` will copy already-hashed secrets verbatim. If you want a fresh secret on the clone, generate one and don't carry over `CopyClientSecrets`.
+- **`ClientId` is the natural key.** Even though `Guid` is the primary key, all IS4 lookups happen via `ClientId`. Two rows with the same `ClientId` will pass FK constraints but silently break the auth pipeline; the `CheckClientIdExistAsync` guard is the only line of defence.
+- **Permission group collision.** Importing a future Pro package on top of a hand-rolled `AbpIdentityServer.*` permission tree will fail at startup with a duplicate-permission-name exception.
+
+## Cross-links
+
+- Contracts shape the implementation honours: [`identityserver-application-contracts`](/modules/authservers/identityserver-application-contracts)
+- Aggregates and repository helpers: [`identityserver-domain`](/modules/authservers/identityserver-domain)
+- ETO definitions: [`identityserver-domain-shared`](/modules/authservers/identityserver-domain-shared)
+- EF Core persistence: [`identityserver-efcore`](/modules/authservers/identityserver-efcore)
+- Permission-management framework: [`framework/cross/authorization`](/framework/cross/authorization)

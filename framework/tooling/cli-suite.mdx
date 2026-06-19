@@ -1,0 +1,422 @@
+---
+title: "abp suite"
+description: "How SuiteCommand installs, updates, runs and remote-controls ABP Suite — the commercial CRUD generator — via dotnet tool and a local HTTP API."
+---
+
+`abp suite` is a thin wrapper around the **commercial** `Volo.Abp.Suite`
+.NET global tool. The command lives entirely inside
+`Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/SuiteCommand.cs` and orchestrates:
+
+- installing/updating/removing the tool from `nuget.abp.io`,
+- launching it (in headless `--no-browser` mode when it has to drive it
+  itself, otherwise interactively),
+- generating a CRUD page through Suite's HTTP API.
+
+This page explains the moving parts in v7.4.0 so you can read the source
+and understand what the verb is doing on your behalf.
+
+## File inventory
+
+```text
+framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/
+├── Commands/
+│   └── SuiteCommand.cs                    # Everything for `abp suite`
+├── Commands/Services/
+│   └── SuiteAppSettingsService.cs         # Reads Suite's appsettings.json
+├── Auth/
+│   └── AuthService.cs                     # GetLoginInfoAsync() — needed for Suite
+├── Http/
+│   └── CliHttpClientFactory.cs            # Talks to localhost:<port>/api/abpSuite/*
+└── Version/
+    ├── AbpNuGetIndexUrlService.cs         # https://nuget.abp.io/<key>/v3/index.json
+    └── PackageVersionCheckerService.cs    # Find latest preview / stable Suite version
+```
+
+## Subcommands
+
+`SuiteCommand` recognises four sub-verbs through `commandLineArgs.Target`:
+
+```csharp
+switch (operationType)
+{
+    case "":
+    case null:
+        await InstallSuiteIfNotInstalledAsync(currentSuiteVersionAsString);
+        _abpSuitePort = await _suiteAppSettingsService.GetSuitePortAsync(currentSuiteVersionAsString);
+        RunSuite(commandLineArgs);
+        break;
+
+    case "generate":
+        await InstallSuiteIfNotInstalledAsync(currentSuiteVersionAsString);
+        _abpSuitePort = await _suiteAppSettingsService.GetSuitePortAsync(currentSuiteVersionAsString);
+        var suiteProcess = StartSuite();
+        Thread.Sleep(500);                  // wait for it to bind the port
+        await GenerateCrudPageAsync(commandLineArgs);
+        if (suiteProcess != null) KillSuite();
+        break;
+
+    case "install":
+        await InstallSuiteAsync(version, preview);
+        break;
+
+    case "update":
+        await UpdateSuiteAsync(version, preview);
+        break;
+
+    case "remove":
+        Logger.LogInformation("Removing ABP Suite...");
+        RemoveSuite();
+        break;
+}
+```
+
+`operationType` is normalised with `NamespaceHelper.NormalizeNamespace`,
+so case-variants of `Install` / `INSTALL` work.
+
+## Flag reference
+
+| Flag | Subcommands | Effect |
+| --- | --- | --- |
+| `-v`, `--version <ver>` | `install`, `update` | Pin a specific Suite version. |
+| `-p`, `--preview` | `install`, `update` | Use the latest pre-release Suite. |
+| `-s`, `--solution <file>` | `generate`, and bare `abp suite` | Solution to load (or generate against). |
+| `-e`, `--entity <file>` | `generate` | Path to the CRUD entity JSON file. |
+
+The class has nested `Options.Preview`, `Options.Version`,
+`Options.Crud.Solution` and `Options.Crud.Entity` containers — the
+familiar `Short` / `Long` constants pattern shared with every other
+command.
+
+## `abp suite install`
+
+```csharp
+private async Task InstallSuiteAsync(string version = null, bool preview = false)
+{
+    var nugetIndexUrl = await _nuGetIndexUrlService.GetAsync();
+    if (nugetIndexUrl == null) return;
+
+    var versionOption = string.Empty;
+    if (preview)
+    {
+        var latestPreviewVersion = await GetLatestPreviewVersion();
+        if (latestPreviewVersion != null)
+            versionOption = $" --version {latestPreviewVersion}";
+    }
+    else if (version != null)
+    {
+        versionOption = $" --version {version}";
+    }
+
+    CmdHelper.RunCmd(
+        $"dotnet tool install {SuitePackageName}{versionOption} --add-source {nugetIndexUrl} -g",
+        out int exitCode);
+
+    if (exitCode == 0)
+    {
+        Logger.LogInformation("ABP Suite has been successfully installed.");
+        Logger.LogInformation("You can run it with the CLI command \"abp suite\"");
+    }
+    else
+    {
+        ShowSuiteManualInstallCommand();
+    }
+}
+```
+
+Notes:
+
+- **`SuitePackageName = "Volo.Abp.Suite"`** — the constant at the top of
+  the file.
+- **`_nuGetIndexUrlService.GetAsync()`** fetches the per-account index
+  URL: `https://nuget.abp.io/<api-key>/v3/index.json`. That is why
+  `abp login` is a hard prerequisite — without an API key there is no
+  source to install from.
+- **`-g`** installs as a global tool. The CLI does not currently support
+  installing Suite into a tool-manifest.
+- **Manual fallback.** If `dotnet tool install` returns non-zero, the
+  CLI logs the manual command for you to copy-paste:
+
+  ```bash
+  dotnet tool install -g Volo.Abp.Suite \
+      --add-source https://nuget.abp.io/<your-private-key>/v3/index.json
+  ```
+
+### Preview-version detection
+
+`GetLatestPreviewVersion` uses `PackageVersionCheckerService` to query
+`nuget.abp.io` for `Volo.Abp.Suite` with `includeReleaseCandidates: true`,
+and returns it only if `IsPrerelease`:
+
+```csharp
+private async Task<string> GetLatestPreviewVersion()
+{
+    var latest = await _packageVersionCheckerService.GetLatestVersionOrNullAsync(
+        packageId: SuitePackageName, includeReleaseCandidates: true);
+
+    return latest.Version.IsPrerelease ? latest.Version.ToString() : null;
+}
+```
+
+## `abp suite update`
+
+Symmetric to install, but emits `dotnet tool update`. The same
+"workaround for `dotnet tool update --version` not accepting
+pre-releases" applies here too — when a preview version is requested,
+the CLI prefers `update --version <X>` (which works on recent SDKs);
+older SDKs may need an uninstall+install pair.
+
+```csharp
+CmdHelper.RunCmd(
+    $"dotnet tool update {SuitePackageName}{versionOption} --add-source {nugetIndexUrl} -g",
+    out int exitCode);
+
+if (exitCode != 0) ShowSuiteManualUpdateCommand();
+```
+
+## `abp suite remove`
+
+A one-liner:
+
+```csharp
+private void RemoveSuite()
+{
+    CmdHelper.RunCmd("dotnet tool uninstall " + SuitePackageName + " -g");
+}
+```
+
+## Bare `abp suite` — launching the tool
+
+```csharp
+private void RunSuite(CommandLineArgs commandLineArgs)
+{
+    if (!GlobalToolHelper.IsGlobalToolInstalled("abp-suite"))
+    {
+        Logger.LogWarning("ABP Suite is not installed! To install it you can run \"abp suite install\"");
+        return;
+    }
+
+    var targetSolution = GetTargetSolutionOrNull(commandLineArgs);
+    var launchUrl = targetSolution == null
+        ? $"http://localhost:{_abpSuitePort}"
+        : $"http://localhost:{_abpSuitePort}/CrudPageGenerator/Create?targetSolution={targetSolution}";
+
+    if (IsSuiteAlreadyRunning())
+    {
+        Logger.LogInformation("Opening suite...");
+        CmdHelper.Open(launchUrl);
+        return;
+    }
+
+    if (IsPortAlreadyInUse())
+    {
+        Logger.LogError($"Port \"{_abpSuitePort}\" is already in use.");
+        return;
+    }
+
+    if (targetSolution == null)
+    {
+        var args = Environment.GetCommandLineArgs();
+        var suiteArgs = args.Skip(2).JoinAsString(" ");
+        CmdHelper.RunCmd("abp-suite " + suiteArgs);
+    }
+    else
+    {
+        new Thread(OpenSuiteInBrowserWithLaunchUrl).Start();
+        CmdHelper.RunCmd("abp-suite --no-browser");
+
+        void OpenSuiteInBrowserWithLaunchUrl()
+        {
+            Thread.Sleep(2500);            // give the web app time to start
+            CmdHelper.Open(launchUrl);
+        }
+    }
+}
+```
+
+Two branches:
+
+- **No solution given.** The CLI re-forwards every CLI flag after
+  `abp suite` directly to `abp-suite`. Suite opens in your default
+  browser.
+- **Solution given.** The CLI launches Suite headlessly
+  (`--no-browser`) and opens the browser itself at the
+  `/CrudPageGenerator/Create?targetSolution=…` deep link so you land
+  directly on the generator for that solution.
+
+### Port handling
+
+The Suite port is read from Suite's own `appsettings.json` by
+`SuiteAppSettingsService.GetSuitePortAsync(currentSuiteVersionAsString)`.
+Default is `3000`, declared as the field initialiser
+`private int _abpSuitePort = 3000;`. If you have multiple Suite
+versions installed side-by-side, each has its own port.
+
+`IsSuiteAlreadyRunning()` checks for processes with name containing
+`abp-suite`:
+
+```csharp
+private IEnumerable<Process> GetProcessesRelatedWithSuite()
+{
+    return Process.GetProcesses()
+                  .Where(p => p.ProcessName.ToLower().Contains("abp-suite"));
+}
+```
+
+`IsPortAlreadyInUse()` uses `IPGlobalProperties.GetIPGlobalProperties()`
+to enumerate active TCP listeners.
+
+## `abp suite generate` — driving Suite over HTTP
+
+The most under-documented sub-verb. It lets you generate a CRUD page
+from a JSON entity descriptor **without** opening Suite's UI:
+
+```bash
+abp suite generate \
+    -s ../Acme.BookStore.sln \
+    -e ./entities/Book.json
+```
+
+### How it works
+
+```csharp
+var suiteProcess = StartSuite();         // launches abp-suite --no-browser
+Thread.Sleep(500);                       // wait for binding
+await GenerateCrudPageAsync(args);
+if (suiteProcess != null) KillSuite();   // kill it after we're done
+```
+
+Inside `GenerateCrudPageAsync`:
+
+1. Validates the `-s` and `-e` flags (entity must end with `.json` and
+   exist; solution must end with `.sln`).
+2. POSTs the solution path to
+   `http://localhost:<port>/api/abpSuite/addSolution` if Suite doesn't
+   know about it yet (via `GetSolutionIdAsync` + `AddSolutionToSuiteAsync`).
+3. Calls `is-built` to check whether the solution has been built
+   recently. If not, it runs `dotnet build` in the solution directory.
+4. POSTs the contents of the entity file to
+   `http://localhost:<port>/api/abpSuite/crudPageGenerator/<id>/save-and-generate-entity`.
+5. Reads back the response; an empty body means success.
+
+```csharp
+var responseMessage = await client.PostAsync(
+    $"http://localhost:{_abpSuitePort}/api/abpSuite/crudPageGenerator/{solutionId}/save-and-generate-entity",
+    entityContent);
+
+var response = await responseMessage.Content.ReadAsStringAsync();
+
+if (!response.IsNullOrWhiteSpace())
+{
+    Logger.LogError(response);
+    if (response.Contains("Commercial.SuiteTemplates.dll"))
+        Logger.LogInformation("The solution should be built before generating an entity!");
+}
+else
+{
+    Logger.LogInformation("CRUD page generation successfully completed.");
+}
+```
+
+Retries are encoded in `GetSolutionIdAsync` with a 10-step interval list
+of `TimeSpan.FromSeconds(5)`, so the CLI waits up to ~50 seconds for
+Suite to come online.
+
+### Entity JSON
+
+The entity file shape matches what Suite's UI persists. Capture it once
+from the Suite UI (click "Save"), then commit the JSON and replay it
+from CI:
+
+```json
+{
+  "name": "Book",
+  "namespace": "Acme.BookStore.Books",
+  "databaseTableName": "Books",
+  "properties": [
+    { "name": "Name", "type": "string", "isNullable": false, "maxLength": 128 },
+    { "name": "Price", "type": "decimal", "isNullable": false }
+  ],
+  "createUi": true,
+  "createDto": true
+}
+```
+
+## Authentication
+
+```csharp
+#if !DEBUG
+    var loginInfo = await _authService.GetLoginInfoAsync();
+    if (string.IsNullOrEmpty(loginInfo?.Organization))
+        throw new CliUsageException("Please login with your account.");
+#endif
+```
+
+In a non-DEBUG build, `abp suite` refuses to run if you have no token or
+the token doesn't carry an organisation claim. The token lives at
+`~/.abp/cli/access-token.bin` (see `CliPaths.AccessToken`); refresh it
+with `abp login`.
+
+## Usage screen
+
+```text
+Usage:
+  abp suite [options]
+
+Options:
+  <no argument>      (run ABP Suite)
+  install            (install ABP Suite as a dotnet global tool)
+  update             (update ABP Suite to the latest)
+  remove             (uninstall ABP Suite)
+
+Examples:
+  abp suite
+  abp suite install
+  abp suite install --preview
+  abp suite install --version 4.2.2
+  abp suite update
+  abp suite update --preview
+  abp suite remove
+```
+
+The `generate` sub-verb is intentionally not advertised in the help
+screen — it's primarily a CI hook used by ABP Studio and template tests.
+
+## Gotchas
+
+- **Login is mandatory.** Without `abp login` and an organisation,
+  install and run both refuse to start.
+- **`dotnet tool` needs the NuGet API key.** `nuget.abp.io` only
+  authorises commercial customers; the CLI fetches the URL only after
+  login.
+- **Suite uses port 3000 by default.** If something else (React dev
+  server is the classic offender) is listening, you'll get
+  `Port "3000" is already in use.`. Change Suite's `appsettings.json`
+  via the GUI or expose a `Suite__Port` env var.
+- **`generate` blocks until Suite reports built.** If your solution
+  doesn't compile, the CLI will run `dotnet build` for you and surface
+  the error directly.
+- **Killing Suite.** `abp suite generate` kills every `abp-suite`
+  process at the end. If you had an interactive Suite running before,
+  it will be terminated too. Use the explicit
+  `RunSuite`/interactive path for everyday work.
+- **Pre-release on Linux/macOS.** Some old preview builds shipped only
+  Windows binaries; if `--preview` installs a version that doesn't
+  start, fall back to `abp suite install` (stable).
+- **`dotnet tool list -g` parsing.** `GetCurrentSuiteVersion` looks for
+  a line starting with `volo.abp.suite ` (case-insensitive). Custom
+  prefixes (e.g. piped output from another CLI) can confuse it.
+
+## Cross-references
+
+- [CLI host](./cli) — login state, `~/.abp/cli/access-token.bin`,
+  `nuget.abp.io` URL resolution.
+- [Command registry](./cli-commands) — where
+  `SuiteCommand.Name = "suite"` is wired in.
+- [`abp add-package`](./cli-add-package) — Suite reuses
+  `ProjectNugetPackageAdder` over HTTP when you install a module from
+  its UI.
+- [ABP Studio](./studio) — the spiritual successor to Suite, which
+  ships its own CLI verbs in addition to driving Suite.
+- Official documentation:
+  [docs.abp.io/en/commercial/latest/abp-suite/index](https://docs.abp.io/en/commercial/latest/abp-suite/index),
+  [commercial.abp.io/tools/suite](https://commercial.abp.io/tools/suite).

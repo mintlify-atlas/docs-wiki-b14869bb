@@ -1,0 +1,298 @@
+---
+title: "Volo.Abp.SettingManagement.EntityFrameworkCore"
+description: "DbContext, EF Core repositories, and model-builder extensions for the AbpSettings and AbpSettingDefinitions tables — plus the Oracle column-length workaround."
+---
+
+The EF Core persistence package wires the `Setting` aggregate and the optional `SettingDefinitionRecord` to a relational database. It is the most-used storage backend; the MongoDB equivalent is documented in [MongoDB](/modules/setting-management/mongodb).
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingManagementDomainModule),
+    typeof(AbpEntityFrameworkCoreModule))]
+public class AbpSettingManagementEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<SettingManagementDbContext>(options =>
+        {
+            options.AddDefaultRepositories<ISettingManagementDbContext>();
+            options.AddRepository<Setting, EfCoreSettingRepository>();
+            options.AddRepository<SettingDefinitionRecord, EfCoreSettingDefinitionRecordRepository>();
+        });
+    }
+}
+```
+
+`AddDefaultRepositories<ISettingManagementDbContext>()` registers the basic `IRepository<T, TKey>` against the interface DbContext — but the *specialized* `ISettingRepository` and `ISettingDefinitionRecordRepository` interfaces come from the explicit `AddRepository<…>` calls. The Domain layer only knows about the specialized interfaces; the default basic repositories are convenience for application code that needs raw CRUD.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.EntityFrameworkCore/Volo/Abp/SettingManagement/EntityFrameworkCore/
+├── AbpSettingManagementEntityFrameworkCoreModule.cs
+├── EfCoreSettingDefinitionRecordRepository.cs
+├── EfCoreSettingRepository.cs
+├── ISettingManagementDbContext.cs
+├── SettingManagementDbContext.cs
+└── SettingManagementDbContextModelBuilderExtensions.cs
+```
+
+## `ISettingManagementDbContext`
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public interface ISettingManagementDbContext : IEfCoreDbContext
+{
+    DbSet<Setting> Settings { get; }
+    DbSet<SettingDefinitionRecord> SettingDefinitionRecords { get; }
+}
+```
+
+Two attributes drive the behaviour:
+
+* **`[IgnoreMultiTenancy]`** — even though `Setting` rows have a `ProviderKey` that may carry a tenant ID, the *table itself* lives in the host database. This stops the framework's `IDataFilter<IMultiTenant>` from injecting `TenantId == CurrentTenant.Id` filters on queries. Without this attribute, host-side queries would mysteriously return zero rows in tenant context.
+* **`[ConnectionStringName("AbpSettingManagement")]`** — the module advertises a logical connection string name. Applications can map it to the default connection in `appsettings.json` or route it to a separate database via `ConnectionStrings:AbpSettingManagement`.
+
+The interface is a stable target for `EfCoreRepository<TDbContext, TEntity, TKey>`. Any application can supply its *own* implementation of this DbContext interface (e.g. a single application DbContext that aggregates several module entities) and the module's repositories will still bind to it.
+
+## `SettingManagementDbContext`
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public class SettingManagementDbContext : AbpDbContext<SettingManagementDbContext>, ISettingManagementDbContext
+{
+    public DbSet<Setting> Settings { get; set; }
+    public DbSet<SettingDefinitionRecord> SettingDefinitionRecords { get; set; }
+
+    public SettingManagementDbContext(DbContextOptions<SettingManagementDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureSettingManagement();
+    }
+}
+```
+
+This is the *standalone* context used by the `AddAbpDbContext<SettingManagementDbContext>` registration. In most applications it is replaced by the host application's own context, which also calls `builder.ConfigureSettingManagement()`. The standalone version stays around so the module's repositories work even in test projects that don't compose an application context.
+
+## `ConfigureSettingManagement` — the model-builder extension
+
+```csharp
+public static class SettingManagementDbContextModelBuilderExtensions
+{
+    public static void ConfigureSettingManagement([NotNull] this ModelBuilder builder)
+    {
+        Check.NotNull(builder, nameof(builder));
+
+        if (builder.IsTenantOnlyDatabase())
+        {
+            return;
+        }
+
+        builder.Entity<Setting>(b =>
+        {
+            b.ToTable(AbpSettingManagementDbProperties.DbTablePrefix + "Settings",
+                AbpSettingManagementDbProperties.DbSchema);
+
+            b.ConfigureByConvention();
+
+            b.Property(x => x.Name).HasMaxLength(SettingConsts.MaxNameLength).IsRequired();
+
+            if (builder.IsUsingOracle()) { SettingConsts.MaxValueLengthValue = 2000; }
+            b.Property(x => x.Value).HasMaxLength(SettingConsts.MaxValueLengthValue).IsRequired();
+
+            b.Property(x => x.ProviderName).HasMaxLength(SettingConsts.MaxProviderNameLength);
+            b.Property(x => x.ProviderKey).HasMaxLength(SettingConsts.MaxProviderKeyLength);
+
+            b.HasIndex(x => new { x.Name, x.ProviderName, x.ProviderKey }).IsUnique(true);
+
+            b.ApplyObjectExtensionMappings();
+        });
+
+        builder.Entity<SettingDefinitionRecord>(b =>
+        {
+            b.ToTable(AbpSettingManagementDbProperties.DbTablePrefix + "SettingDefinitions",
+                AbpSettingManagementDbProperties.DbSchema);
+
+            b.ConfigureByConvention();
+
+            b.Property(x => x.Name).HasMaxLength(SettingDefinitionRecordConsts.MaxNameLength).IsRequired();
+            b.Property(x => x.DisplayName).HasMaxLength(SettingDefinitionRecordConsts.MaxDisplayNameLength).IsRequired();
+            b.Property(x => x.Description).HasMaxLength(SettingDefinitionRecordConsts.MaxDescriptionLength);
+            b.Property(x => x.DefaultValue).HasMaxLength(SettingDefinitionRecordConsts.MaxDefaultValueLength);
+            b.Property(x => x.Providers).HasMaxLength(SettingDefinitionRecordConsts.MaxProvidersLength);
+
+            b.HasIndex(x => new { x.Name }).IsUnique();
+
+            b.ApplyObjectExtensionMappings();
+        });
+
+        builder.TryConfigureObjectExtensions<SettingManagementDbContext>();
+    }
+}
+```
+
+### Tables
+
+* **`{prefix}Settings`** — uses `Volo.Abp.Data.AbpCommonDbProperties.DbTablePrefix`, which defaults to `Abp` so the table name is `AbpSettings`. Override `AbpSettingManagementDbProperties.DbTablePrefix` *before* `OnModelCreating` runs if you want `AbpSettingManagementSettings` or similar.
+* **`{prefix}SettingDefinitions`** — `AbpSettingDefinitions` by default. Only populated when the dynamic setting store is enabled.
+
+### Unique indexes
+
+The composite unique index on `Settings (Name, ProviderName, ProviderKey)` is the linchpin of the entire persistence model. Every read by `EfCoreSettingRepository.FindAsync` and every write by `SettingManagementStore.SetAsync` relies on it. Custom migrations must not drop or modify it without compensating updates to `ISettingRepository`.
+
+`SettingDefinitions` has a single unique index on `Name`. There can be only one definition per setting name across the entire application.
+
+### Tenant-only databases
+
+```csharp
+if (builder.IsTenantOnlyDatabase()) return;
+```
+
+When the model builder is configuring a *tenant* database (i.e. ABP's multi-tenant database-per-tenant feature is enabled and this `ModelBuilder` is for a tenant DB), the module skips creating any tables. The Setting Management module lives **only in the host database**.
+
+### Oracle's 2000-char ceiling
+
+```csharp
+if (builder.IsUsingOracle()) { SettingConsts.MaxValueLengthValue = 2000; }
+```
+
+Oracle's `NVARCHAR2` maxes out at 2000 characters per column when stored in-row. The model builder mutates the *static* `SettingConsts.MaxValueLengthValue` so the `HasMaxLength(SettingConsts.MaxValueLengthValue)` call captures the right number. This is intentionally `MaxValueLengthValue` — a separate property from `MaxValueLength` — so applications can read the original `MaxValueLength` for client-side validation while EF Core uses the constrained value.
+
+If you target Oracle with values longer than 2000 characters, switch the column type to `CLOB` via a custom property configuration or split the value across multiple settings.
+
+### Object extensions
+
+`b.ApplyObjectExtensionMappings()` and `builder.TryConfigureObjectExtensions<SettingManagementDbContext>()` activate the framework's `ObjectExtensionManager`. Applications can add custom columns:
+
+```csharp
+ObjectExtensionManager.Instance
+    .MapEfCoreProperty<Setting, string>(
+        "ExternalId",
+        b => { b.HasMaxLength(64); }
+    );
+```
+
+The extension is automatically created as a real EF Core property on the entity, included in migrations, and available through `entity.GetProperty("ExternalId")`.
+
+## `EfCoreSettingRepository`
+
+```csharp
+public class EfCoreSettingRepository : EfCoreRepository<ISettingManagementDbContext, Setting, Guid>, ISettingRepository
+{
+    public EfCoreSettingRepository(IDbContextProvider<ISettingManagementDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<Setting> FindAsync(
+        string name, string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Setting>> GetListAsync(
+        string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Setting>> GetListAsync(
+        string[] names, string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => names.Contains(s.Name) && s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+A few details that matter for performance:
+
+* The `FindAsync` overload uses `OrderBy(x => x.Id).FirstOrDefaultAsync(...)`. The ordering is defensive against the unique index being absent during data-migration or seed scenarios — the call still returns one deterministic row.
+* `names.Contains(s.Name)` translates to a SQL `IN (...)` clause. EF Core 6+ caches the plan per array length up to 2048 elements; beyond that you'll see plan-cache thrash. The current `SettingManagementStore.GetCacheItemsAsync` never passes more than the number of declared settings (typically a few dozen), so this is rarely a problem.
+* There's no parameter for tenant or any other implicit filter — the repository talks raw entity columns. Multi-tenancy filtering is *suppressed* by `[IgnoreMultiTenancy]` on the DbContext interface.
+
+## `EfCoreSettingDefinitionRecordRepository`
+
+```csharp
+public class EfCoreSettingDefinitionRecordRepository :
+    EfCoreRepository<ISettingManagementDbContext, SettingDefinitionRecord, Guid>,
+    ISettingDefinitionRecordRepository
+{
+    public EfCoreSettingDefinitionRecordRepository(IDbContextProvider<ISettingManagementDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<SettingDefinitionRecord> FindByNameAsync(string name, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(x => x.Name == name, cancellationToken);
+    }
+}
+```
+
+Used heavily by `StaticSettingSaver` and `DynamicSettingDefinitionStore` during startup. The unique `Name` index makes `FindByNameAsync` an index seek; the `OrderBy(x => x.Id)` is again defensive.
+
+## Wiring this into an application DbContext
+
+The recommended pattern is for the host application to expose a single DbContext that implements every module's interface. Example:
+
+```csharp
+[ConnectionStringName("Default")]
+public class MyAppDbContext : AbpDbContext<MyAppDbContext>,
+    ISettingManagementDbContext,
+    IIdentityDbContext // ...
+{
+    public DbSet<Setting> Settings { get; set; }
+    public DbSet<SettingDefinitionRecord> SettingDefinitionRecords { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+
+        builder.ConfigureSettingManagement();
+        builder.ConfigureIdentity();
+        // ...
+    }
+}
+```
+
+Then in the application's EF Core module:
+
+```csharp
+context.Services.AddAbpDbContext<MyAppDbContext>(options =>
+{
+    options.ReplaceDbContext<ISettingManagementDbContext>();
+    // ...
+});
+```
+
+The `ReplaceDbContext<ISettingManagementDbContext>()` call tells the framework to redirect every `IDbContextProvider<ISettingManagementDbContext>` resolution to `MyAppDbContext`. The module's repositories continue to work unchanged.
+
+## Migration considerations
+
+* **Adding a new `EmbeddedResource`** to your migrations project picks up new module versions automatically — the `ConfigureSettingManagement` extension always sees the current `SettingConsts` values.
+* **`MaxValueLength` changes** require an `AlterColumn` migration if you bump it. The model builder uses the *current* static value, so existing DBs won't shrink automatically — but EF Core will see the difference on the next `Add-Migration`.
+* **Object extension columns** are detected by EF Core diffing — they appear in migrations as long as the extension is registered *before* `Add-Migration` runs. Re-run the design-time DbContext factory with the extension wired in.
+
+## Gotchas
+
+* **Don't drop `[IgnoreMultiTenancy]`.** Adding implicit tenant filters silently corrupts host-only reads.
+* **`MaxValueLength` mutations are global.** The static property is shared by every DbContext in the process. If a single application targets both SQL Server and Oracle simultaneously (rare but possible), the first one to call `OnModelCreating` wins.
+* **`AddRepository<…>` is order-sensitive.** Calling `AddRepository<Setting, EfCoreSettingRepository>()` *after* `AddDefaultRepositories<…>()` is fine; the explicit registration replaces the default. Other modules' similar patterns rely on the same idempotence.
+* **Don't mix EF Core and MongoDB.** The Domain layer registers `ISettingManagementStore` as a single transient. If you add both EF Core and MongoDB modules, the DI container will resolve whichever loaded last — there is no per-entity routing.
+* **`SettingDefinition.Name` is case-sensitive in the DB.** Most providers preserve the casing of the static constants (`Abp.Mailing.Smtp.Host`). If you write a setting with a typo (`abp.mailing…`), it will create a new row.
+
+## Cross-links
+
+* For MongoDB equivalents (`SettingManagementMongoDbContext`, `MongoSettingRepository`), see [MongoDB](/modules/setting-management/mongodb).
+* For how `EfCoreSettingRepository` is consumed by `SettingManagementStore`, see [Domain](/modules/setting-management/domain).
+* For the column-length constants, see [Domain.Shared](/modules/setting-management/domain-shared).

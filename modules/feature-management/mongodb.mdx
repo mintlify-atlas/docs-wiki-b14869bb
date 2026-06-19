@@ -1,0 +1,319 @@
+---
+title: "Volo.Abp.FeatureManagement.MongoDB: Mongo context and repositories"
+sidebarTitle: "MongoDB"
+description: "FeatureManagementMongoDbContext, the three MongoDbRepository implementations, collection naming, IgnoreMultiTenancy semantics, and the asymmetry with the EF Core unique-index guarantee."
+---
+
+`Volo.Abp.FeatureManagement.MongoDB` is the Mongo counterpart to the EF Core package. It implements the same three Domain-layer repository contracts (`IFeatureValueRepository`, `IFeatureDefinitionRecordRepository`, `IFeatureGroupDefinitionRecordRepository`) on top of `MongoDbRepository<,,>`.
+
+Module class:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementDomainModule),
+    typeof(AbpMongoDbModule))]
+public class AbpFeatureManagementMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<FeatureManagementMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories<IFeatureManagementMongoDbContext>();
+            options.AddRepository<FeatureGroupDefinitionRecord, MongoFeatureGroupDefinitionRecordRepository>();
+            options.AddRepository<FeatureDefinitionRecord, MongoFeatureDefinitionRecordRepository>();
+            options.AddRepository<FeatureValue, MongoFeatureValueRepository>();
+        });
+    }
+}
+```
+
+Same wiring pattern as the EF Core module: register the typed repositories explicitly (so `IFeatureValueRepository` resolves to `MongoFeatureValueRepository`) and register defaults against the interface form of the context (so `IRepository<FeatureValue>` resolves correctly).
+
+## File inventory
+
+| Path under `Volo/Abp/FeatureManagement/MongoDB/` | Role |
+| --- | --- |
+| `AbpFeatureManagementMongoDbModule.cs` | Module class — wires `AddMongoDbContext` and the three custom repositories. |
+| `IFeatureManagementMongoDbContext.cs` | Interface form. |
+| `FeatureManagementMongoDbContext.cs` | Concrete `AbpMongoDbContext`. |
+| `FeatureManagementMongoDbContextExtensions.cs` | `ConfigureFeatureManagement(this IMongoModelBuilder)` — sets the collection names. |
+| `MongoFeatureValueRepository.cs` | Implements `IFeatureValueRepository`. |
+| `MongoFeatureDefinitionRecordRepository.cs` | Implements `IFeatureDefinitionRecordRepository`. |
+| `MongoFeatureGroupDefinitionRecordRepository.cs` | Implements `IFeatureGroupDefinitionRecordRepository` — inherits the base CRUD only. |
+
+## `FeatureManagementMongoDbContext`
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public class FeatureManagementMongoDbContext : AbpMongoDbContext, IFeatureManagementMongoDbContext
+{
+    public IMongoCollection<FeatureGroupDefinitionRecord> FeatureGroups => Collection<FeatureGroupDefinitionRecord>();
+    public IMongoCollection<FeatureDefinitionRecord> Features => Collection<FeatureDefinitionRecord>();
+    public IMongoCollection<FeatureValue> FeatureValues => Collection<FeatureValue>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureFeatureManagement();
+    }
+}
+```
+
+`[IgnoreMultiTenancy]` carries the same semantics here as in the EF Core context: feature data is host-scoped, the `ProviderKey` is the tenant discriminator. `[ConnectionStringName("AbpFeatureManagement")]` resolves via `IConnectionStringResolver`.
+
+The interface:
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public interface IFeatureManagementMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<FeatureGroupDefinitionRecord> FeatureGroups { get; }
+    IMongoCollection<FeatureDefinitionRecord> Features { get; }
+    IMongoCollection<FeatureValue> FeatureValues { get; }
+}
+```
+
+As with the EF Core context, the interface form is what repositories depend on, so host applications can swap in a derived `MyAppFeatureManagementMongoDbContext` via `options.ReplaceDbContext<IFeatureManagementMongoDbContext>();`.
+
+## Collection naming
+
+```csharp
+public static void ConfigureFeatureManagement(this IMongoModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    builder.Entity<FeatureGroupDefinitionRecord>(b =>
+    {
+        b.CollectionName = AbpFeatureManagementDbProperties.DbTablePrefix + "FeatureGroups";
+    });
+
+    builder.Entity<FeatureDefinitionRecord>(b =>
+    {
+        b.CollectionName = AbpFeatureManagementDbProperties.DbTablePrefix + "Features";
+    });
+
+    builder.Entity<FeatureValue>(b =>
+    {
+        b.CollectionName = AbpFeatureManagementDbProperties.DbTablePrefix + "FeatureValues";
+    });
+}
+```
+
+With the default `DbTablePrefix = "Abp"` you get three collections:
+
+| Collection | Purpose |
+| --- | --- |
+| `AbpFeatureGroups` | `FeatureGroupDefinitionRecord` documents. |
+| `AbpFeatures` | `FeatureDefinitionRecord` documents. |
+| `AbpFeatureValues` | `FeatureValue` documents. |
+
+Indexes are **not** declared here. Unlike EF Core's fluent model builder, the Mongo configuration only carries collection naming. **You must create the unique index on `(Name, ProviderName, ProviderKey)` yourself** if you want the same guarantee as on a relational backend. Without it, two concurrent `FeatureManagementStore.SetAsync` calls for the same triple can race and produce duplicate documents — both will subsequently be returned by `FindAllAsync`, and `FindAsync` (which calls `.OrderBy(x => x.Id).FirstOrDefaultAsync(...)`) deterministically returns one of them, ignoring the rest.
+
+Recommended index command:
+
+```javascript
+db.AbpFeatureValues.createIndex(
+  { Name: 1, ProviderName: 1, ProviderKey: 1 },
+  { unique: true, name: "ux_FeatureValue_Name_ProviderName_ProviderKey" }
+);
+
+db.AbpFeatures.createIndex({ Name: 1 }, { unique: true });
+db.AbpFeatures.createIndex({ GroupName: 1 });
+db.AbpFeatureGroups.createIndex({ Name: 1 }, { unique: true });
+```
+
+Run these as part of your deployment script. The ABP CLI's `migrate` command doesn't generate Mongo index scripts.
+
+## Repositories
+
+### `MongoFeatureValueRepository`
+
+```csharp
+public class MongoFeatureValueRepository :
+    MongoDbRepository<IFeatureManagementMongoDbContext, FeatureValue, Guid>,
+    IFeatureValueRepository
+{
+    public virtual async Task<FeatureValue> FindAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey,
+                                 GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> FindAllAsync(
+        string name, string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .Where(s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> GetListAsync(
+        string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task DeleteAsync(
+        string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        var dbContext = await GetDbContextAsync();
+        await dbContext.FeatureValues.DeleteManyAsync(
+            x => x.ProviderName == providerName && x.ProviderKey == providerKey,
+            GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+The shape mirrors the EF Core repository. The differences:
+
+- Queries go through `GetMongoQueryableAsync` (MongoDB.Driver's `IMongoQueryable<>` LINQ provider), not EF Core's `IQueryable<>`.
+- `DeleteAsync(providerName, providerKey)` bypasses the repository layer entirely and uses `IMongoCollection<FeatureValue>.DeleteManyAsync` directly. That means **no domain event is raised** for bulk deletes — `FeatureValueCacheItemInvalidator` will not see those changes. If you call `IFeatureManager.DeleteAsync(providerName, providerKey)`, the standard path loops via `FindAllAsync` + per-row `DeleteAsync(entity)` for value-by-value deletion, which *does* raise `EntityChangedEventData<FeatureValue>` per row, so cache stays consistent.
+- `OrderBy(x => x.Id).FirstOrDefaultAsync` mirrors the EF Core pattern — defensive against duplicates the absent unique index can let through.
+
+### `MongoFeatureDefinitionRecordRepository`
+
+```csharp
+public class MongoFeatureDefinitionRecordRepository :
+    MongoDbRepository<IFeatureManagementMongoDbContext, FeatureDefinitionRecord, Guid>,
+    IFeatureDefinitionRecordRepository
+{
+    public virtual async Task<FeatureDefinitionRecord> FindByNameAsync(
+        string name, CancellationToken cancellationToken = default)
+    {
+        cancellationToken = GetCancellationToken(cancellationToken);
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(s => s.Name == name, cancellationToken);
+    }
+}
+```
+
+The base `MongoDbRepository` provides `GetListAsync()` (no parameters) that the static saver and the dynamic store call to bulk-load all definitions. `FindByNameAsync` is rarely on the hot path.
+
+### `MongoFeatureGroupDefinitionRecordRepository`
+
+```csharp
+public class MongoFeatureGroupDefinitionRecordRepository :
+    MongoDbRepository<IFeatureManagementMongoDbContext, FeatureGroupDefinitionRecord, Guid>,
+    IFeatureGroupDefinitionRecordRepository {}
+```
+
+Empty class — inherits `IBasicRepository<FeatureGroupDefinitionRecord, Guid>` semantics.
+
+## Differences from EF Core
+
+| Aspect | EF Core | MongoDB |
+| --- | --- | --- |
+| Unique index on `(Name, ProviderName, ProviderKey)` | Declared in `OnModelCreating`, applied via migration. | **Not declared** — host must create manually. |
+| Predicate-based bulk delete events | Depends on EF Core version. Modern versions support `ExecuteDelete` without entity tracking — no events. | `DeleteManyAsync` direct — no events. The Domain layer's `FeatureManager.DeleteAsync` path uses per-entity delete, so events fire from there. |
+| Schema | `AbpFeatureManagementDbProperties.DbSchema` (e.g. `"FM"` if you set it). | No schema concept; only the `DbTablePrefix` "Abp" applies. |
+| Object extensions | `ApplyObjectExtensionMappings` + `TryConfigureObjectExtensions` configured automatically. | Object extensions still work via `ExtraProperties` on the entity, but no extra column metadata to map. |
+| Transactions | Available in any UoW with a transactional provider. | Available only against replica sets / sharded clusters supporting multi-document transactions. `StaticFeatureSaver` opens `UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true)` — Mongo standalone deployments fail there. |
+
+## Multi-document transactions
+
+`StaticFeatureSaver.SaveAsync` runs inside `UnitOfWorkManager.Begin(requiresNew: true, isTransactional: true)`. On a standalone MongoDB instance, `isTransactional: true` resolves to a no-op for the Mongo client (the ABP UoW gracefully degrades), but on a replica set or sharded cluster the saver runs in a real session and the entire group/feature merge becomes atomic.
+
+If you run on a standalone Mongo (no replica set), any failure during `UpdateChangedFeatureGroupsAsync` / `UpdateChangedFeaturesAsync` leaves the database half-updated. The hash cache is updated *after* the writes succeed, so the next boot will retry. That self-healing is intentional — the dynamic store will pick up the partial state once `EnsureCacheIsUptoDateAsync` runs.
+
+## Configuration patterns
+
+Consolidated context — call from the host's `MyAppMongoDbContext.CreateModel`:
+
+```csharp
+protected override void CreateModel(IMongoModelBuilder modelBuilder)
+{
+    base.CreateModel(modelBuilder);
+    modelBuilder.ConfigureFeatureManagement();
+    modelBuilder.ConfigureIdentity();
+    modelBuilder.ConfigureAuditLogging();
+    // ...
+}
+```
+
+Dedicated context with custom collections — `options.ReplaceDbContext<IFeatureManagementMongoDbContext>();`. Most apps don't need this.
+
+## Tenant database semantics
+
+The same observation as for EF Core: `[IgnoreMultiTenancy]` keeps every feature value row in the host database. With Mongo's connection-string-per-tenant scenario the host's `AbpFeatureValues` collection is queried regardless of the resolved tenant — the `ProviderKey` field is the only tenant discriminator. There is **no** equivalent of `IsTenantOnlyDatabase()` guard in the Mongo extension — the Mongo configuration runs unconditionally. If you deploy a tenant-only Mongo and accidentally include this module's wiring, you'll get empty collections that never receive writes (because the connection is rejected at startup based on `[ConnectionStringName]`).
+
+## Indexes you should add manually
+
+Beyond the unique `(Name, ProviderName, ProviderKey)` index, two more help in production:
+
+```javascript
+db.AbpFeatureValues.createIndex(
+  { ProviderName: 1, ProviderKey: 1 },
+  { name: "ix_FeatureValue_ProviderName_ProviderKey" }
+);
+
+db.AbpFeatures.createIndex({ GroupName: 1 });
+```
+
+The first speeds up the `GetListAsync(providerName, providerKey)` fan-out warm read called by `FeatureManagementStore.SetCacheItemsAsync` — on a tenant with thousands of features that's a full-collection scan without it.
+
+## Gotchas
+
+- **The unique index is your responsibility.** Without it, concurrent writes race-create duplicates and the deduplication only happens at read time (via `OrderBy(x => x.Id).FirstOrDefaultAsync`). Add it.
+- **`DeleteAsync(providerName, providerKey)` does not raise entity events.** The framework path through `FeatureManager.DeleteAsync` is fine; direct calls to `_repo.DeleteAsync(providerName, providerKey, ...)` skip cache invalidation.
+- **`StaticFeatureSaver` transactions silently degrade on standalone Mongo.** Either accept partial-update reboots (the retry will heal them) or run a replica set.
+- **No `OrderBy` index hint.** `FindAsync` falls back to a scan-then-sort if you forget the compound `(Name, ProviderName, ProviderKey)` index. The 1-row case is usually fine until your tenant count hits five digits.
+- **Mongo's `null` semantics are stricter than SQL Server's.** Two documents with `ProviderKey: null` are considered identical in `{ ProviderKey: 1 }` unique index — the same as the SQL Server pre-2022 behaviour. If you want the host-default row plus a tenant override to coexist in production, your unique index *must* be compound on `(Name, ProviderName, ProviderKey)`.
+- **`ExtraProperties` round-trips as a BSON document.** Mongo serializes it natively, so the column-length constraints from `FeatureDefinitionRecordConsts` don't apply — extra properties can grow unbounded. If you abuse this for large objects you'll pay for it in BSON document size limits (16 MB hard cap per document).
+- For `IFeatureChecker`, the value-provider chain, and the upstream `IFeatureStore` contract this module implements, see [framework/cross/features](/framework/cross/features).
+
+## Replicating the EF Core uniqueness guarantee
+
+The EF Core mapping declares `b.HasIndex(x => new { x.Name, x.ProviderName, x.ProviderKey }).IsUnique();` which gives an atomic write-or-fail guarantee. With Mongo you'd write the equivalent index as part of host bootstrap:
+
+```csharp
+public class FeatureManagementMongoIndexInitializer : IHostedService
+{
+    private readonly IMongoDatabase _db;
+    public FeatureManagementMongoIndexInitializer(IMongoDatabase db) => _db = db;
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        var coll = _db.GetCollection<FeatureValue>("AbpFeatureValues");
+        var keys = Builders<FeatureValue>.IndexKeys
+            .Ascending(x => x.Name)
+            .Ascending(x => x.ProviderName)
+            .Ascending(x => x.ProviderKey);
+        await coll.Indexes.CreateOneAsync(
+            new CreateIndexModel<FeatureValue>(keys, new CreateIndexOptions { Unique = true }),
+            cancellationToken: cancellationToken);
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}
+```
+
+Register the hosted service in your host module. The first boot creates the index; subsequent boots are no-ops because Mongo's `createIndex` is idempotent.
+
+## Driver version compatibility
+
+The package depends on the `MongoDB.Driver` version pinned by `AbpMongoDbModule`. If your host uses a newer driver via a transient project reference, the package compiles but you may see `BsonSerializationException` for `IStringValueType` because the driver's serializer registration order changed between major versions. The framework registers `IStringValueType` BSON converters via `AbpMongoDbModule`; verify they survived your driver upgrade.
+
+## Schema-less `ExtraProperties`
+
+`FeatureDefinitionRecord.ExtraProperties` is a `Dictionary<string, object>` stored as a BSON sub-document. Mongo schemas don't constrain it, so you can stuff arbitrary structured data — but be aware:
+
+- The 16 MB document size cap applies. Large extra properties on a single feature can push you toward the limit.
+- Queries on extra-property fields require explicit indexes — there's no auto-indexing.
+- Filter expressions on extra properties cannot use the framework's `IRepository<T>` LINQ provider; drop to the driver-level `Builders<T>.Filter` for those queries.
+
+## Replica set considerations
+
+`StaticFeatureSaver`'s use of `UnitOfWorkManager.Begin(isTransactional: true)` requires a replica set or a sharded cluster. Single-node Mongo gracefully degrades — the transaction becomes a no-op session — but partial updates can occur on failure. In production:
+
+- Run a 3-node replica set minimum.
+- Set the driver's `readPreference` and `writeConcern` appropriately (`writeConcern=majority` for the static saver path; `readPreference=primary` for the dynamic store reads).
+- Monitor the `AbpFeatureManagement` connection — it sees periodic load from the static saver retry loop on cold boot.

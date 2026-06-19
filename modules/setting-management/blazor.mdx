@@ -1,0 +1,363 @@
+---
+title: "Volo.Abp.SettingManagement.Blazor"
+description: "Blazorise-based settings UI at /setting-management — ISettingComponentContributor, the SettingManagement.razor shell, view components, and the WebAssembly-friendly contract."
+---
+
+The Blazor package is the Blazorise-themed equivalent of the MVC `Web` module. It exposes a single page at `/setting-management` with the same tab-based layout, but the contributor model and the component model differ in subtle ways from MVC because Blazor renders components rather than view components, and contributors must work across both server-side and WebAssembly hosting.
+
+```csharp
+[DependsOn(
+    typeof(AbpAutoMapperModule),
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpSettingManagementApplicationContractsModule))]
+public class AbpSettingManagementBlazorModule : AbpModule { ... }
+```
+
+The module depends only on `Application.Contracts` (not on the full Application or Domain layers). This is what makes the package safe to reference from a Blazor WebAssembly project — there are no EF Core or `ISettingManager` dependencies.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.Blazor/
+├── AbpSettingManagementBlazorModule.cs
+├── _Imports.razor
+├── ISettingComponentContributor.cs
+├── Menus/
+│   ├── SettingManagementMenuContributor.cs
+│   └── SettingManagementMenus.cs
+├── Pages/SettingManagement/
+│   ├── SettingManagement.razor
+│   ├── SettingManagement.razor.cs
+│   ├── EmailSettingGroup/
+│   │   ├── EmailSettingGroupViewComponent.razor
+│   │   └── EmailSettingGroupViewComponent.razor.cs
+│   └── TimeZoneSettingGroup/
+│       ├── TimeZoneSettingGroupViewComponent.razor
+│       └── TimeZoneSettingGroupViewComponent.razor.cs
+├── SettingComponentCreationContext.cs
+├── SettingComponentGroup.cs
+├── SettingManagementBlazorAutoMapperProfile.cs
+├── SettingManagementComponentOptions.cs
+└── Settings/
+    ├── EmailingPageContributor.cs
+    └── TimeZonePageContributor.cs
+```
+
+## Module wiring
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.AddAutoMapperObjectMapper<AbpSettingManagementBlazorModule>();
+
+    Configure<AbpAutoMapperOptions>(options =>
+    {
+        options.AddProfile<SettingManagementBlazorAutoMapperProfile>(validate: true);
+    });
+
+    Configure<AbpNavigationOptions>(options =>
+    {
+        options.MenuContributors.Add(new SettingManagementMenuContributor());
+    });
+
+    Configure<AbpRouterOptions>(options =>
+    {
+        options.AdditionalAssemblies.Add(typeof(AbpSettingManagementBlazorModule).Assembly);
+    });
+
+    Configure<SettingManagementComponentOptions>(options =>
+    {
+        options.Contributors.Add(new EmailingPageContributor());
+        options.Contributors.Add(new TimeZonePageContributor());
+    });
+
+    Configure<AbpLocalizationOptions>(options =>
+    {
+        options.Resources
+            .Get<AbpSettingManagementResource>()
+            .AddBaseTypes(typeof(AbpUiResource));
+    });
+}
+```
+
+Three things to highlight:
+
+* **`AbpRouterOptions.AdditionalAssemblies.Add(...)`** registers the assembly with `AbpRouter` so the `@page "/setting-management"` route is discoverable. Without it, the route simply does not resolve.
+* **The contributors are *different* types** from the MVC ones — `Volo.Abp.SettingManagement.Blazor.Settings.EmailingPageContributor` vs. `Volo.Abp.SettingManagement.Web.Settings.EmailingPageContributor`. They share the name but live in different namespaces.
+* **No `DisableModule` call** — Blazor doesn't use the dynamic JavaScript proxy; it calls the HTTP API directly through `IEmailSettingsAppService` (resolved either to the local app service in Blazor Server, or to the HTTP client proxy in WebAssembly).
+
+## `ISettingComponentContributor`
+
+```csharp
+public interface ISettingComponentContributor
+{
+    Task ConfigureAsync(SettingComponentCreationContext context);
+    Task<bool> CheckPermissionsAsync(SettingComponentCreationContext context);
+}
+```
+
+Unlike the MVC equivalent, **the Blazor interface keeps `CheckPermissionsAsync` as a first-class member**. There is no `SettingComponentContributorBase` and no batched permission evaluation. Each contributor is responsible for its own check. The reason is partly historical and partly because Blazor's per-component lifecycle makes batched checks less useful.
+
+A typical contributor:
+
+```csharp
+public class EmailingPageContributor : ISettingComponentContributor
+{
+    public Task ConfigureAsync(SettingComponentCreationContext context)
+    {
+        var l = context.ServiceProvider.GetRequiredService<IStringLocalizer<AbpSettingManagementResource>>();
+        context.Groups.Add(
+            new SettingComponentGroup(
+                "Volo.Abp.EmailSetting",
+                l["Menu:Emailing"],
+                typeof(EmailSettingGroupViewComponent)));
+        return Task.CompletedTask;
+    }
+
+    public async Task<bool> CheckPermissionsAsync(SettingComponentCreationContext context)
+    {
+        var permissionChecker = context.ServiceProvider.GetRequiredService<IPermissionChecker>();
+        return await permissionChecker.IsGrantedAsync(SettingManagementPermissions.Emailing);
+    }
+}
+```
+
+`CheckPermissionsAsync` is called by `SettingManagementMenuContributor.CheckAnyOfPagePermissionsGranted` to decide whether the *menu item* should be displayed. The contributor's tab visibility on the actual page is computed by the same call — see below.
+
+## `SettingComponentGroup` and `SettingComponentCreationContext`
+
+```csharp
+public class SettingComponentGroup
+{
+    public const int DefaultOrder = 1000;
+    public string Id { get; set; }
+    public string DisplayName { get; set; }
+    public Type ComponentType { get; set; } // a Blazor component type
+    public object Parameter { get; set; }
+    public int Order { get; set; }
+}
+
+public class SettingComponentCreationContext : IServiceProviderAccessor
+{
+    public IServiceProvider ServiceProvider { get; }
+    public List<SettingComponentGroup> Groups { get; private set; }
+
+    public void Normalize() => Groups = Groups.OrderBy(item => item.Order).ThenBy(item => item.DisplayName).ToList();
+}
+```
+
+`ComponentType` is a Blazor component (subclass of `ComponentBase`), not an MVC view component. The shell renders it inside a `<TabPanel>` using `RenderFragment` + `builder.OpenComponent(0, group.ComponentType)`.
+
+## `SettingManagement.razor` — the shell
+
+```razor
+@page "/setting-management"
+@using Microsoft.AspNetCore.Authorization
+@using Volo.Abp.Features
+@attribute [Authorize]
+@attribute [RequiresFeature(SettingManagementFeatures.Enable)]
+
+<PageHeader Title="@L["Settings"]" BreadcrumbItems="@BreadcrumbItems"></PageHeader>
+
+<Card>
+    <CardBody>
+        <Tabs @bind-SelectedTab="@SelectedGroup" TabPosition="TabPosition.Start" Pills="true" RenderMode="TabsRenderMode.LazyReload" VerticalItemsColumnSize="ColumnSize.Is3">
+            <Items>
+                @foreach (var group in SettingComponentCreationContext.Groups)
+                {
+                    <Tab Name="@GetNormalizedString(group.Id)">@group.DisplayName</Tab>
+                }
+            </Items>
+            <Content>
+                @foreach (var group in SettingComponentCreationContext.Groups)
+                {
+                    <TabPanel Name="@GetNormalizedString(group.Id)" class="abp-md-form">
+                        <h2>@group.DisplayName</h2>
+                        <Divider />
+                        @{
+                            SettingItemRenders.Add(builder =>
+                            {
+                                builder.OpenComponent(0, group.ComponentType);
+                                builder.CloseComponent();
+                            });
+                        }
+                        @SettingItemRenders.Last()
+                    </TabPanel>
+                }
+            </Content>
+        </Tabs>
+    </CardBody>
+</Card>
+```
+
+Key Blazorise pieces:
+
+* **`Pills="true"`** + **`TabPosition="TabPosition.Start"`** + **`VerticalItemsColumnSize="ColumnSize.Is3"`** = vertical pill nav on the left, content on the right. Matches the MVC layout visually.
+* **`RenderMode="TabsRenderMode.LazyReload"`** — tab content is created on first activation and re-created on each re-activation. Tabs do *not* persist state across switches; switching back to the Email tab reloads its data.
+* **`SettingItemRenders.Add(builder => …)`** captures each group's render fragment into a list. This pattern works around Blazor's behavior where loops with `RenderFragment` instances would otherwise share a single delegate.
+
+## `SettingManagement.razor.cs` — code-behind
+
+```csharp
+public partial class SettingManagement
+{
+    [Inject] protected IServiceProvider ServiceProvider { get; set; }
+    protected SettingComponentCreationContext SettingComponentCreationContext { get; set; }
+
+    [Inject] protected IOptions<SettingManagementComponentOptions> _options { get; set; }
+    [Inject] protected IStringLocalizer<AbpSettingManagementResource> L { get; set; }
+
+    protected SettingManagementComponentOptions Options => _options.Value;
+    protected List<RenderFragment> SettingItemRenders { get; set; } = new();
+
+    protected string SelectedGroup;
+    protected List<BreadcrumbItem> BreadcrumbItems = new();
+
+    protected async override Task OnInitializedAsync()
+    {
+        BreadcrumbItems.Add(new BreadcrumbItem(@L["Settings"]));
+
+        SettingComponentCreationContext = new SettingComponentCreationContext(ServiceProvider);
+
+        foreach (var contributor in Options.Contributors)
+        {
+            await contributor.ConfigureAsync(SettingComponentCreationContext);
+        }
+        SettingComponentCreationContext.Normalize();
+        SettingItemRenders.Clear();
+
+        SelectedGroup = GetNormalizedString(SettingComponentCreationContext.Groups.First().Id);
+    }
+
+    protected virtual string GetNormalizedString(string value) => value.Replace('.', '_');
+}
+```
+
+Two important details:
+
+* **`OnInitializedAsync` does not filter contributors by permissions.** Every registered contributor's `ConfigureAsync` runs. The MVC equivalent batch-filters by permission *before* `ConfigureAsync`. In Blazor, contributors should check inside `ConfigureAsync` themselves if they want to skip — though in practice the menu contributor's check is the gating layer.
+* **`GetNormalizedString` replaces `.` with `_`.** Group IDs are `Volo.Abp.EmailSetting`, but Blazorise's tab name attribute disallows dots (they're used as CSS selectors). The normalization makes `SelectedGroup = "Volo_Abp_EmailSetting"`.
+
+## `EmailSettingGroupViewComponent.razor.cs`
+
+```csharp
+public partial class EmailSettingGroupViewComponent
+{
+    [Inject] protected IEmailSettingsAppService EmailSettingsAppService { get; set; }
+    [Inject] protected IPermissionChecker PermissionChecker { get; set; }
+    [Inject] private ICurrentApplicationConfigurationCacheResetService CurrentApplicationConfigurationCacheResetService { get; set; }
+    [Inject] protected IUiMessageService UiMessageService { get; set; }
+
+    protected UpdateEmailSettingsViewModel EmailSettings;
+    protected SendTestEmailViewModel SendTestEmailInput;
+    protected Validations EmailSettingValidation;
+    protected Validations EmailSettingTestValidation;
+    protected Modal SendTestEmailModal;
+    protected bool HasSendTestEmailPermission { get; set; }
+
+    public EmailSettingGroupViewComponent()
+    {
+        ObjectMapperContext = typeof(AbpSettingManagementBlazorModule);
+        LocalizationResource = typeof(AbpSettingManagementResource);
+    }
+
+    protected async override Task OnInitializedAsync()
+    {
+        EmailSettings = ObjectMapper.Map<EmailSettingsDto, UpdateEmailSettingsViewModel>(await EmailSettingsAppService.GetAsync());
+        HasSendTestEmailPermission = await PermissionChecker.IsGrantedAsync(SettingManagementPermissions.EmailingTest);
+        SendTestEmailInput = new SendTestEmailViewModel();
+    }
+
+    protected virtual async Task UpdateSettingsAsync()
+    {
+        if (!await EmailSettingValidation.ValidateAll()) return;
+
+        await EmailSettingsAppService.UpdateAsync(
+            ObjectMapper.Map<UpdateEmailSettingsViewModel, UpdateEmailSettingsDto>(EmailSettings));
+
+        await CurrentApplicationConfigurationCacheResetService.ResetAsync();
+
+        await UiMessageService.Success(L["SuccessfullySaved"]);
+    }
+
+    // OpenSendTestEmailModalAsync, CloseSendTestEmailModalAsync, SendTestEmailAsync …
+}
+```
+
+Two things to highlight:
+
+* **`ICurrentApplicationConfigurationCacheResetService.ResetAsync()`** is called *client-side* after a successful save. This invalidates the cached `abp.setting.values` so subsequent reads see the new SMTP host. The MVC equivalent uses an `ILocalEventBus` event; Blazor uses a service call because the local event bus is server-only.
+* **`HasSendTestEmailPermission`** is fetched separately because the Send Test Email button is rendered conditionally inside the same component. The permission state changes only on permission grants/revocations, not on feature toggles — feature toggles unmount the whole tab.
+
+The `UpdateEmailSettingsViewModel` and `SendTestEmailViewModel` types are nested classes on the component, carrying DataAnnotations attributes for Blazorise's `Validations` infrastructure. Same shape as the MVC view-model.
+
+## `SettingManagementMenuContributor`
+
+```csharp
+public class SettingManagementMenuContributor : IMenuContributor
+{
+    public async Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name == StandardMenus.Main)
+        {
+            await ConfigureMainMenuAsync(context);
+        }
+    }
+
+    private async Task ConfigureMainMenuAsync(MenuConfigurationContext context)
+    {
+        var settingManagementPageOptions = context.ServiceProvider.GetRequiredService<IOptions<SettingManagementComponentOptions>>().Value;
+        var settingPageCreationContext = new SettingComponentCreationContext(context.ServiceProvider);
+        if (!settingManagementPageOptions.Contributors.Any() ||
+            !(await CheckAnyOfPagePermissionsGranted(settingManagementPageOptions, settingPageCreationContext)))
+        {
+            return;
+        }
+
+        var l = context.GetLocalizer<AbpSettingManagementResource>();
+
+        /* If MVC UI is also loaded, drop its menu item first */
+        context.Menu.GetAdministration().TryRemoveMenuItem(SettingManagementMenus.GroupName);
+
+        context.Menu.GetAdministration().AddItem(
+            new ApplicationMenuItem(
+                SettingManagementMenus.GroupName,
+                l["Settings"],
+                "~/setting-management",
+                icon: "fa fa-cog"
+            ).RequireFeatures(SettingManagementFeatures.Enable));
+    }
+
+    protected virtual async Task<bool> CheckAnyOfPagePermissionsGranted(
+        SettingManagementComponentOptions settingManagementComponentOptions,
+        SettingComponentCreationContext settingComponentCreationContext)
+    {
+        foreach (var contributor in settingManagementComponentOptions.Contributors)
+        {
+            if (await contributor.CheckPermissionsAsync(settingComponentCreationContext))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+```
+
+`TryRemoveMenuItem(SettingManagementMenus.GroupName)` is what coexists with the MVC menu contributor — Blazor wins because its module is loaded later in hybrid hosts.
+
+`CheckAnyOfPagePermissionsGranted` returns true on the *first* successful permission check; it short-circuits. So a tenant with only the TimeZone permission still sees the menu item, and the Email tab is filtered out by the contributor's own check during `ConfigureAsync`/render.
+
+## Gotchas
+
+* **Blazor contributor permissions aren't batched.** Each tenant page load can issue N permission checks, one per contributor. For applications with many custom contributors this can be a perf concern — implement a cached `IPermissionChecker` if necessary.
+* **`Tabs` lazy-reload causes data loss on switch.** Users typing into the Email tab and switching to TimeZone *lose* their edits if they switch back. The framework doesn't warn about this. Either change the render mode to `TabsRenderMode.LazyLoad` (loads once, persists state) or implement an explicit "discard changes?" prompt.
+* **Two `EmailingPageContributor` types exist.** The Web and Blazor modules each have their own. Don't import the wrong namespace — the registration types are scoped to their options class.
+* **`IServiceProvider`-bound `OnInitializedAsync`** races with prerendering on Blazor Server. If you customize a contributor that depends on `ICurrentUser`, ensure it tolerates the prerendering pass where the user might appear anonymous.
+* **The page does not refresh on feature toggle.** A tenant whose `Enable` feature is turned off after the page is loaded will keep seeing the open page until they navigate. The framework's `RequiresFeature` attribute checks on route resolution, not on every render.
+
+## Cross-links
+
+* For the MVC equivalent (which has batched permission checks and view-component-based tabs), see [Web (MVC)](/modules/setting-management/web).
+* For the Blazor *Server* host wrapper, see [Blazor.Server](/modules/setting-management/blazor-server).
+* For the underlying `IEmailSettingsAppService` and its DTOs, see [Application.Contracts](/modules/setting-management/application-contracts).

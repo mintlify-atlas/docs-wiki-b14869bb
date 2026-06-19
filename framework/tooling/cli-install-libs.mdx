@@ -1,0 +1,434 @@
+---
+title: "abp install-libs"
+description: "How InstallLibsService finds every UI project, runs Yarn or NPM, then mirrors NPM modules into wwwroot/libs based on abp.resourcemapping.js."
+---
+
+ABP's MVC, Razor Pages and Blazor Server UIs depend on Bootstrap,
+jQuery, Datatables, Lepton-X and a long tail of NPM packages. Those
+packages can't be served straight from `node_modules` — they need to
+land at `wwwroot/libs/<name>/…` so the runtime can serve them as static
+files. `abp install-libs` is the verb that synchronises everything.
+
+It does two things:
+
+1. **Run the package manager** (Yarn if available, otherwise NPM) in
+   every UI project found under the working directory.
+2. **Mirror selected files from `node_modules` into `wwwroot/libs`**,
+   driven by `abp.resourcemapping.js` files that ABP modules ship.
+
+## File inventory
+
+```text
+framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/
+├── Commands/
+│   └── InstallLibsCommand.cs        # IConsoleCommand entry point
+└── LIbs/
+    ├── InstallLibsService.cs        # Workhorse
+    ├── IInstallLibsService.cs       # Public surface
+    ├── ResourceMapping.cs           # JSON shape of abp.resourcemapping.js
+    └── FileMatchResult.cs           # (path, stem) record returned by globber
+```
+
+> The folder is spelled `LIbs/` (note the capitalisation) in the source.
+
+## Command class
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/InstallLibsCommand.cs
+public class InstallLibsCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "install-libs";
+
+    public ILogger<InstallLibsCommand> Logger { get; set; }
+    protected IInstallLibsService InstallLibsService { get; }
+
+    public InstallLibsCommand(IInstallLibsService installLibsService)
+    {
+        InstallLibsService = installLibsService;
+        Logger = NullLogger<InstallLibsCommand>.Instance;
+    }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var workingDirectoryArg = commandLineArgs.Options.GetOrNull(
+            Options.WorkingDirectory.Short, Options.WorkingDirectory.Long);
+
+        var workingDirectory = workingDirectoryArg ?? Directory.GetCurrentDirectory();
+
+        if (!Directory.Exists(workingDirectory))
+            throw new CliUsageException("Specified directory does not exist." +
+                                        Environment.NewLine + GetUsageInfo());
+
+        await InstallLibsService.InstallLibsAsync(workingDirectory);
+    }
+}
+```
+
+### Flag reference
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `-wd`, `--working-directory <path>` | Current directory | Where to scan for projects. The service searches recursively. |
+
+There are no other flags. `abp install-libs` is the lowest-noise
+command in the toolbox.
+
+### Usage screen
+
+```text
+Usage:
+  abp install-libs
+
+Options:
+  -wd|--working-directory <directory-path>  (default: empty)
+```
+
+### Short description
+
+`InstallLibsCommand.GetShortDescription()`:
+
+> Install NPM Packages for MVC / Razor Pages and Blazor Server UI types.
+
+## InstallLibsService — what actually happens
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/LIbs/InstallLibsService.cs
+public const string LibsDirectory = "./wwwroot/libs";
+
+private static readonly List<string> ExcludeDirectory = new()
+{
+    "node_modules",
+    ".git",
+    ".idea",
+    Path.Combine("bin", "debug"),
+    Path.Combine("obj", "debug"),
+};
+
+public async Task InstallLibsAsync(string directory)
+{
+    var projectPaths = FindAllProjects(directory);
+    if (!projectPaths.Any())
+    {
+        Logger.LogError("No project found in the directory.");
+        return;
+    }
+
+    if (!NpmHelper.IsNpmInstalled())
+    {
+        Logger.LogWarning("NPM is not installed, visit https://nodejs.org/en/download/ …");
+        return;
+    }
+
+    if (!NpmHelper.IsYarnAvailable())
+        Logger.LogWarning("YARN is not installed … please use YARN instead of NPM.");
+
+    Logger.LogInformation($"Found {projectPaths.Count} projects.");
+
+    foreach (var projectPath in projectPaths)
+    {
+        var projectDirectory = Path.GetDirectoryName(projectPath);
+
+        if (projectPath.EndsWith("angular.json"))
+        {
+            if (NpmHelper.IsYarnAvailable()) NpmHelper.RunYarn(projectDirectory);
+            else                             NpmHelper.RunNpmInstall(projectDirectory);
+        }
+
+        if (projectPath.EndsWith(".csproj"))
+        {
+            var packageJsonFilePath = Path.Combine(Path.GetDirectoryName(projectPath), "package.json");
+            if (!File.Exists(packageJsonFilePath)) continue;
+
+            if (NpmHelper.IsYarnAvailable()) NpmHelper.RunYarn(projectDirectory);
+            else                             NpmHelper.RunNpmInstall(projectDirectory);
+
+            await CleanAndCopyResources(projectDirectory);
+        }
+    }
+}
+```
+
+The flow:
+
+1. **Find all projects** — `*.csproj` or `angular.json` under the working
+   directory, filtered.
+2. **Bail if NPM is missing.** Yarn is preferred but optional — if it's
+   missing the service emits a warning and continues with `npm install`.
+3. **Per project**: run `yarn` / `npm install` in the project's folder.
+4. **For .NET UI projects only** (those that ship an `abp.resourcemapping.js`
+   — see below), run `CleanAndCopyResources` to mirror files from
+   `node_modules` into `wwwroot/libs`.
+
+### Project discovery
+
+```csharp
+private List<string> FindAllProjects(string directory)
+{
+    return Directory.GetFiles(directory, "*.csproj", SearchOption.AllDirectories)
+        .Union(Directory.GetFiles(directory, "angular.json", SearchOption.AllDirectories))
+        .Where(file => ExcludeDirectory.All(x => file.IndexOf(x, StringComparison.OrdinalIgnoreCase) == -1))
+        .Where(file =>
+        {
+            if (file.EndsWith(".csproj"))
+            {
+                var packageJsonFilePath = Path.Combine(Path.GetDirectoryName(file), "package.json");
+                if (!File.Exists(packageJsonFilePath)) return false;
+
+                using var reader = File.OpenText(file);
+                var fileTexts = reader.ReadToEnd();
+                return fileTexts.Contains("Microsoft.NET.Sdk.Web")
+                    || fileTexts.Contains("Microsoft.NET.Sdk.Razor")
+                    || fileTexts.Contains("Microsoft.NET.Sdk.BlazorWebAssembly");
+            }
+            return true;
+        })
+        .OrderBy(x => x).ToList();
+}
+```
+
+A .NET project qualifies if it has all of:
+
+- a `*.csproj` that uses one of the web/Razor/Blazor SDKs,
+- a sibling `package.json`,
+- it isn't inside an excluded directory (`node_modules`, `.git`,
+  `.idea`, `bin/debug`, `obj/debug`).
+
+Angular projects qualify if `angular.json` exists in the tree (no
+sibling `package.json` requirement — the Angular CLI requires one
+anyway).
+
+## Yarn vs NPM
+
+`NpmHelper` (under `Volo/Abp/Cli/Utils/`) is the abstraction:
+
+- `IsNpmInstalled()` — shell out to `npm -v`.
+- `IsYarnAvailable()` — shell out to `yarn -v` (classic Yarn 1.x).
+- `RunYarn(directory)` — runs `yarn` (which installs from the lock).
+- `RunNpmInstall(directory)` — runs `npm install`.
+
+The CLI prefers Yarn because the ABP templates ship a `yarn.lock` and a
+mixed `yarn`/`npm` install routinely produces version drift on the
+transitive `lodash`/`bootstrap` peer trees.
+
+## CleanAndCopyResources — `abp.resourcemapping.js`
+
+Every UI module that needs to publish NPM assets ships a file named
+`abp.resourcemapping.js` (or several — they merge):
+
+```javascript
+module.exports = {
+  aliases: {
+    "@bootstrap": "@node_modules/bootstrap",
+    "@datatables-net": "@node_modules/datatables.net"
+  },
+  clean: [
+    "@libs/bootstrap"
+  ],
+  mappings: {
+    "@bootstrap/dist/css/**/*"   : "@libs/bootstrap/css/",
+    "@bootstrap/dist/js/**/*"    : "@libs/bootstrap/js/",
+    "@datatables-net/js/**/*"    : "@libs/datatables.net/js/"
+  }
+};
+```
+
+It's a JS module rather than JSON so contributors can use comments and
+multi-line literals. The CLI parses it as JSON after stripping the
+`module.exports = …` wrapper:
+
+```csharp
+var mappingFiles = Directory.GetFiles(fileDirectory, "abp.resourcemapping.js",
+                                      SearchOption.AllDirectories);
+var resourceMapping = new ResourceMapping
+{
+    Clean = new List<string> { LibsDirectory }
+};
+
+foreach (var mappingFile in mappingFiles)
+{
+    using var reader = File.OpenText(mappingFile);
+    var mappingFileContent = await reader.ReadToEndAsync();
+
+    // System.Text.Json doesn't support unquoted property names → use JSON.NET
+    var mapping = JsonConvert.DeserializeObject<ResourceMapping>(
+        mappingFileContent
+            .Replace("module.exports", string.Empty)
+            .Replace("=", string.Empty)
+            .Trim().TrimEnd(';'));
+
+    mapping.ReplaceAliases();
+
+    mapping.Clean   .ForEach(c => resourceMapping.Clean.AddIfNotContains(c));
+    mapping.Aliases .ToList().ForEach(x => resourceMapping.Aliases .AddIfNotContains(x));
+    mapping.Mappings.ToList().ForEach(x => resourceMapping.Mappings.AddIfNotContains(x));
+}
+
+EnsureLibsFolderExists(fileDirectory, LibsDirectory);
+CleanDirsAndFiles  (fileDirectory, resourceMapping);
+CopyResourcesToLibs(fileDirectory, resourceMapping);
+```
+
+### ResourceMapping
+
+```csharp
+public class ResourceMapping
+{
+    public Dictionary<string, string> Aliases  { get; set; }
+    public List<string>               Clean    { get; set; }
+    public Dictionary<string, string> Mappings { get; set; }
+
+    public ResourceMapping()
+    {
+        Aliases = new Dictionary<string, string>
+        {
+            { "@node_modules", "./node_modules" },
+            { "@libs",         "./wwwroot/libs" },
+        };
+        Clean    = new List<string>();
+        Mappings = new Dictionary<string, string>();
+    }
+}
+```
+
+`ReplaceAliases()` resolves `@node_modules` and `@libs` (plus any
+user-defined aliases) in every mapping/clean entry. After the pass,
+every path is a real relative path from the project root.
+
+### Globbing
+
+`FindFiles(directory, params string[] patterns)` uses
+`Microsoft.Extensions.FileSystemGlobbing.Matcher` to interpret
+`**`, `*` and `!` patterns. The `!`-prefix excludes files matched by
+later patterns:
+
+```csharp
+var matcher = new Matcher();
+
+foreach (var pattern in patterns)
+{
+    if (pattern.StartsWith("!"))
+        matcher.AddExclude(NormalizeGlob(pattern).TrimStart('!'));
+    else
+        matcher.AddInclude(NormalizeGlob(pattern));
+}
+
+var result = matcher.Execute(new DirectoryInfoWrapper(new DirectoryInfo(directory)));
+return result.Files.Select(x => new FileMatchResult(Path.Combine(directory, x.Path), x.Stem)).ToList();
+```
+
+`NormalizeGlob` adds a trailing `**` when the pattern doesn't end in a
+file extension or `*`, so `@bootstrap/dist/css/` becomes
+`@bootstrap/dist/css/**`.
+
+### Clean step
+
+`CleanDirsAndFiles`:
+
+1. Resolves every glob in `Clean` to a list of files.
+2. Deletes each file.
+3. Walks the first `Clean` entry (`./wwwroot/libs` by default) and
+   removes any empty subdirectories.
+
+That last step is what makes a `wwwroot/libs/<oldModule>` folder vanish
+when you remove a module from your solution.
+
+### Copy step
+
+```csharp
+private void CopyResourcesToLibs(string fileDirectory, ResourceMapping resourceMapping)
+{
+    foreach (var mapping in resourceMapping.Mappings)
+    {
+        var destPath = Path.Combine(fileDirectory, mapping.Value);
+        var files    = FindFiles(fileDirectory, mapping.Key);
+
+        foreach (var file in files)
+        {
+            var destFilePath = Path.Combine(destPath, file.Stem);
+            if (File.Exists(destFilePath)) continue;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destFilePath));
+            File.Copy(file.Path, destFilePath);
+        }
+    }
+}
+```
+
+A few non-obvious points:
+
+- **Files are never overwritten.** If `destFilePath` already exists, the
+  copy is skipped. The `Clean` step is what allows refreshes — without
+  it your patched copy of `bootstrap.css` would stick around forever.
+- **`file.Stem`** is the path *relative to the glob's base*, which is
+  what lets `@bootstrap/dist/css/**/*` flatten into `@libs/bootstrap/css/`
+  correctly.
+
+## Examples
+
+```bash
+# Default usage — run inside the solution root
+abp install-libs
+
+# Specify a working directory
+abp install-libs -wd src
+
+# After adding a module, refresh libs
+abp add-module Volo.Blogging
+abp install-libs
+
+# Re-run if you manually deleted wwwroot/libs to "start over"
+abp install-libs
+```
+
+## NewCommand integration
+
+`NewCommand.RunInstallLibsForWebTemplateAsync` (in
+`Commands/ProjectCreationCommandBase.cs`) is the hook that runs after a
+solution is scaffolded:
+
+```csharp
+if (!commandLineArgs.Options.ContainsKey(Options.SkipInstallingLibs.Long))
+{
+    await RunInstallLibsForWebTemplateAsync(projectArgs);
+    ConfigureAngularJsonForThemeSelection(projectArgs);
+}
+```
+
+It invokes `IInstallLibsService.InstallLibsAsync(projectArgs.OutputFolder)`
+in-process. `--skip-installing-libs` (`-sib`) on `abp new` skips it
+entirely — useful when you intend to run an offline `yarn install`
+yourself.
+
+## Gotchas
+
+- **Yarn lockfiles win.** Without Yarn, `npm install` may resolve
+  different transitive versions than what the ABP templates were tested
+  against. Install Yarn (`npm i -g yarn`) before complaining.
+- **`abp.resourcemapping.js` is JS-flavoured JSON.** Comments are not
+  supported by the parser. Stick to the `module.exports = { … }` shape
+  the templates ship.
+- **`Clean` always includes `./wwwroot/libs`.** You don't need to add
+  it explicitly. But if you point `LibsDirectory` somewhere custom by
+  editing `InstallLibsService`, beware that the clean step uses the
+  *first* Clean entry as the root for empty-directory pruning.
+- **The `bin/debug` / `obj/debug` exclusions are case-insensitive.**
+  Visual Studio's `bin/Debug` is correctly skipped.
+- **No `--force` flag.** If you really need a clean refresh, delete
+  `wwwroot/libs` and re-run.
+- **Yarn 1 (classic) is assumed.** Yarn 2/3 (Berry) with PnP enabled
+  will still work for `yarn install` itself, but the mirroring step
+  expects files inside `./node_modules`, which Berry doesn't populate.
+  Switch to `node-modules` linker if you must use Berry.
+
+## Cross-references
+
+- [CLI host](./cli) — `Volo.Abp.Cli` boot and DI.
+- [Command registry](./cli-commands) — registration of
+  `InstallLibsCommand.Name = "install-libs"`.
+- [`abp new`](./cli-new-command) — calls `IInstallLibsService` directly.
+- [`abp add-package`](./cli-add-package) — runs the same service for
+  Angular packages after touching `package.json`.
+- [`abp bundle`](./cli-bundle) — sibling verb for Blazor WebAssembly's
+  static-content pipeline.
+- Official docs:
+  [docs.abp.io/en/abp/latest/UI/AspNetCore/Client-Side-Package-Management](https://docs.abp.io/en/abp/latest/UI/AspNetCore/Client-Side-Package-Management).

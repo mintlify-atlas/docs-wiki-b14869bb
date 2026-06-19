@@ -1,0 +1,236 @@
+---
+title: "Volo.Abp.HangFire — Hangfire host integration module"
+sidebarTitle: "Hangfire"
+description: "AbpHangfireModule wraps services.AddHangfire, builds the BackgroundJobServer through a customisable factory and ties it to the ABP lifecycle."
+---
+
+`Volo.Abp.HangFire` is the host-side integration for [Hangfire](https://www.hangfire.io/). It owns three things: registering Hangfire's services through `services.AddHangfire`, creating a single `BackgroundJobServer` whose construction you can intercept, and tying the server's life-cycle to ABP's application start/shutdown events. The package is consumed by higher-level packages — `Volo.Abp.BackgroundJobs.HangFire` (one-off jobs) and `Volo.Abp.BackgroundWorkers.Hangfire` (recurring workers) — but you can also use it standalone if you just want a configured Hangfire instance inside an ABP host.
+
+The package is small: four C# files. Its value comes from the factory pattern around `BackgroundJobServer` and the dashboard-authorization filter that knows about ABP permissions.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/Hangfire/AbpHangfireModule.cs` | Module class — wires `services.AddHangfire`, registers the `AbpHangfireBackgroundJobServer` singleton, owns shutdown. |
+| `Volo/Abp/Hangfire/AbpHangfireOptions.cs` | Options bag — `ServerOptions`, `Storage`, `AdditionalProcesses`, `BackgroundJobServerFactory`. |
+| `Volo/Abp/Hangfire/AbpHangfireBackgroundJobServer.cs` | Tiny holder for the nullable `BackgroundJobServer` instance. |
+| `Volo/Abp/Hangfire/AbpHangfireAuthorizationFilter.cs` | `IDashboardAsyncAuthorizationFilter` honouring `ICurrentUser` + `IPermissionChecker`. |
+
+## Key abstractions
+
+| Symbol | Role |
+| --- | --- |
+| `AbpHangfireModule` | Calls `services.AddHangfire(...)` and resolves the `BackgroundJobServer` lazily via the configured factory. |
+| `AbpHangfireOptions` | Captures the `BackgroundJobServerOptions`, `JobStorage`, additional `IBackgroundProcess` collection and the factory that builds the server. |
+| `AbpHangfireBackgroundJobServer` | Wrapper around `BackgroundJobServer?`. Used so the module can dispose it on application shutdown. |
+| `AbpHangfireAuthorizationFilter` | Dashboard authorization that requires `ICurrentUser.IsAuthenticated`, optionally a tenant, optionally a permission. |
+
+## The module
+
+```csharp
+[DependsOn(typeof(AbpAuthorizationAbstractionsModule))]
+public class AbpHangfireModule : AbpModule
+{
+    private AbpHangfireBackgroundJobServer? _backgroundJobServer;
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var preActions = context.Services.GetPreConfigureActions<IGlobalConfiguration>();
+        context.Services.AddHangfire(configuration =>
+        {
+            preActions.Configure(configuration);
+        });
+
+        context.Services.AddSingleton(serviceProvider =>
+        {
+            var options = serviceProvider.GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+            return new AbpHangfireBackgroundJobServer(options.BackgroundJobServerFactory.Invoke(serviceProvider));
+        });
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        _backgroundJobServer = context.ServiceProvider.GetRequiredService<AbpHangfireBackgroundJobServer>();
+    }
+
+    public override void OnApplicationShutdown(ApplicationShutdownContext context)
+    {
+        if (_backgroundJobServer == null) return;
+        _backgroundJobServer.HangfireJobServer?.SendStop();
+        _backgroundJobServer.HangfireJobServer?.Dispose();
+    }
+}
+```
+
+Three subtle moves:
+
+- **Pre-configure pattern.** Other modules contribute Hangfire configuration via `PreConfigure<IGlobalConfiguration>(...)`. Those actions run inside the `AddHangfire` lambda. The Mongo storage extension, the SQL Server one, `UseColouredConsoleLogProvider`, etc., all install themselves this way.
+- **Lazy server creation.** The `BackgroundJobServer` is built only when `AbpHangfireBackgroundJobServer` is resolved — which happens at `OnApplicationInitialization`. If a downstream module needs Hangfire's services (e.g. `IBackgroundJobClient` for enqueueing) but does **not** want a server in this process, it can resolve `JobStorage` directly without ever resolving the server.
+- **Clean shutdown.** `SendStop()` asks the server to stop accepting new jobs; `Dispose()` waits for in-flight jobs to finish (subject to `BackgroundJobServerOptions.ShutdownTimeout`).
+
+## The options class
+
+```csharp
+public class AbpHangfireOptions
+{
+    public BackgroundJobServerOptions? ServerOptions { get; set; }
+    public IEnumerable<IBackgroundProcess>? AdditionalProcesses { get; set; }
+    public JobStorage? Storage { get; set; }
+
+    [NotNull]
+    public Func<IServiceProvider, BackgroundJobServer?> BackgroundJobServerFactory { get; set; }
+
+    public AbpHangfireOptions()
+    {
+        BackgroundJobServerFactory = CreateJobServer;
+    }
+
+    private BackgroundJobServer CreateJobServer(IServiceProvider serviceProvider)
+    {
+        Storage = Storage ?? serviceProvider.GetRequiredService<JobStorage>();
+        ServerOptions = ServerOptions
+            ?? serviceProvider.GetService<BackgroundJobServerOptions>()
+            ?? new BackgroundJobServerOptions();
+        AdditionalProcesses = AdditionalProcesses ?? serviceProvider.GetServices<IBackgroundProcess>();
+
+        return new BackgroundJobServer(ServerOptions, Storage, AdditionalProcesses,
+            ServerOptions.FilterProvider ?? serviceProvider.GetRequiredService<IJobFilterProvider>(),
+            ServerOptions.Activator ?? serviceProvider.GetRequiredService<JobActivator>(),
+            serviceProvider.GetService<IBackgroundJobFactory>(),
+            serviceProvider.GetService<IBackgroundJobPerformer>(),
+            serviceProvider.GetService<IBackgroundJobStateChanger>());
+    }
+}
+```
+
+Notable details:
+
+- **`JobActivator` comes from DI.** Calling `services.AddHangfire(...)` from `Hangfire.AspNetCore` registers a `JobActivator` that creates jobs from a child `IServiceScope`. ABP therefore gets **a fresh DI scope per job invocation** for free — scoped services (`ICurrentTenant`, `IUnitOfWorkManager`, EF Core DbContexts) behave correctly without extra work.
+- **Factory contract returns `BackgroundJobServer?`.** Higher-level packages override the factory to return `null` — see the [BackgroundWorkers.Hangfire module](/framework/background/background-workers-hangfire) which does this in "enqueue-only" mode.
+- **`AdditionalProcesses` fallback.** Any `IBackgroundProcess` registered in DI (custom queues, dashboard recurring schedulers, ABP's `AbpBackgroundJobsHangfireModule` worker) is picked up automatically when `AdditionalProcesses` is left null.
+
+## Server lifecycle
+
+```mermaid
+sequenceDiagram
+  participant Host as Host
+  participant Mod as AbpHangfireModule
+  participant Opt as AbpHangfireOptions
+  participant SP as IServiceProvider
+  participant Server as BackgroundJobServer
+
+  Host->>Mod: ConfigureServices
+  Mod->>SP: services.AddHangfire(preActions...)
+  Mod->>SP: AddSingleton<AbpHangfireBackgroundJobServer>
+  Host->>Mod: OnApplicationInitialization
+  Mod->>SP: GetRequiredService<AbpHangfireBackgroundJobServer>
+  SP->>Opt: BackgroundJobServerFactory(sp)
+  Opt->>Server: new BackgroundJobServer(opts, storage, ...)
+  Server-->>SP: started
+  Host->>Mod: OnApplicationShutdown
+  Mod->>Server: SendStop()
+  Mod->>Server: Dispose()
+```
+
+## Configuring storage
+
+`AbpHangfireModule` does **not** pick a `JobStorage`. You must contribute one via `PreConfigure<IGlobalConfiguration>`:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<IGlobalConfiguration>(cfg =>
+    {
+        cfg.UseSqlServerStorage(
+            configuration.GetConnectionString("Default"),
+            new SqlServerStorageOptions { /* ... */ });
+    });
+}
+```
+
+<Warning>
+**Without a `UseXxxStorage` call, Hangfire 1.8 falls back to `MemoryStorage`** if `Hangfire.MemoryStorage` is referenced. Memory storage is **not durable** — jobs and recurring schedules are lost on restart. Always configure a persistent storage backend in production (SQL Server, PostgreSQL, MongoDB, Redis, ...).
+</Warning>
+
+## Dashboard authorization
+
+```csharp
+public class AbpHangfireAuthorizationFilter : IDashboardAsyncAuthorizationFilter
+{
+    public AbpHangfireAuthorizationFilter(bool enableTenant = false, string? requiredPermissionName = null)
+    {
+        _enableTenant = requiredPermissionName.IsNullOrWhiteSpace() ? enableTenant : true;
+        _requiredPermissionName = requiredPermissionName;
+    }
+
+    public async Task<bool> AuthorizeAsync(DashboardContext context)
+    {
+        if (!IsLoggedIn(context, _enableTenant)) return false;
+        if (_requiredPermissionName.IsNullOrEmpty()) return true;
+        return await IsPermissionGrantedAsync(context, _requiredPermissionName!);
+    }
+
+    private static bool IsLoggedIn(DashboardContext context, bool enableTenant)
+    {
+        var currentUser = context.GetHttpContext().RequestServices.GetRequiredService<ICurrentUser>();
+        if (!enableTenant)
+            return currentUser.IsAuthenticated && !currentUser.TenantId.HasValue;
+        return currentUser.IsAuthenticated;
+    }
+
+    private static async Task<bool> IsPermissionGrantedAsync(DashboardContext context, string requiredPermissionName)
+    {
+        var permissionChecker = context.GetHttpContext().RequestServices.GetRequiredService<IPermissionChecker>();
+        return await permissionChecker.IsGrantedAsync(requiredPermissionName);
+    }
+}
+```
+
+Three behaviours:
+
+- **Anonymous users always denied.** The filter consults `ICurrentUser.IsAuthenticated`.
+- **Default to host-only.** When neither a permission nor `enableTenant` is supplied, the filter rejects any user with a `TenantId` — protecting the dashboard from leaking tenant-scoped jobs to other tenants.
+- **Permission auto-promotes tenant flag.** Passing `requiredPermissionName` forces `enableTenant = true` because the permission check is the discriminator.
+
+Wire it up at the MVC layer:
+
+```csharp
+endpoints.MapHangfireDashboard("/hangfire", new DashboardOptions
+{
+    AsyncAuthorization = new[] { new AbpHangfireAuthorizationFilter(
+        requiredPermissionName: "BookStore.Manage") }
+});
+```
+
+## Options reference
+
+| Option | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `AbpHangfireOptions.ServerOptions` | `BackgroundJobServerOptions?` | `null` → DI lookup → `new BackgroundJobServerOptions()` | Workers, queues, `ShutdownTimeout`, polling interval. |
+| `AbpHangfireOptions.Storage` | `JobStorage?` | `null` → `IServiceProvider.GetRequiredService<JobStorage>()` | Explicit storage override. Most apps leave this null and configure storage via `PreConfigure<IGlobalConfiguration>`. |
+| `AbpHangfireOptions.AdditionalProcesses` | `IEnumerable<IBackgroundProcess>?` | `null` → all DI `IBackgroundProcess` services | Extra background processes (custom queue cleaners, etc.). |
+| `AbpHangfireOptions.BackgroundJobServerFactory` | `Func<IServiceProvider, BackgroundJobServer?>` | private `CreateJobServer` | Replace to suppress server creation (return `null`) or build the server with a custom recipe. |
+
+## Gotchas
+
+- **`OnApplicationInitialization` instantiates the server eagerly.** Hangfire starts polling storage immediately — make sure storage is reachable before module init or you'll see retry loops in logs.
+- **Permission check uses request services.** The filter resolves `ICurrentUser` from `context.GetHttpContext().RequestServices`. That means the dashboard endpoint must run inside ASP.NET Core's pipeline (where `RequestServices` is populated). Mounting it outside the standard endpoint routing breaks the filter.
+- **The filter is **not** registered as a service.** Pass it as an instance to `DashboardOptions`. Each request reuses the same instance — keep state immutable.
+- **`PreConfigureActions` run inside `AddHangfire`.** A `Configure<IGlobalConfiguration>` would run too late (after `AddHangfire` has built its services). Always use `PreConfigure<IGlobalConfiguration>` for storage/log providers.
+- **`SendStop` is not synchronous.** Workers stop accepting new jobs but the call returns immediately. `Dispose()` is what blocks for in-flight completion — within `BackgroundJobServerOptions.ShutdownTimeout`.
+
+<CardGroup cols={2}>
+  <Card title="Workers · Hangfire" icon="conveyor-belt" href="/framework/background/background-workers-hangfire">
+    Recurring `IBackgroundWorker` instances scheduled on Hangfire.
+  </Card>
+  <Card title="Background jobs · Hangfire" icon="briefcase" href="/framework/background/background-jobs-hangfire">
+    One-off `IBackgroundJobManager` enqueue on top of this module.
+  </Card>
+  <Card title="Quartz module" icon="repeat" href="/framework/background/quartz">
+    The Quartz-based counterpart.
+  </Card>
+  <Card title="Authorization" icon="lock" href="/framework/auth/authorization">
+    `IPermissionChecker` consumed by the dashboard authorization filter.
+  </Card>
+</CardGroup>

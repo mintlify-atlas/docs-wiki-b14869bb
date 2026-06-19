@@ -1,0 +1,378 @@
+---
+title: "Volo.Abp.TenantManagement.Web"
+sidebarTitle: "Web (MVC)"
+description: "The Razor Pages UI under ~/TenantManagement/Tenants: index page, create/edit modals, menu contributor, page-toolbar buttons, and the AutoMapper profile that bridges DTOs to view models."
+---
+
+`Volo.Abp.TenantManagement.Web` is the MVC / Razor Pages UI. It supplies an index page that lists tenants, two modal pages for create and edit, a menu contributor that puts *Tenant Management → Tenants* under the administration menu, and an AutoMapper profile that maps DTOs to page-level view models. Authorization is wired through Razor Pages conventions, and the *New Tenant* button is registered through the page-toolbar options so it can be authorized and localized centrally.
+
+## Files
+
+```
+Volo.Abp.TenantManagement.Web/
+├── AbpTenantManagementWebAutoMapperProfile.cs
+├── AbpTenantManagementWebModule.cs
+├── Navigation/
+│   ├── AbpTenantManagementWebMainMenuContributor.cs
+│   └── TenantManagementMenuNames.cs
+└── Pages/TenantManagement/
+    ├── _ViewImports.cshtml
+    └── Tenants/
+        ├── CreateModal.cshtml(.cs)
+        ├── EditModal.cshtml(.cs)
+        ├── Index.cshtml(.cs)
+        └── TenantManagementPageModel.cs
+```
+
+## The module class
+
+```csharp
+[DependsOn(typeof(AbpTenantManagementApplicationContractsModule))]
+[DependsOn(typeof(AbpAspNetCoreMvcUiBootstrapModule))]
+[DependsOn(typeof(AbpFeatureManagementWebModule))]
+[DependsOn(typeof(AbpAutoMapperModule))]
+public class AbpTenantManagementWebModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+        {
+            options.AddAssemblyResource(
+                typeof(AbpTenantManagementResource),
+                typeof(AbpTenantManagementWebModule).Assembly);
+        });
+
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpTenantManagementWebModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpNavigationOptions>(options =>
+        {
+            options.MenuContributors.Add(new AbpTenantManagementWebMainMenuContributor());
+        });
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpTenantManagementWebModule>();
+        });
+
+        context.Services.AddAutoMapperObjectMapper<AbpTenantManagementWebModule>();
+        Configure<AbpAutoMapperOptions>(options =>
+        {
+            options.AddProfile<AbpTenantManagementWebAutoMapperProfile>(validate: true);
+        });
+
+        Configure<RazorPagesOptions>(options =>
+        {
+            options.Conventions.AuthorizePage("/TenantManagement/Tenants/Index",       TenantManagementPermissions.Tenants.Default);
+            options.Conventions.AuthorizePage("/TenantManagement/Tenants/CreateModal", TenantManagementPermissions.Tenants.Create);
+            options.Conventions.AuthorizePage("/TenantManagement/Tenants/EditModal",   TenantManagementPermissions.Tenants.Update);
+        });
+
+        Configure<AbpPageToolbarOptions>(options =>
+        {
+            options.Configure<Pages.TenantManagement.Tenants.IndexModel>(toolbar =>
+            {
+                toolbar.AddButton(
+                    LocalizableString.Create<AbpTenantManagementResource>("NewTenant"),
+                    icon: "plus",
+                    name: "CreateTenant",
+                    requiredPolicyName: TenantManagementPermissions.Tenants.Create);
+            });
+        });
+
+        Configure<DynamicJavaScriptProxyOptions>(options =>
+        {
+            options.DisableModule(TenantManagementRemoteServiceConsts.ModuleName);
+        });
+    }
+
+    public override void PostConfigureServices(ServiceConfigurationContext context)
+    {
+        OneTimeRunner.Run(() =>
+        {
+            ModuleExtensionConfigurationHelper.ApplyEntityConfigurationToUi(
+                TenantManagementModuleExtensionConsts.ModuleName,
+                TenantManagementModuleExtensionConsts.EntityNames.Tenant,
+                createFormTypes: new[] { typeof(Pages.TenantManagement.Tenants.CreateModalModel.TenantInfoModel) },
+                editFormTypes:   new[] { typeof(Pages.TenantManagement.Tenants.EditModalModel.TenantInfoModel) });
+        });
+    }
+}
+```
+
+The interesting blocks:
+
+1. **`AddAssemblyResource(AbpTenantManagementResource, …)`** routes Data-Annotations validation messages emitted from this assembly through the tenant management resource — so `[Required]` on `TenantInfoModel.Name` produces a localized message.
+2. **Page conventions** attach policy names to entire pages. The convention layer rejects unauthorized requests before the page model is constructed, so the modal redirects to the login page automatically.
+3. **`AbpPageToolbarOptions`** registers the *New Tenant* button against `IndexModel`. Toolbar configuration is centralized so any host can hide, reorder, or augment buttons globally.
+4. **`DisableModule(TenantManagementRemoteServiceConsts.ModuleName)`** turns off the dynamic JavaScript proxy for `multi-tenancy` — the Razor Pages do not need it, since they call `ITenantAppService` directly through DI.
+5. **`PostConfigureServices`** is the third hop of the [extension-property pipeline](/modules/tenant-management/domain-shared#object-extension-hooks): it tells the framework which form view-models will host extension inputs in the create/edit modals.
+
+## Menu
+
+```csharp
+public class AbpTenantManagementWebMainMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.Main) return Task.CompletedTask;
+
+        var administrationMenu = context.Menu.GetAdministration();
+        var l = context.GetLocalizer<AbpTenantManagementResource>();
+
+        var tenantManagementMenuItem = new ApplicationMenuItem(
+            TenantManagementMenuNames.GroupName,
+            l["Menu:TenantManagement"],
+            icon: "fa fa-users");
+        administrationMenu.AddItem(tenantManagementMenuItem);
+
+        tenantManagementMenuItem.AddItem(new ApplicationMenuItem(
+                TenantManagementMenuNames.Tenants,
+                l["Tenants"],
+                url: "~/TenantManagement/Tenants")
+            .RequirePermissions(TenantManagementPermissions.Tenants.Default));
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Two layers: a group under the standard administration menu, then a leaf pointing at `~/TenantManagement/Tenants`. `RequirePermissions` makes the menu item disappear for users without `Tenants.Default` — combined with the host-only side declared in the permission provider, the menu is invisible to any tenant-side user.
+
+`TenantManagementMenuNames` is the constants holder:
+
+```csharp
+public class TenantManagementMenuNames
+{
+    public const string GroupName = "TenantManagement";
+    public const string Tenants   = GroupName + ".Tenants";
+}
+```
+
+## The index page
+
+`Index.cshtml.cs`:
+
+```csharp
+public class IndexModel : TenantManagementPageModel
+{
+    public virtual Task<IActionResult> OnGetAsync()
+        => Task.FromResult<IActionResult>(Page());
+
+    public virtual Task<IActionResult> OnPostAsync()
+        => Task.FromResult<IActionResult>(Page());
+}
+```
+
+Empty — the table is rendered client-side from JavaScript using ABP's DataTables integration. The Razor view sets up the grid columns and binds them to `volo.abp.tenantManagement.tenant.getList`, the auto-generated proxy method. Even though the dynamic JS proxy is disabled at the module level, the page wraps a hand-written invocation against `volo.abp.identity.role`-style JS that ABP's proxy script generator emits per controller; in practice the index issues an XHR to `GET /api/multi-tenancy/tenants?Filter=…`.
+
+The base class:
+
+```csharp
+public abstract class TenantManagementPageModel : AbpPageModel
+{
+    public TenantManagementPageModel()
+    {
+        ObjectMapperContext = typeof(AbpTenantManagementWebModule);
+    }
+}
+```
+
+`ObjectMapperContext` makes `ObjectMapper` resolve the Web profile rather than the Application profile, so the DTO ↔ view-model mappings work.
+
+## Create modal
+
+```csharp
+public class CreateModalModel : TenantManagementPageModel
+{
+    [BindProperty] public TenantInfoModel Tenant { get; set; }
+
+    protected ITenantAppService TenantAppService { get; }
+
+    public CreateModalModel(ITenantAppService tenantAppService)
+    {
+        TenantAppService = tenantAppService;
+    }
+
+    public virtual Task<IActionResult> OnGetAsync()
+    {
+        Tenant = new TenantInfoModel();
+        return Task.FromResult<IActionResult>(Page());
+    }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        ValidateModel();
+        var input = ObjectMapper.Map<TenantInfoModel, TenantCreateDto>(Tenant);
+        await TenantAppService.CreateAsync(input);
+        return NoContent();
+    }
+
+    public class TenantInfoModel : ExtensibleObject
+    {
+        [Required]
+        [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxNameLength))]
+        [Display(Name = "DisplayName:TenantName")]
+        public string Name { get; set; }
+
+        [Required]
+        [EmailAddress]
+        [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxAdminEmailAddressLength))]
+        public string AdminEmailAddress { get; set; }
+
+        [Required]
+        [DataType(DataType.Password)]
+        [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxPasswordLength))]
+        public string AdminPassword { get; set; }
+    }
+}
+```
+
+A few details worth noting:
+
+- The nested `TenantInfoModel` is a **view model** distinct from `TenantCreateDto`. The mapping from `TenantInfoModel` to `TenantCreateDto` is declared in `AbpTenantManagementWebAutoMapperProfile`, with `.MapExtraProperties()` so any extension property added through the object-extension manager round-trips.
+- `Display(Name = "DisplayName:TenantName")` is a *display* localization key, separate from the validation-message key. The Web Module's `AbpMvcDataAnnotationsLocalizationOptions.AddAssemblyResource` wires both keys through `AbpTenantManagementResource`.
+- `ExtensibleObject` adds the `ExtraProperties` dictionary so the `<abp-extension-properties>` Tag Helper in the .cshtml can render extra inputs without hard-coding them.
+- `OnPostAsync` returns `NoContent()` on success; the front-end closes the modal and refreshes the table.
+
+## Edit modal
+
+```csharp
+public class EditModalModel : TenantManagementPageModel
+{
+    [BindProperty] public TenantInfoModel Tenant { get; set; }
+
+    protected ITenantAppService TenantAppService { get; }
+
+    public EditModalModel(ITenantAppService tenantAppService)
+    {
+        TenantAppService = tenantAppService;
+    }
+
+    public virtual async Task<IActionResult> OnGetAsync(Guid id)
+    {
+        Tenant = ObjectMapper.Map<TenantDto, TenantInfoModel>(
+            await TenantAppService.GetAsync(id));
+        return Page();
+    }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        ValidateModel();
+        var input = ObjectMapper.Map<TenantInfoModel, TenantUpdateDto>(Tenant);
+        await TenantAppService.UpdateAsync(Tenant.Id, input);
+        return NoContent();
+    }
+
+    public class TenantInfoModel : ExtensibleObject, IHasConcurrencyStamp
+    {
+        [HiddenInput] public Guid Id { get; set; }
+
+        [Required]
+        [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxNameLength))]
+        [Display(Name = "DisplayName:TenantName")]
+        public string Name { get; set; }
+
+        [HiddenInput] public string ConcurrencyStamp { get; set; }
+    }
+}
+```
+
+Two hidden inputs survive the round-trip:
+
+- `Id` — the tenant identifier.
+- `ConcurrencyStamp` — forwarded back to the app service unchanged. A stale value triggers `AbpDbConcurrencyException` on save.
+
+There is no `AdminEmailAddress` / `AdminPassword` in the edit form. Renaming a tenant cannot re-seed an admin user; password resets go through Account / Identity.
+
+## The Web AutoMapper profile
+
+```csharp
+public class AbpTenantManagementWebAutoMapperProfile : Profile
+{
+    public AbpTenantManagementWebAutoMapperProfile()
+    {
+        // List → edit form
+        CreateMap<TenantDto, EditModalModel.TenantInfoModel>();
+
+        // Create form → DTO
+        CreateMap<CreateModalModel.TenantInfoModel, TenantCreateDto>()
+            .MapExtraProperties();
+
+        // Edit form → DTO
+        CreateMap<EditModalModel.TenantInfoModel, TenantUpdateDto>()
+            .MapExtraProperties();
+    }
+}
+```
+
+Note the direction: from a `TenantDto` *into* the edit view model (so the form is pre-populated), and from each form's `TenantInfoModel` *into* the corresponding DTO (so the post is sent to the app service). `MapExtraProperties` is added only on the two writer directions — the read direction does not need it because the view model is server-side scratch.
+
+## Page-toolbar registration
+
+```csharp
+Configure<AbpPageToolbarOptions>(options =>
+{
+    options.Configure<IndexModel>(toolbar =>
+    {
+        toolbar.AddButton(
+            LocalizableString.Create<AbpTenantManagementResource>("NewTenant"),
+            icon: "plus",
+            name: "CreateTenant",
+            requiredPolicyName: TenantManagementPermissions.Tenants.Create);
+    });
+});
+```
+
+The toolbar is keyed by page model type, not by URL. The button:
+
+- Displays *New Tenant* localized through the tenant management resource.
+- Renders a `plus` icon.
+- Is identified by name `"CreateTenant"` so a host theme can remove or replace it.
+- Requires `Tenants.Create` — the framework hides the button when the current user lacks the permission, even if they can see the index page.
+
+## Authorization flow
+
+```mermaid
+flowchart TD
+    Req[GET /TenantManagement/Tenants] --> Conv{RazorPagesOptions convention<br>Tenants.Default}
+    Conv -- denied --> Login[Login redirect]
+    Conv -- granted --> Index[IndexModel.OnGet]
+    Index --> Toolbar{Has Tenants.Create?}
+    Toolbar -- yes --> NewBtn[New Tenant button rendered]
+    Toolbar -- no --> NoBtn[Button hidden]
+    NewBtn --> Modal[GET CreateModal]
+    Modal --> ConvCreate{Convention<br>Tenants.Create}
+    ConvCreate -- granted --> ShowModal[Modal HTML]
+    ShowModal --> Post[POST CreateModal]
+    Post --> AppSvc[TenantAppService.CreateAsync]
+    AppSvc --> AuthAttr{[Authorize(Create)]}
+    AuthAttr -- granted --> Insert[Insert + seed + event]
+```
+
+The permission is checked in three places — convention layer, toolbar predicate, app-service attribute — and every check resolves the same policy name `Tenants.Create`. There is no scenario where the UI offers an action the backend would reject.
+
+## Why direct DI instead of HTTP
+
+The Razor Pages inject `ITenantAppService` and call it through the container. In a monolith, this saves a network hop, a JSON round-trip, and the dynamic-proxy plumbing. In a microservice topology the host's container instead resolves `ITenantAppService` to `TenantClientProxy` (from [HttpApi.Client](/modules/tenant-management/http-api-client)), so the same page code transparently issues an HTTP call. The page model never knows which mode it is in — that is the whole point of the contract split.
+
+## Features modal
+
+The *Features* action lives in the data-table column definitions registered via JavaScript (see `Index.cshtml`). It calls into Feature Management's modal, which is the reason `AbpFeatureManagementWebModule` is a `[DependsOn]` of this module. Implementation details belong to Feature Management; from Tenant Management's side, the modal is wired through provider name `"T"` and provider key `tenant.id`.
+
+## What you typically extend
+
+| Extension point | Where |
+| --- | --- |
+| Add a column to the index | `Index.cshtml` (subclass or replace via virtual file system) |
+| Add a field to the create modal | `ObjectExtensionManager.ConfigureTenantManagement(...)` |
+| Add a toolbar button | `Configure<AbpPageToolbarOptions>(...)` |
+| Add a menu item | A custom `IMenuContributor` after `AbpTenantManagementWebMainMenuContributor` |
+| Replace the app service call | Subclass `CreateModalModel.OnPostAsync` |
+
+The next chapter, [Blazor](/modules/tenant-management/blazor), provides the same UI for the Blazorise stack — and shares the same backend.

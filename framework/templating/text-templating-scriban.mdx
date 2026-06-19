@@ -1,0 +1,377 @@
+---
+title: "Volo.Abp.TextTemplating.Scriban — the default rendering engine"
+sidebarTitle: "Scriban engine"
+description: "How AbpTextTemplatingScribanModule registers ScribanTemplateRenderingEngine, builds a Scriban TemplateContext per render, exposes the model and the L localizer, and handles layout templates."
+---
+
+`Volo.Abp.TextTemplating.Scriban` is the **default** rendering engine for ABP's text-templating system. It wraps [Scriban](https://github.com/scriban/scriban) — a fast, sandboxed, dependency-free template language — into an `ITemplateRenderingEngine` implementation that integrates with ABP's `TemplateDefinition`, `ITemplateContentProvider`, `IStringLocalizerFactory` and `CultureHelper`. Template files conventionally use the `.tpl` extension.
+
+The Scriban engine is the right pick for **non-HTML, sandboxed, side-effect-free** output: transactional emails, SMS bodies, push payloads, code generation, configuration files. Because Scriban refuses to call arbitrary CLR methods and has no `@inherits` / `<script>` style escape hatches, it is generally safer to expose to non-developers than [Razor](/framework/templating/text-templating-razor).
+
+## File inventory
+
+The engine assembly is small — only four C# files, each playing a distinct role.
+
+| File | Role |
+| --- | --- |
+| `Volo.Abp.TextTemplating.Scriban/.../AbpTextTemplatingScribanModule.cs` | Registers the engine in `AbpTextTemplatingOptions` and claims the `DefaultRenderingEngine` slot. |
+| `Volo.Abp.TextTemplating.Scriban/.../ScribanTemplateRenderingEngine.cs` | The `ITemplateRenderingEngine` implementation — turns `TemplateDefinition` + raw text + model into rendered output. |
+| `Volo.Abp.TextTemplating.Scriban/.../ScribanTemplateLocalizer.cs` | An `IScriptCustomFunction` that exposes ABP's `IStringLocalizer` to templates as the `L` callable. |
+| `Volo.Abp.TextTemplating.Scriban/.../ScribanTemplateDefinitionExtensions.cs` | `WithScribanEngine()` extension that sets `TemplateDefinition.RenderEngine = "Scriban"`. |
+
+The package depends only on `AbpTextTemplatingCoreModule` (for the abstractions) and the upstream `Scriban` NuGet package.
+
+## Module wiring
+
+`AbpTextTemplatingScribanModule.ConfigureServices` does three things: register the engine in the engine map, claim the default-engine slot, and depend on the core module so providers and contributors are auto-discovered.
+
+```csharp
+[DependsOn(typeof(AbpTextTemplatingCoreModule))]
+public class AbpTextTemplatingScribanModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpTextTemplatingOptions>(options =>
+        {
+            options.DefaultRenderingEngine = ScribanTemplateRenderingEngine.EngineName;
+            options.RenderingEngines[ScribanTemplateRenderingEngine.EngineName] = typeof(ScribanTemplateRenderingEngine);
+        });
+    }
+}
+```
+
+Note that **Scriban unconditionally overwrites `DefaultRenderingEngine`** — if you depend on both `AbpTextTemplatingScribanModule` and `AbpTextTemplatingRazorModule`, Scriban wins because the Razor module only assigns the default when the slot is empty. To make Razor the default while keeping Scriban available, swap the values in your own module:
+
+```csharp
+public override void PostConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpTextTemplatingOptions>(options =>
+    {
+        options.DefaultRenderingEngine = RazorTemplateRenderingEngine.EngineName;
+    });
+}
+```
+
+The constants are public, so prefer `RazorTemplateRenderingEngine.EngineName` over the literal `"Razor"`.
+
+## `ScribanTemplateRenderingEngine`
+
+The engine derives from `TemplateRenderingEngineBase` — that gives it `TemplateDefinitionManager`, `TemplateContentProvider`, `StringLocalizerFactory` and the protected helpers `GetContentOrNullAsync` and `GetLocalizerOrNull`. Its name is the constant `"Scriban"`:
+
+```csharp
+public class ScribanTemplateRenderingEngine : TemplateRenderingEngineBase, ITransientDependency
+{
+    public const string EngineName = "Scriban";
+    public override string Name => EngineName;
+
+    public ScribanTemplateRenderingEngine(
+        ITemplateDefinitionManager templateDefinitionManager,
+        ITemplateContentProvider templateContentProvider,
+        IStringLocalizerFactory stringLocalizerFactory)
+        : base(templateDefinitionManager, templateContentProvider, stringLocalizerFactory) { }
+    /* ... */
+}
+```
+
+### `RenderAsync` and culture scoping
+
+`RenderAsync` normalises the `globalContext` dictionary and — crucially — wraps the inner render in `CultureHelper.Use(cultureName)` so that everything downstream (`TemplateContentProvider`'s culture fallback, `IStringLocalizer`'s resolution, `Scriban`'s number / date formatting) observes the same culture:
+
+```csharp
+public override async Task<string> RenderAsync(
+    [NotNull] string templateName,
+    [CanBeNull] object model = null,
+    [CanBeNull] string cultureName = null,
+    [CanBeNull] Dictionary<string, object> globalContext = null)
+{
+    Check.NotNullOrWhiteSpace(templateName, nameof(templateName));
+
+    if (globalContext == null)
+    {
+        globalContext = new Dictionary<string, object>();
+    }
+
+    if (cultureName == null)
+    {
+        return await RenderInternalAsync(templateName, globalContext, model);
+    }
+    else
+    {
+        using (CultureHelper.Use(cultureName))
+        {
+            return await RenderInternalAsync(templateName, globalContext, model);
+        }
+    }
+}
+```
+
+If `cultureName` is `null` the engine inherits whatever `CultureInfo.CurrentUICulture` is on the calling thread — typically the per-request culture set by ABP's localization middleware.
+
+### Layout handling
+
+After rendering the child template, the engine checks `TemplateDefinition.Layout`. If set, it pushes the rendered child content into the layout's `globalContext` under the key `"content"` and renders the layout in the same culture scope:
+
+```csharp
+protected virtual async Task<string> RenderInternalAsync(
+    string templateName,
+    Dictionary<string, object> globalContext,
+    object model = null)
+{
+    var templateDefinition = await TemplateDefinitionManager.GetAsync(templateName);
+
+    var renderedContent = await RenderSingleTemplateAsync(templateDefinition, globalContext, model);
+
+    if (templateDefinition.Layout != null)
+    {
+        globalContext["content"] = renderedContent;
+        renderedContent = await RenderInternalAsync(templateDefinition.Layout, globalContext);
+    }
+
+    return renderedContent;
+}
+```
+
+So a Scriban layout template is just another template that references `{{ content }}`:
+
+```liquid
+*BEGIN*{{content}}*END*
+```
+
+The model is **not** forwarded to the layout — only `globalContext` is — so layouts should rely on `globalContext` keys and the special `content` value, not on `model.x`.
+
+### `TemplateContext` construction
+
+The heart of the engine is `CreateScribanTemplateContext`. It builds a fresh `ScriptObject`, imports the global context dictionary into it, sets `model` to the supplied model object, exposes the `L` localizer if the definition has a `LocalizationResourceName`, and pushes the current culture:
+
+```csharp
+protected virtual TemplateContext CreateScribanTemplateContext(
+    TemplateDefinition templateDefinition,
+    Dictionary<string, object> globalContext,
+    object model = null)
+{
+    var context = new TemplateContext();
+
+    var scriptObject = new ScriptObject();
+
+    scriptObject.Import(globalContext);
+
+    if (model != null)
+    {
+        scriptObject["model"] = model;
+    }
+
+    var localizer = GetLocalizerOrNull(templateDefinition);
+    if (localizer != null)
+    {
+        scriptObject.SetValue("L", new ScribanTemplateLocalizer(localizer), true);
+    }
+
+    context.PushGlobal(scriptObject);
+    context.PushCulture(System.Globalization.CultureInfo.CurrentCulture);
+
+    return context;
+}
+```
+
+Three things to notice:
+
+1. **`globalContext` is *imported*, not nested.** Each key becomes a top-level identifier inside the template, so `globalContext["companyName"] = "Acme"` is reachable as `{{ companyName }}` — not `{{ globalContext.companyName }}`.
+2. **The model is *always* called `model`.** There is no way to pick a different name. If you need multiple objects, pass an anonymous wrapper or a dictionary.
+3. **`L` is registered as `readOnly: true`** (`scriptObject.SetValue("L", …, true)`), so templates can't shadow it.
+
+The actual render is one line:
+
+```csharp
+return await Template.Parse(templateContent).RenderAsync(context);
+```
+
+`Template.Parse` is Scriban's parser; it is invoked **once per render call** because the engine is transient and the parsed AST is not cached between renders. For very hot templates with stable content this is the place to add a cache (override `RenderTemplateContentWithScribanAsync` and key on `templateDefinition.Name + culture`).
+
+## Localization: the `L` function
+
+`ScribanTemplateLocalizer` wraps an `IStringLocalizer` as a Scriban `IScriptCustomFunction`. Templates call it like a function — the first positional argument is the localization key, the rest are formatter arguments:
+
+```liquid
+{{ L "HelloText" model.name }}
+{{ L "ItemCount" model.cart.items.size }}
+```
+
+The implementation is straightforward:
+
+```csharp
+public class ScribanTemplateLocalizer : IScriptCustomFunction
+{
+    private readonly IStringLocalizer _localizer;
+
+    public ScribanTemplateLocalizer(IStringLocalizer localizer) { _localizer = localizer; }
+
+    public object Invoke(TemplateContext context, ScriptNode callerContext, ScriptArray arguments,
+        ScriptBlockStatement blockStatement) => GetString(arguments);
+
+    public ValueTask<object> InvokeAsync(TemplateContext context, ScriptNode callerContext, ScriptArray arguments,
+        ScriptBlockStatement blockStatement) => new ValueTask<object>(GetString(arguments));
+
+    private string GetString(ScriptArray arguments)
+    {
+        if (arguments.IsNullOrEmpty()) return string.Empty;
+
+        var name = arguments[0];
+        if (name == null || name.ToString().IsNullOrWhiteSpace()) return string.Empty;
+
+        var args = arguments.Skip(1).Where(x => x != null && !x.ToString().IsNullOrWhiteSpace()).ToArray();
+        return args.Any() ? _localizer[name.ToString(), args] : _localizer[name.ToString()];
+    }
+
+    public int RequiredParameterCount => 1;
+    public int ParameterCount => ScriptFunctionCall.MaximumParameterCount - 1;
+    public ScriptVarParamKind VarParamKind => ScriptVarParamKind.Direct;
+    public Type ReturnType => typeof(object);
+
+    public ScriptParameterInfo GetParameterInfo(int index) =>
+        index == 0
+            ? new ScriptParameterInfo(typeof(string), "template_name")
+            : new ScriptParameterInfo(typeof(object), "value");
+}
+```
+
+Behaviours to be aware of:
+
+- **Empty or whitespace key → empty string.** No exception, no fallback — the template simply emits nothing. Useful for optional labels but easy to mask typos.
+- **Null / whitespace arguments are filtered out** before they reach `_localizer[name, args]`. If your resource expects a positional argument and you pass `null`, Scriban won't complain — `_localizer[name]` is called instead, and you get the unformatted resource.
+- **`L` is only available when the definition has a `LocalizationResourceName`.** `GetLocalizerOrNull` falls back to `StringLocalizerFactory.CreateDefaultOrNull()`, but if the application has no default localization resource registered either, `L` is simply not in the script object and the template throws a "variable not found" error from Scriban.
+
+## Template authoring patterns
+
+### Inline-localized single file
+
+`ForgotPasswordEmail.tpl` (one file, culture-independent, relies on `L`):
+
+```liquid
+{{L "HelloText" model.name}}, {{L "HowAreYou" }}. Please click to the following link to get an email to reset your password!
+```
+
+Registered as:
+
+```csharp
+new TemplateDefinition("MyApp.ForgotPasswordEmail", typeof(MyAppResource))
+    .WithVirtualFilePath("/Emails/ForgotPasswordEmail.tpl", isInlineLocalized: true)
+    .WithScribanEngine();
+```
+
+### Folder layout (one file per culture)
+
+`WelcomeEmail/en.tpl`:
+
+```liquid
+Welcome {{model.name}} to the abp.io!
+```
+
+`WelcomeEmail/tr.tpl`:
+
+```liquid
+abp.io'ya hoş geldin {{model.name}}!
+```
+
+Registered as:
+
+```csharp
+new TemplateDefinition("MyApp.WelcomeEmail")
+    .WithVirtualFilePath("/Emails/WelcomeEmail", isInlineLocalized: false)
+    .WithScribanEngine();
+```
+
+The default-culture fallback (`TemplateDefinition.DefaultCultureName`) kicks in when the requested culture has no file.
+
+### Layouts
+
+```csharp
+context.Add(
+    new TemplateDefinition("MyApp.EmailLayout", isLayout: true)
+        .WithVirtualFilePath("/Emails/EmailLayout.tpl", isInlineLocalized: true)
+        .WithScribanEngine(),
+
+    new TemplateDefinition("MyApp.WelcomeEmail", layout: "MyApp.EmailLayout")
+        .WithVirtualFilePath("/Emails/WelcomeEmail", isInlineLocalized: false)
+        .WithScribanEngine()
+);
+```
+
+`EmailLayout.tpl`:
+
+```liquid
+<html>
+  <body>
+    <h1>Acme</h1>
+    {{ content }}
+    <hr/><small>© Acme</small>
+  </body>
+</html>
+```
+
+### Passing extras via `globalContext`
+
+```csharp
+var html = await _templateRenderer.RenderAsync(
+    templateName: "MyApp.WelcomeEmail",
+    model: new { Name = "Alice" },
+    cultureName: "en",
+    globalContext: new Dictionary<string, object>
+    {
+        ["companyName"] = "Acme",
+        ["supportUrl"]  = "https://acme.example/support"
+    });
+```
+
+Inside the template: `{{ companyName }}` and `{{ supportUrl }}` — same scope as `model`.
+
+## Render sequence
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant Renderer as AbpTemplateRenderer
+    participant Scriban as ScribanTemplateRenderingEngine
+    participant Content as TemplateContentProvider
+    participant LocFactory as IStringLocalizerFactory
+    participant L as ScribanTemplateLocalizer
+    participant Parser as Scriban Template.Parse
+
+    App->>Renderer: RenderAsync("WelcomeEmail", model, "tr-TR")
+    Renderer->>Scriban: RenderAsync(...)
+    Scriban->>Scriban: using CultureHelper.Use("tr-TR")
+    Scriban->>Content: GetContentOrNullAsync(def)
+    Content-->>Scriban: raw .tpl text
+    Scriban->>LocFactory: CreateByResourceName(def.LocalizationResourceName)
+    LocFactory-->>Scriban: IStringLocalizer
+    Scriban->>L: new ScribanTemplateLocalizer(localizer)
+    Scriban->>Scriban: ScriptObject.Import(globalContext); set model; set L
+    Scriban->>Parser: Template.Parse(rawText)
+    Parser-->>Scriban: parsed Template
+    Scriban->>Scriban: template.RenderAsync(context)
+    alt definition.Layout != null
+        Scriban->>Scriban: globalContext["content"] = rendered
+        Scriban->>Scriban: RenderInternalAsync(layoutName, globalContext) (recursive)
+    end
+    Scriban-->>Renderer: final string
+    Renderer-->>App: final string
+```
+
+## Gotchas
+
+- **Scriban does not call CLR methods on your model.** Properties on POCOs are accessible via snake-case in Scriban's standard mode (`model.first_name`), or PascalCase if you set `MemberRenamer = m => m.Name` on the `TemplateContext`. Passing `new { FirstName = "..." }` and using `{{ model.FirstName }}` in a template **silently emits an empty string** if the renamer is left at its default. ABP does not customise the renamer; rely on snake-case or override `CreateScribanTemplateContext` to install your own.
+- **`globalContext` keys are *imported* into the root scope.** A key called `model` will collide with the auto-injected model parameter. Avoid keys named `model`, `content`, or `L`.
+- **`Template.Parse` runs every call.** No AST caching is built in. If you render the same template thousands of times per second, subclass `ScribanTemplateRenderingEngine`, override `RenderTemplateContentWithScribanAsync` and cache by `(templateDefinition.Name, culture)`.
+- **Layouts don't receive `model`.** Only `globalContext` (plus the injected `content` key) is available — this is enforced by `RenderInternalAsync(templateDefinition.Layout, globalContext)` being called without a model argument.
+- **Empty localization key returns empty string, not a fallback marker.** Combined with case-sensitivity, this makes typos invisible. Lean on unit tests that render every template with a fixed model and assert no `MissingManifestResourceException`-style behaviour by hand-rolling assertions.
+- **Layout templates should declare `isLayout: true`.** While the engine doesn't validate it at render time, `IsLayout` is the signal that admin UIs use to expose the template in a layout-picker dropdown rather than as a renderable template.
+- **The engine name is `"Scriban"`, exact case.** `Options.RenderingEngines` is a `Dictionary<string, Type>` with default (case-sensitive) string comparison. `def.WithRenderEngine("scriban")` will fall through to `DefaultRenderingEngine`.
+- **`PushCulture(CultureInfo.CurrentCulture)`** uses `CurrentCulture`, not `CurrentUICulture`. Because `CultureHelper.Use(cultureName)` sets both, this matches in practice, but be cautious if you call the engine directly without going through `ITemplateRenderer`.
+- **The Scriban module overwrites the default engine without checking.** Whichever engine module loads last wins for `DefaultRenderingEngine`; in 7.4.0, module load order is dependency-driven and not deterministic across rebuilds, so always pin the default explicitly in your own module if you depend on it.
+
+## Related pages
+
+- [Text templating core](/framework/templating/text-templating) — abstractions (`ITemplateRenderer`, `TemplateDefinition`, contributors).
+- [Razor rendering engine](/framework/templating/text-templating-razor) — Roslyn-compiled `.cshtml` templates with strongly-typed models.
+- [Liquid rendering engine](/framework/templating/text-templating-liquid) — pattern for adding a third engine alongside Scriban and Razor.
+- [Localization](/framework/core/localization) — `IStringLocalizer`, resource registration, the source of `L`'s strings.
+- [Virtual file system](/framework/core/virtual-file-system) — where `.tpl` files are loaded from.

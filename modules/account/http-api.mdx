@@ -1,0 +1,351 @@
+---
+title: "Account HTTP API"
+description: "AccountController, ProfileController and the dynamic-proxy contract published by Volo.Abp.Account.HttpApi."
+---
+
+`Volo.Abp.Account.HttpApi` exposes the two application services as conventional ASP.NET Core
+controllers under `/api/account/...`. They are *thin* — every method delegates straight to the
+application service, and the routing attributes mirror the contract methods one-to-one. The same
+controllers participate in ABP's dynamic-proxy convention, so the static
+[client proxies](/modules/account/http-api-client) (used by Blazor WASM and console hosts) target
+identical URLs.
+
+## File inventory
+
+```
+Volo.Abp.Account.HttpApi/Volo/Abp/Account/
+├── AbpAccountHttpApiModule.cs
+├── AccountController.cs
+└── ProfileController.cs
+```
+
+## Module declaration
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountApplicationContractsModule),
+    typeof(AbpIdentityHttpApiModule),
+    typeof(AbpAspNetCoreMvcModule))]
+public class AbpAccountHttpApiModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpAccountHttpApiModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AccountResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+Two responsibilities:
+
+1. **`AddApplicationPartIfNotExists`** — MVC scans the Account assembly for controllers. Without this
+   `PreConfigure`, the host's MVC builder ignores the package and the routes never appear.
+2. **`AccountResource` adopts `AbpUiResource` as a base.** That cross-resource inheritance is what
+   makes generic UI strings (`"Cancel"`, `"Save"`, etc.) available in the same `L[...]` indexer used
+   by Account-specific keys.
+
+The module declares `AbpAccountApplicationContractsModule` (so the controllers can reference
+interfaces and DTOs) and `AbpIdentityHttpApiModule` (so the `IdentityUserDto` JSON contract is shared
+across endpoints). The actual application implementation (`AbpAccountApplicationModule`) is **not** a
+dependency — you can ship the HTTP API in a separate API gateway as long as the application module
+is loaded somewhere in the process.
+
+## `AccountController`
+
+```csharp
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[Route("api/account")]
+public class AccountController : AbpControllerBase, IAccountAppService
+{
+    protected IAccountAppService AccountAppService { get; }
+
+    public AccountController(IAccountAppService accountAppService)
+    {
+        AccountAppService = accountAppService;
+    }
+
+    [HttpPost]
+    [Route("register")]
+    public virtual Task<IdentityUserDto> RegisterAsync(RegisterDto input)
+        => AccountAppService.RegisterAsync(input);
+
+    [HttpPost]
+    [Route("send-password-reset-code")]
+    public virtual Task SendPasswordResetCodeAsync(SendPasswordResetCodeDto input)
+        => AccountAppService.SendPasswordResetCodeAsync(input);
+
+    [HttpPost]
+    [Route("verify-password-reset-token")]
+    public Task<bool> VerifyPasswordResetTokenAsync(VerifyPasswordResetTokenInput input)
+        => AccountAppService.VerifyPasswordResetTokenAsync(input);
+
+    [HttpPost]
+    [Route("reset-password")]
+    public virtual Task ResetPasswordAsync(ResetPasswordDto input)
+        => AccountAppService.ResetPasswordAsync(input);
+}
+```
+
+### Attribute breakdown
+
+- **`[RemoteService(Name = "AbpAccount")]`.** Tells ABP the controller participates in remote
+  invocations and labels every endpoint with the `AbpAccount` remote-service name in the
+  generated API description model. Static client proxies match against the same name (see
+  [http-api-client](/modules/account/http-api-client)).
+- **`[Area("account")]`.** Used by ABP's route grouping (Swagger groups, application configuration
+  module name). It is also the key the Web module passes to
+  `DynamicJavaScriptProxyOptions.DisableModule("account")` to suppress the auto-generated jQuery
+  proxy.
+- **`[Route("api/account")]`.** Combined with the per-action `[Route(...)]` segments, this produces
+  the URL table below.
+- **`IAccountAppService` implementation.** ABP's dynamic-proxy convention prefers controllers that
+  implement the same interface as the application service — that's how the static proxy in
+  `HttpApi.Client` can call `AccountClientProxy.RegisterAsync` and have it routed to
+  `POST /api/account/register` automatically.
+
+### Routes
+
+| Verb | Path | Body | Returns |
+| --- | --- | --- | --- |
+| `POST` | `/api/account/register` | `RegisterDto` | `IdentityUserDto` |
+| `POST` | `/api/account/send-password-reset-code` | `SendPasswordResetCodeDto` | `204 No Content` |
+| `POST` | `/api/account/verify-password-reset-token` | `VerifyPasswordResetTokenInput` | `bool` |
+| `POST` | `/api/account/reset-password` | `ResetPasswordDto` | `204 No Content` |
+
+All four routes are anonymous — the controller has no `[Authorize]` attribute. Self-registration is
+gated by `Abp.Account.IsSelfRegistrationEnabled` in the application service, and password reset is
+gated by the cryptographic token. If you need to restrict by IP, add an MVC filter; the easiest hook
+is `services.Configure<MvcOptions>(o => o.Filters.Add(...))` because the controller is open.
+
+## `ProfileController`
+
+```csharp
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[ControllerName("Profile")]
+[Route("/api/account/my-profile")]
+public class ProfileController : AbpControllerBase, IProfileAppService
+{
+    protected IProfileAppService ProfileAppService { get; }
+
+    public ProfileController(IProfileAppService profileAppService)
+    {
+        ProfileAppService = profileAppService;
+    }
+
+    [HttpGet]
+    public virtual Task<ProfileDto> GetAsync()
+        => ProfileAppService.GetAsync();
+
+    [HttpPut]
+    public virtual Task<ProfileDto> UpdateAsync(UpdateProfileDto input)
+        => ProfileAppService.UpdateAsync(input);
+
+    [HttpPost]
+    [Route("change-password")]
+    public virtual Task ChangePasswordAsync(ChangePasswordInput input)
+        => ProfileAppService.ChangePasswordAsync(input);
+}
+```
+
+### Routes
+
+| Verb | Path | Body | Returns |
+| --- | --- | --- | --- |
+| `GET` | `/api/account/my-profile` | — | `ProfileDto` |
+| `PUT` | `/api/account/my-profile` | `UpdateProfileDto` | `ProfileDto` |
+| `POST` | `/api/account/my-profile/change-password` | `ChangePasswordInput` | `204 No Content` |
+
+The application service is annotated `[Authorize]`, so attempting any of these without a valid
+authentication cookie/bearer returns `401 Unauthorized`.
+
+`ControllerName("Profile")` decouples the URL from the class name — without it the dynamic OpenAPI
+description would include a `ProfileController` action group, but with it the Swagger UI shows a
+clean `Profile` tag.
+
+## Wire format
+
+### `POST /api/account/register`
+
+```http
+POST /api/account/register HTTP/1.1
+Content-Type: application/json
+__tenant: 9c11ad6f-... (optional)
+
+{
+  "userName": "alice",
+  "emailAddress": "alice@example.com",
+  "password": "Pa$$w0rd!",
+  "appName": "MVC",
+  "extraProperties": {
+    "DateOfBirth": "1990-01-01"
+  }
+}
+```
+
+Response on success:
+
+```json
+{
+  "id": "f30a04...",
+  "userName": "alice",
+  "name": null,
+  "surname": null,
+  "email": "alice@example.com",
+  "emailConfirmed": false,
+  "phoneNumber": null,
+  "phoneNumberConfirmed": false,
+  "isActive": true,
+  "lockoutEnabled": true,
+  "lockoutEnd": null,
+  "concurrencyStamp": "...",
+  "creationTime": "2024-...",
+  "tenantId": "9c11ad6f-..."
+}
+```
+
+When `Abp.Account.IsSelfRegistrationEnabled` is `false`, the application service throws
+`UserFriendlyException("SelfRegistrationDisabledMessage")`. ABP's exception filter converts that into:
+
+```json
+{
+  "error": {
+    "code": null,
+    "message": "Self registration is disabled.",
+    "details": null
+  }
+}
+```
+
+with status `403 Forbidden`.
+
+### `POST /api/account/verify-password-reset-token`
+
+This endpoint is unusual in that it returns a *boolean* — `true` if the token is valid, `false`
+otherwise. The Razor page uses the boolean to set `InvalidToken = true` and render a "Token is no
+longer valid" message before any password input is shown:
+
+```http
+POST /api/account/verify-password-reset-token HTTP/1.1
+Content-Type: application/json
+
+{ "userId": "f30a04...", "resetToken": "CfDJ..." }
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+true
+```
+
+### `PUT /api/account/my-profile`
+
+```http
+PUT /api/account/my-profile HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGc...
+
+{
+  "userName": "alice2",
+  "email": "alice2@example.com",
+  "name": "Alice",
+  "surname": "Smith",
+  "phoneNumber": "+15551234",
+  "concurrencyStamp": "fa9b...",
+  "extraProperties": { ... }
+}
+```
+
+If `IdentitySettingNames.User.IsUserNameUpdateEnabled` is `false`, the username field is silently
+ignored — the server still returns `200 OK` with the *unchanged* username. There is no error and no
+warning header. If you need strict feedback, override `ProfileAppService.UpdateAsync` to throw when
+the requested change is suppressed.
+
+## Multi-tenancy
+
+Account's controllers do not declare a `MultiTenancySides`. By default they accept the
+`__tenant` cookie/header populated by `AbpAspNetCoreMultiTenancyMiddleware`. Two consequences:
+
+- The **register** endpoint creates the user in whatever tenant the request resolves to. Make sure
+  the front-end sets `__tenant` (the cookie value) **before** posting to `/api/account/register`,
+  otherwise the user is created in the host.
+- The **password-reset** flow embeds the tenant id in the email link
+  (`&__tenant=<guid>` — see `AccountEmailer.SendPasswordResetLinkAsync`). When the recipient clicks
+  the link, ABP's tenant resolver picks up the query string and the reset endpoint runs in the
+  correct tenant scope.
+
+See [multi-tenancy resolution](/flows/multi-tenancy-resolution) for the full middleware sequence.
+
+## OpenAPI / Swagger
+
+Both controllers are picked up by ABP's automatic OpenAPI generation; the `[Area("account")]`
+attribute groups them under the `account` tag. The Swagger XML doc file is shipped with the package
+(`Volo.Abp.Account.HttpApi.xml`) and read by ABP's Swagger generator — turn on
+`options.IncludeXmlComments(...)` to surface DTO descriptions in Swagger UI.
+
+The dynamic JavaScript proxy is *intentionally disabled* for this module in the Web layer:
+
+```csharp
+// AbpAccountWebModule.cs
+Configure<DynamicJavaScriptProxyOptions>(options =>
+{
+    options.DisableModule(AccountRemoteServiceConsts.ModuleName);
+});
+```
+
+The Web project ships a hand-written ES6 proxy at `wwwroot/client-proxies/account-proxy.js` instead,
+giving more control over the URLs and 2FA-aware error handling for the Manage page.
+
+## Calling the API from cURL
+
+```bash
+# Anonymous: trigger a password reset email for the tenant 'demo'
+curl -X POST https://localhost:44300/api/account/send-password-reset-code \
+  -H "Content-Type: application/json" \
+  -H "__tenant: demo" \
+  -d '{
+        "email": "alice@example.com",
+        "appName": "MVC",
+        "returnUrl": "/dashboard",
+        "returnUrlHash": null
+      }'
+
+# Authenticated: change current user's password
+curl -X POST https://localhost:44300/api/account/my-profile/change-password \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -d '{ "currentPassword": "Pa$$w0rd!", "newPassword": "N3wP@ss!" }'
+```
+
+## Customization recipes
+
+- **Add a Captcha to `/register`.** Subclass `AccountController` and decorate the override with a
+  `[ServiceFilter(typeof(CaptchaFilter))]`. Make sure to register your subclass with
+  `[Dependency(ReplaceServices = true)]` so DI resolves it instead of the original.
+- **Rename routes.** Override the controller and use a different `[Route]`. Because the static
+  client proxy targets the *interface*, not the route, you must also customize the proxy if you
+  break the URL contract.
+- **Restrict to one tenant.** Add `[MultiTenantSide(MultiTenancySides.Tenant)]` (from
+  `Volo.Abp.MultiTenancy`) to the controller subclass so host-side calls return `403`.
+
+## Cross-references
+
+- [application-contracts](/modules/account/application-contracts) — interface and DTO definitions.
+- [application](/modules/account/application) — body of every action.
+- [http-api-client](/modules/account/http-api-client) — static client proxies that call these
+  endpoints.
+- [Identity HTTP API](/modules/identity/http-api) — companion controllers for user/role admin.
+- [HTTP request lifecycle](/flows/http-request-lifecycle) — how MVC sees these routes inside the ABP
+  middleware pipeline.

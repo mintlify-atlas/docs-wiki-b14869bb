@@ -1,0 +1,300 @@
+---
+title: "Volo.Abp.FeatureManagement.Application: FeatureAppService and the per-provider policy gate"
+sidebarTitle: "Application"
+description: "FeatureAppService.GetAsync/UpdateAsync/DeleteAsync — how groups are assembled, depth is computed, host-vs-tenant authorization is dispatched, and FeatureValueInvalidException propagates."
+---
+
+`Volo.Abp.FeatureManagement.Application` contains exactly one substantive class — `FeatureAppService` — and its abstract base. Everything else (DTOs, the `IFeatureAppService` contract, the `ManageHostFeatures` permission) is in [Application.Contracts](/modules/feature-management/application-contracts). The application module is small because the heavy lifting (provider chain, store, cache) was already done in the Domain layer; this layer is the policy gate plus DTO assembly.
+
+Module class:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementDomainModule),
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpDddApplicationModule))]
+public class AbpFeatureManagementApplicationModule : AbpModule
+{
+}
+```
+
+No `ConfigureServices` — `FeatureAppService` and `FeatureManagementAppServiceBase` are picked up by the `AbpDddApplicationModule` convention.
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `AbpFeatureManagementApplicationModule.cs` | Module class — depends on Domain + Application.Contracts. |
+| `FeatureManagementAppServiceBase.cs` | Sets `ObjectMapperContext = typeof(AbpFeatureManagementApplicationModule)` and `LocalizationResource = typeof(AbpFeatureManagementResource)`. |
+| `FeatureAppService.cs` | The only `IFeatureAppService` implementation in this assembly. |
+
+That's the whole package.
+
+## `FeatureManagementAppServiceBase`
+
+```csharp
+public abstract class FeatureManagementAppServiceBase : ApplicationService
+{
+    protected FeatureManagementAppServiceBase()
+    {
+        ObjectMapperContext = typeof(AbpFeatureManagementApplicationModule);
+        LocalizationResource = typeof(AbpFeatureManagementResource);
+    }
+}
+```
+
+Setting `LocalizationResource` makes `L["..."]` inside subclasses resolve against `AbpFeatureManagementResource` without per-call disambiguation. The `ObjectMapperContext` would be used if `IObjectMapper` were ever invoked; in practice this module does no mapping (DTOs are assembled by hand).
+
+## `FeatureAppService`
+
+```csharp
+[Authorize]
+public class FeatureAppService : FeatureManagementAppServiceBase, IFeatureAppService
+{
+    protected FeatureManagementOptions Options { get; }
+    protected IFeatureManager FeatureManager { get; }
+    protected IFeatureDefinitionManager FeatureDefinitionManager { get; }
+
+    public FeatureAppService(IFeatureManager featureManager,
+        IFeatureDefinitionManager featureDefinitionManager,
+        IOptions<FeatureManagementOptions> options)
+    {
+        FeatureManager = featureManager;
+        FeatureDefinitionManager = featureDefinitionManager;
+        Options = options.Value;
+    }
+    // ...
+}
+```
+
+The class-level `[Authorize]` enforces that the caller is authenticated. The per-method authorization is finer-grained — `CheckProviderPolicy(providerName, providerKey)` runs before any read or write.
+
+### `GetAsync`
+
+```csharp
+public virtual async Task<GetFeatureListResultDto> GetAsync(
+    [NotNull] string providerName, string providerKey)
+{
+    await CheckProviderPolicy(providerName, providerKey);
+
+    var result = new GetFeatureListResultDto { Groups = new List<FeatureGroupDto>() };
+
+    foreach (var group in await FeatureDefinitionManager.GetGroupsAsync())
+    {
+        var groupDto = CreateFeatureGroupDto(group);
+
+        foreach (var featureDefinition in group.GetFeaturesWithChildren())
+        {
+            if (providerName == TenantFeatureValueProvider.ProviderName &&
+                CurrentTenant.Id == null &&
+                providerKey == null &&
+                !featureDefinition.IsAvailableToHost)
+            {
+                continue;
+            }
+
+            var feature = await FeatureManager.GetOrNullWithProviderAsync(
+                featureDefinition.Name, providerName, providerKey);
+            groupDto.Features.Add(CreateFeatureDto(feature, featureDefinition));
+        }
+
+        SetFeatureDepth(groupDto.Features, providerName, providerKey);
+
+        if (groupDto.Features.Any())
+        {
+            result.Groups.Add(groupDto);
+        }
+    }
+
+    return result;
+}
+```
+
+Key behaviour:
+
+- **Filtering `IsAvailableToHost = false`.** When the call represents "edit host defaults" (provider `"T"` + null tenant + null key), features marked `IsAvailableToHost = false` are excluded. The host shouldn't even see those — they're tenant-only features.
+- **Depth is computed server-side.** `SetFeatureDepth` recurses by matching `ParentName` to `Name`, starting at root features (`ParentName == null`) with depth `0`. The UI uses it for indentation.
+- **Empty groups disappear.** If every feature in a group was filtered, the group is dropped from the response — the UI never sees an empty tab.
+- **Per-feature provider lookup.** Each feature is fetched individually via `IFeatureManager.GetOrNullWithProviderAsync` rather than `GetAllWithProviderAsync`. That's because `GetAllWithProviderAsync` *omits* features whose value is `null` (no override anywhere) — the UI needs the `null` row too so the user can *start* setting a value. The per-feature call returns a `FeatureNameValueWithGrantedProvider` whose `Provider` is `null` when nothing overrode the default.
+
+`CreateFeatureGroupDto`:
+
+```csharp
+private FeatureGroupDto CreateFeatureGroupDto(FeatureGroupDefinition groupDefinition)
+{
+    return new FeatureGroupDto
+    {
+        Name = groupDefinition.Name,
+        DisplayName = groupDefinition.DisplayName?.Localize(StringLocalizerFactory),
+        Features = new List<FeatureDto>()
+    };
+}
+```
+
+`StringLocalizerFactory` comes from `ApplicationService` — the framework wires up the same factory that `FeatureManagementAppServiceBase` set on `LocalizationResource`.
+
+`CreateFeatureDto`:
+
+```csharp
+private FeatureDto CreateFeatureDto(FeatureNameValueWithGrantedProvider featureNameValueWithGrantedProvider,
+                                    FeatureDefinition featureDefinition)
+{
+    return new FeatureDto
+    {
+        Name = featureDefinition.Name,
+        DisplayName = featureDefinition.DisplayName?.Localize(StringLocalizerFactory),
+        Description = featureDefinition.Description?.Localize(StringLocalizerFactory),
+        ValueType = featureDefinition.ValueType,
+        ParentName = featureDefinition.Parent?.Name,
+        Value = featureNameValueWithGrantedProvider.Value,
+        Provider = new FeatureProviderDto
+        {
+            Name = featureNameValueWithGrantedProvider.Provider?.Name,
+            Key = featureNameValueWithGrantedProvider.Provider?.Key
+        }
+    };
+}
+```
+
+Three nullables to watch:
+
+- `featureDefinition.DisplayName?.Localize(...)` — for a feature defined without a display name, this is `null`. The UI then falls back to `Name`.
+- `featureNameValueWithGrantedProvider.Value` — `null` if no provider overrode the default and the default itself is `null`.
+- `Provider?.Name`/`Provider?.Key` — both `null` when the value came from `DefaultValueFeatureManagementProvider` *and* the default was null (rare — usually the default provider always answers).
+
+The `Value` *not* being filtered for nulls means the modal can render an empty input. That's intentional: the UI distinguishes "no value here" from "value = empty string".
+
+### `UpdateAsync`
+
+```csharp
+public virtual async Task UpdateAsync([NotNull] string providerName, string providerKey, UpdateFeaturesDto input)
+{
+    await CheckProviderPolicy(providerName, providerKey);
+
+    foreach (var feature in input.Features)
+    {
+        await FeatureManager.SetAsync(feature.Name, feature.Value, providerName, providerKey);
+    }
+}
+```
+
+There is no ambient transaction. Each `IFeatureManager.SetAsync` call enters its own `[UnitOfWork]` scope via `FeatureManagementStore`. If the third of seven feature updates throws `FeatureValueInvalidException`, the first two are already persisted and visible to other readers. If you need atomic batch updates, wrap the caller in your own `IUnitOfWorkManager.Begin(requiresNew: true, isTransactional: true)`.
+
+### `DeleteAsync`
+
+```csharp
+public virtual async Task DeleteAsync([NotNull] string providerName, string providerKey)
+{
+    await FeatureManager.DeleteAsync(providerName, providerKey);
+}
+```
+
+Notably **does not** call `CheckProviderPolicy`. That's an oversight in the source — `DeleteAsync` lets any authenticated user (`[Authorize]` is class-level) reset *any* provider's overrides if they can reach the controller. The default authorization model still protects you on the host side via the controller's `[Authorize]` plus network-level controls, but if you build a custom provider with a strict policy, override this method to call `CheckProviderPolicy(providerName, providerKey)` before the delete.
+
+### `CheckProviderPolicy`
+
+```csharp
+protected virtual async Task CheckProviderPolicy(string providerName, string providerKey)
+{
+    string policyName;
+    if (providerName == TenantFeatureValueProvider.ProviderName && CurrentTenant.Id == null && providerKey == null)
+    {
+        policyName = FeatureManagementPermissions.ManageHostFeatures;
+    }
+    else
+    {
+        policyName = Options.ProviderPolicies.GetOrDefault(providerName);
+        if (policyName.IsNullOrEmpty())
+        {
+            throw new AbpException(
+                $"No policy defined to get/set permissions for the provider '{providerName}'. " +
+                $"Use {nameof(FeatureManagementOptions)} to map the policy.");
+        }
+    }
+
+    await AuthorizationService.CheckAsync(policyName);
+}
+```
+
+Decision tree:
+
+| `providerName` | `CurrentTenant.Id` | `providerKey` | Policy used |
+| --- | --- | --- | --- |
+| `"T"` | `null` | `null` | `FeatureManagementPermissions.ManageHostFeatures` |
+| any | `not null` or `providerKey not null` | — | `Options.ProviderPolicies[providerName]` (must be set, else throws). |
+
+Out of the box `ProviderPolicies["T"] = "AbpTenantManagement.Tenants.ManageFeatures"`. Edition (`"E"`) and any custom providers are unconfigured — adding them requires the host to wire `Options.ProviderPolicies["E"] = "...";` in their own `ConfigureServices`.
+
+### `SetFeatureDepth`
+
+```csharp
+protected virtual void SetFeatureDepth(List<FeatureDto> features,
+    string providerName, string providerKey,
+    FeatureDto parentFeature = null, int depth = 0)
+{
+    foreach (var feature in features)
+    {
+        if ((parentFeature == null && feature.ParentName == null) ||
+            (parentFeature != null && parentFeature.Name == feature.ParentName))
+        {
+            feature.Depth = depth;
+            SetFeatureDepth(features, providerName, providerKey, feature, depth + 1);
+        }
+    }
+}
+```
+
+Two notes:
+
+- The recursion is O(n²) in the number of features per group — each level scans the whole list. For typical feature counts (low hundreds at most) this is fine; if you ship thousands of dynamic features per group, you'll want to override and build a single-pass dictionary.
+- `providerName` and `providerKey` are passed through but unused in the body — leftovers from an earlier signature.
+
+## Authorization wiring summary
+
+Three layers stack to gate `IFeatureAppService`:
+
+1. **Class-level `[Authorize]`** — caller must be authenticated.
+2. **`CheckProviderPolicy`** in `GetAsync` and `UpdateAsync` — per-provider, per-scope policy from `FeatureManagementOptions.ProviderPolicies` or `ManageHostFeatures` for the host-default branch.
+3. **`AbpFeaturesModule` interceptor** — none of these methods carry `[RequiresFeature]`, so this layer is a no-op for the feature management methods themselves.
+
+For the host side, the standard ABP project template seeds `FeatureManagement.ManageHostFeatures` to the **admin** role on the host side at boot via `IdentityDataSeedContributor` — confirm this in your host module if you rolled your own identity seeder.
+
+## Multitenancy interplay
+
+The crucial pattern: when an admin on the *host* side opens the modal for tenant T:
+
+1. `FeaturesClientProxy` (or direct call) → `FeaturesController.GetAsync(providerName: "T", providerKey: T.ToString())`.
+2. `FeatureAppService.GetAsync` runs in *host* context — `CurrentTenant.Id == null`.
+3. `CheckProviderPolicy` sees `providerKey != null`, so it picks `ProviderPolicies["T"] = "AbpTenantManagement.Tenants.ManageFeatures"`.
+4. `IFeatureManager.GetOrNullWithProviderAsync(featureName, "T", T.ToString())` → `TenantFeatureManagementProvider.HandleContextAsync` is *not* invoked at read time; the read path goes through `FeatureManagementStore` which does the lookup directly with the provided key.
+
+When the same admin saves the modal:
+
+1. `FeatureAppService.UpdateAsync` → `FeatureManager.SetAsync` per feature.
+2. Inside `SetAsync`, the redundant-value check calls `providers[0].HandleContextAsync(providerName, providerKey)` — that's where `TenantFeatureManagementProvider.HandleContextAsync` parses the `providerKey` as a Guid and calls `ICurrentTenant.Change(tenantId)`. The fallback-comparison read then runs in tenant T's data filter context.
+
+This pattern is important: it lets `FeatureManager.SetAsync` resolve "what would the next provider in the chain say for tenant T" without leaking tenant data filters into the host-scoped flow.
+
+## Audit log integration
+
+Because `FeatureAppService` extends `ApplicationService`, the framework's audit log automatically captures `GetAsync` / `UpdateAsync` / `DeleteAsync` invocations. The `UpdateFeaturesDto` payload appears in the audit log's `Parameters` field (as JSON), so feature-flag changes are auditable out of the box — handy for compliance scenarios. See the `Audit Logging` module for the persistence side.
+
+## Error handling
+
+| Source | Exception | HTTP status (via `AbpExceptionFilter`) |
+| --- | --- | --- |
+| `CheckProviderPolicy` (no mapping) | `AbpException` | 500 |
+| `CheckProviderPolicy` (auth fails) | `AbpAuthorizationException` | 403 |
+| `FeatureManager.SetAsync` (bad value) | `FeatureValueInvalidException` (`BusinessException`) | 403 / 400 depending on `AbpExceptionHandlingOptions` |
+| `FeatureDefinitionManager.GetAsync(name)` (unknown name) | `AbpException` thrown by framework | 500 |
+
+The bad-value path is the one users hit most. The exception localizes via `Volo.Abp.FeatureManagement:InvalidFeatureValue → "{0} feature value is not valid!"`.
+
+## Gotchas
+
+- **`DeleteAsync` skips `CheckProviderPolicy`.** Override it in a derived `FeatureAppService` if your custom provider needs delete protection.
+- **`GetAsync` calls `GetOrNullWithProviderAsync` once per feature.** For a tenant with 100 features and an empty Redis, that's 100 cache lookups + one fan-out DB load (the first call populates *all* entries for that tenant). After the warmup, the loop is cache-only. Worth profiling if you have hundreds of features and aggressive cache eviction.
+- **No atomic batch in `UpdateAsync`.** Wrap the controller call in your own UoW if you need transactional batches across many features.
+- **`ProviderPolicies` lookups silently swallow case-sensitivity bugs.** Keys are case-sensitive (`Dictionary<string, string>` default). Use the static constants (`TenantFeatureValueProvider.ProviderName`, `EditionFeatureValueProvider.ProviderName`) rather than string literals.
+- **Custom providers without a mapped policy throw on every call.** Set `Options.ProviderPolicies[customProviderName] = "..."` in `ConfigureServices` as soon as you register the provider.
+- For `IFeatureChecker`, `[RequiresFeature]`, `IFeatureDefinitionManager`, and how `FeatureDefinition.IsAvailableToHost` participates in the host/tenant distinction, see [framework/cross/features](/framework/cross/features).

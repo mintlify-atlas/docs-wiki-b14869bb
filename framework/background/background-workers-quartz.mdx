@@ -1,0 +1,300 @@
+---
+title: "Volo.Abp.BackgroundWorkers.Quartz — Quartz-backed workers"
+sidebarTitle: "Workers · Quartz"
+description: "QuartzBackgroundWorkerManager replaces BackgroundWorkerManager so each IBackgroundWorker becomes a JobDetail + ITrigger scheduled on the shared IScheduler."
+---
+
+`Volo.Abp.BackgroundWorkers.Quartz` is the Quartz.NET counterpart to the Hangfire workers package. It replaces ABP's default `BackgroundWorkerManager` with `QuartzBackgroundWorkerManager`, which schedules every worker on the shared `IScheduler` exposed by `Volo.Abp.Quartz`.
+
+The package depends on `Volo.Abp.BackgroundWorkers` (for the worker abstractions) and `Volo.Abp.Quartz` (for the `IScheduler` + `ISchedulerFactory` registration). Existing `AsyncPeriodicBackgroundWorkerBase` / `PeriodicBackgroundWorkerBase` subclasses keep working unchanged — they are wrapped by `QuartzPeriodicBackgroundWorkerAdapter<TWorker>`.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/BackgroundWorkers/Quartz/AbpBackgroundWorkersQuartzModule.cs` | Module class. Adds the conventional registrar, registers the adapter and auto-registers `IQuartzBackgroundWorker` instances at startup. |
+| `Volo/Abp/BackgroundWorkers/Quartz/QuartzBackgroundWorkerManager.cs` | `[Dependency(ReplaceServices = true)]` replacement of `BackgroundWorkerManager`. |
+| `Volo/Abp/BackgroundWorkers/Quartz/IQuartzBackgroundWorker.cs` | Worker interface inheriting `IBackgroundWorker` + `Quartz.IJob`. |
+| `Volo/Abp/BackgroundWorkers/Quartz/QuartzBackgroundWorkerBase.cs` | Abstract base implementing the interface with sensible defaults. |
+| `Volo/Abp/BackgroundWorkers/Quartz/QuartzPeriodicBackgroundWorkerAdapter.cs` | Adapter wrapping classic periodic workers as Quartz jobs. |
+| `Volo/Abp/BackgroundWorkers/Quartz/IQuartzBackgroundWorkerAdapter.cs` | Marker exposing `BuildWorker(IBackgroundWorker)`. |
+| `Volo/Abp/BackgroundWorkers/Quartz/AbpQuartzConventionalRegistrar.cs` | Conventional registrar that exposes worker types as `IQuartzBackgroundWorker`. |
+| `Volo/Abp/BackgroundWorkers/Quartz/AbpBackgroundWorkerQuartzOptions.cs` | One flag — `IsAutoRegisterEnabled`. |
+
+## Key abstractions
+
+| Symbol | Role |
+| --- | --- |
+| `IQuartzBackgroundWorker : IBackgroundWorker, IJob` | Worker carrying `ITrigger`, `IJobDetail`, `AutoRegister` and an optional `Func<IScheduler, Task>` to do bespoke scheduling. |
+| `QuartzBackgroundWorkerBase` | Base implementing the interface; `Execute(IJobExecutionContext)` is the user override. |
+| `QuartzBackgroundWorkerManager` | Schedules workers via `Scheduler.ScheduleJob` (or `RescheduleJob` if the job already exists). |
+| `QuartzPeriodicBackgroundWorkerAdapter<TWorker>` | Wraps an `AsyncPeriodicBackgroundWorkerBase` / `PeriodicBackgroundWorkerBase` as an `IQuartzBackgroundWorker`. |
+| `AbpQuartzConventionalRegistrar` | Filters discovery to types implementing `IQuartzBackgroundWorker` and exposes them as that service. |
+| `AbpBackgroundWorkerQuartzOptions` | `IsAutoRegisterEnabled` (default `true`) – enables walking all `IQuartzBackgroundWorker` services at startup. |
+
+## The module
+
+```csharp
+[DependsOn(
+    typeof(AbpBackgroundWorkersModule),
+    typeof(AbpQuartzModule))]
+public class AbpBackgroundWorkersQuartzModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddConventionalRegistrar(new AbpQuartzConventionalRegistrar());
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddSingleton(typeof(QuartzPeriodicBackgroundWorkerAdapter<>));
+    }
+
+    public override void OnPreApplicationInitialization(ApplicationInitializationContext context)
+    {
+        var options = context.ServiceProvider.GetRequiredService<IOptions<AbpBackgroundWorkerOptions>>().Value;
+        if (!options.IsEnabled)
+        {
+            var quartzOptions = context.ServiceProvider
+                .GetRequiredService<IOptions<AbpQuartzOptions>>().Value;
+            quartzOptions.StartSchedulerFactory = _ => Task.CompletedTask;
+        }
+    }
+
+    public async override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        var quartzBackgroundWorkerOptions = context.ServiceProvider
+            .GetRequiredService<IOptions<AbpBackgroundWorkerQuartzOptions>>().Value;
+
+        if (quartzBackgroundWorkerOptions.IsAutoRegisterEnabled)
+        {
+            var backgroundWorkerManager = context.ServiceProvider
+                .GetRequiredService<IBackgroundWorkerManager>();
+            var works = context.ServiceProvider
+                .GetServices<IQuartzBackgroundWorker>()
+                .Where(x => x.AutoRegister);
+
+            foreach (var work in works)
+                await backgroundWorkerManager.AddAsync(work);
+        }
+    }
+}
+```
+
+Three things to note:
+
+- **Disable propagates.** When `AbpBackgroundWorkerOptions.IsEnabled` is `false`, the module short-circuits `AbpQuartzOptions.StartSchedulerFactory` to `Task.CompletedTask` so the scheduler never starts on this instance — an analogue of Hangfire's enqueue-only mode.
+- **Conventional registrar drives discovery.** Worker types implementing `IQuartzBackgroundWorker` are auto-registered (as `IQuartzBackgroundWorker`) — the framework's default ABP registrar would otherwise expose them as their concrete types only.
+- **Auto-registration happens at app init.** All `IQuartzBackgroundWorker` services whose `AutoRegister` is `true` get a `manager.AddAsync(...)` call. Set `AutoRegister = false` on a worker that you want to schedule yourself with a custom trigger.
+
+## The conventional registrar
+
+```csharp
+public class AbpQuartzConventionalRegistrar : DefaultConventionalRegistrar
+{
+    protected override bool IsConventionalRegistrationDisabled(Type type)
+        => !typeof(IQuartzBackgroundWorker).IsAssignableFrom(type)
+           || base.IsConventionalRegistrationDisabled(type);
+
+    protected override List<Type> GetExposedServiceTypes(Type type)
+        => new() { typeof(IQuartzBackgroundWorker) };
+}
+```
+
+The override of `GetExposedServiceTypes` is what makes the line `services.GetServices<IQuartzBackgroundWorker>()` in the module return *every* worker, regardless of concrete type — the same idiom ABP uses for event handlers and module dependencies.
+
+## How the manager schedules a worker
+
+```mermaid
+flowchart TD
+  Add[manager.AddAsync(worker)] --> Branch{worker type}
+  Branch -- IQuartzBackgroundWorker --> Cust{ScheduleJob != null?}
+  Cust -- yes --> Custom[ScheduleJob.Invoke(Scheduler)]
+  Cust -- no --> Default[DefaultScheduleJobAsync]
+  Default --> Exists{Scheduler.CheckExists?}
+  Exists -- yes --> Re[AddJob+RescheduleJob]
+  Exists -- no --> Sch[ScheduleJob(JobDetail, Trigger)]
+  Branch -- PeriodicBackgroundWorkerBase --> Adp[Build adapter<br/>BuildWorker(worker)]
+  Adp --> Default
+  Branch -- other IBackgroundWorker --> Base[base.AddAsync — timer]
+```
+
+The relevant code:
+
+```csharp
+public async override Task AddAsync(IBackgroundWorker worker, CancellationToken ct = default)
+    => await ReScheduleJobAsync(worker, ct);
+
+protected virtual async Task ReScheduleJobAsync(IBackgroundWorker worker, CancellationToken ct = default)
+{
+    switch (worker)
+    {
+        case IQuartzBackgroundWorker quartzWork:
+            Check.NotNull(quartzWork.Trigger, nameof(quartzWork.Trigger));
+            Check.NotNull(quartzWork.JobDetail, nameof(quartzWork.JobDetail));
+
+            if (quartzWork.ScheduleJob != null)
+                await quartzWork.ScheduleJob.Invoke(Scheduler);
+            else
+                await DefaultScheduleJobAsync(quartzWork, ct);
+            break;
+
+        case AsyncPeriodicBackgroundWorkerBase or PeriodicBackgroundWorkerBase:
+            var adapterType = typeof(QuartzPeriodicBackgroundWorkerAdapter<>)
+                .MakeGenericType(ProxyHelper.GetUnProxiedType(worker));
+            var workerAdapter = Activator.CreateInstance(adapterType) as IQuartzBackgroundWorkerAdapter;
+            workerAdapter?.BuildWorker(worker);
+            if (workerAdapter?.Trigger != null)
+                await DefaultScheduleJobAsync(workerAdapter, ct);
+            break;
+
+        default:
+            await base.AddAsync(worker, ct);
+            break;
+    }
+}
+
+protected virtual async Task DefaultScheduleJobAsync(IQuartzBackgroundWorker quartzWork, CancellationToken ct)
+{
+    if (await Scheduler.CheckExists(quartzWork.JobDetail.Key, ct))
+    {
+        await Scheduler.AddJob(quartzWork.JobDetail, true, true, ct);
+        await Scheduler.ResumeJob(quartzWork.JobDetail.Key, ct);
+        await Scheduler.RescheduleJob(quartzWork.Trigger.Key, quartzWork.Trigger, ct);
+    }
+    else
+    {
+        await Scheduler.ScheduleJob(quartzWork.JobDetail, quartzWork.Trigger, ct);
+    }
+}
+```
+
+The `CheckExists` branch is what makes the manager **idempotent**: if a Quartz job with the same key is already in the store (which happens when using a persistent store such as SQL Server), the manager re-registers the job (`AddJob(... replace: true)`) and reschedules the trigger. The same code path therefore handles cold-start and warm-start cases.
+
+## `StartAsync` / `StopAsync` — taking the scheduler in and out of standby
+
+```csharp
+public async override Task StartAsync(CancellationToken ct = default)
+{
+    if (Scheduler.IsStarted && Scheduler.InStandbyMode)
+        await Scheduler.Start(ct);
+    await base.StartAsync(ct);
+}
+
+public async override Task StopAsync(CancellationToken ct = default)
+{
+    if (Scheduler.IsStarted && !Scheduler.InStandbyMode)
+        await Scheduler.Standby(ct);
+    await base.StopAsync(ct);
+}
+```
+
+`Scheduler.Standby()` parks misfires until `Start()` is called again — exactly what you want on graceful shutdown so running jobs complete but no new ones fire.
+
+## The periodic adapter — turning timer-based workers into Quartz jobs
+
+```csharp
+[DisallowConcurrentExecution]
+public class QuartzPeriodicBackgroundWorkerAdapter<TWorker> : QuartzBackgroundWorkerBase, IQuartzBackgroundWorkerAdapter
+    where TWorker : IBackgroundWorker
+{
+    public QuartzPeriodicBackgroundWorkerAdapter()
+    {
+        AutoRegister = false;
+        _doWorkAsyncMethod = typeof(TWorker).GetMethod("DoWorkAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        _doWorkMethod = typeof(TWorker).GetMethod("DoWork",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+    }
+
+    public void BuildWorker(IBackgroundWorker worker)
+    {
+        // Reflect AbpTimer.Period or AbpAsyncTimer.Period from the private "Timer" property
+        // ...
+        JobDetail = JobBuilder.Create<QuartzPeriodicBackgroundWorkerAdapter<TWorker>>()
+            .WithIdentity(workerType.FullName!)
+            .Build();
+        Trigger = TriggerBuilder.Create()
+            .WithIdentity(workerType.FullName!)
+            .WithSimpleSchedule(b => b.WithInterval(TimeSpan.FromMilliseconds(period.Value)).RepeatForever())
+            .Build();
+    }
+
+    public async override Task Execute(IJobExecutionContext context)
+    {
+        var worker = (IBackgroundWorker)ServiceProvider.GetRequiredService(typeof(TWorker));
+        var workerContext = new PeriodicBackgroundWorkerContext(ServiceProvider, context.CancellationToken);
+
+        switch (worker)
+        {
+            case AsyncPeriodicBackgroundWorkerBase asyncWorker:
+                if (_doWorkAsyncMethod != null)
+                    await (Task)(_doWorkAsyncMethod.Invoke(asyncWorker, new object[] { workerContext })!);
+                break;
+            case PeriodicBackgroundWorkerBase syncWorker:
+                _doWorkMethod?.Invoke(syncWorker, new object[] { workerContext });
+                break;
+        }
+    }
+}
+```
+
+The `[DisallowConcurrentExecution]` attribute is meaningful here — it prevents Quartz from firing a second `Execute` overlap if the previous run hasn't finished, matching the single-thread semantics of `AbpAsyncTimer`.
+
+`WithIdentity(workerType.FullName!)` ensures the job and trigger keys are stable across deployments. Combined with the `CheckExists` branch above, that makes upgrades safe.
+
+## A first-class Quartz worker
+
+```csharp
+public class CleanupWorker : QuartzBackgroundWorkerBase
+{
+    public CleanupWorker()
+    {
+        JobDetail = JobBuilder.Create<CleanupWorker>().WithIdentity(nameof(CleanupWorker)).Build();
+        Trigger = TriggerBuilder.Create()
+            .WithIdentity(nameof(CleanupWorker))
+            .WithCronSchedule("0 0 3 * * ?") // 03:00 every day
+            .Build();
+    }
+
+    public override async Task Execute(IJobExecutionContext context)
+    {
+        var ct = context.CancellationToken;
+        // resolve services, do the work
+    }
+}
+```
+
+The worker is auto-registered (via `AbpQuartzConventionalRegistrar`) and auto-scheduled at startup because `AutoRegister` defaults to `true`.
+
+## Options reference
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `AbpBackgroundWorkerQuartzOptions.IsAutoRegisterEnabled` | `true` | When `false`, the module skips the `foreach` and you must schedule workers yourself via `IBackgroundWorkerManager.AddAsync`. |
+| `IQuartzBackgroundWorker.AutoRegister` | `true` | Per-worker opt-out from the auto-registration loop. |
+| `IQuartzBackgroundWorker.ScheduleJob` | `null` | Custom scheduling delegate. Useful for `Calendar`-aware triggers, listeners, etc. |
+| `AbpBackgroundWorkerOptions.IsEnabled` | `true` | When `false`, this module forces `AbpQuartzOptions.StartSchedulerFactory` to `Task.CompletedTask` so the scheduler never starts. |
+
+## Gotchas
+
+- **Job keys must be unique cluster-wide.** A persistent store (e.g. AdoJobStore against SQL Server) is shared between replicas. Use the FQN of the worker type as the identity (as the adapter does) or include the environment to avoid collisions.
+- **`[DisallowConcurrentExecution]` is on the adapter, not on your worker.** When you author a first-class `QuartzBackgroundWorkerBase`, apply the attribute on your own class if you don't want concurrent fires.
+- **Scoped DI per fire.** `Quartz` is configured with `UseMicrosoftDependencyInjectionScopedJobFactory()` by `Volo.Abp.Quartz`. Each `Execute` runs in its own DI scope — disposing your transient dependencies as you would expect from an MVC request.
+- **Tenant context is not flowed by Quartz.** Wrap your `Execute` body in `using (_currentTenant.Change(tenantId))` if the work is tenant-specific. The job-data map is the canonical place to stash tenant ids.
+- **Misfire behaviour.** The default trigger policy is "fire now and proceed" — a job missed because the scheduler was down will run once on resume, not catch up on every missed iteration. Override `WithMisfireHandlingInstructionFireAndProceed()` to be explicit.
+
+<CardGroup cols={2}>
+  <Card title="Quartz module" icon="screwdriver-wrench" href="/framework/background/quartz">
+    The `Volo.Abp.Quartz` package that owns `ISchedulerFactory` and `IScheduler`.
+  </Card>
+  <Card title="Background workers" icon="conveyor-belt" href="/framework/background/background-workers">
+    The base `IBackgroundWorker` model.
+  </Card>
+  <Card title="Workers · Hangfire" icon="repeat" href="/framework/background/background-workers-hangfire">
+    The Hangfire-based alternative.
+  </Card>
+  <Card title="Background jobs · Quartz" icon="briefcase" href="/framework/background/background-jobs-quartz">
+    One-off `IBackgroundJobManager` work on top of Quartz.
+  </Card>
+</CardGroup>

@@ -1,0 +1,327 @@
+---
+title: "Account in Blazor Server hosts"
+description: "Combining AbpAccountBlazorModule with AbpAccountWebModule to ship the account UI inside a single Blazor Server process."
+---
+
+The Account module ships a single Blazor package (`Volo.Abp.Account.Blazor`) that powers both
+WebAssembly and Server hosting models. The difference between the two is not in the assembly you
+reference — it is in **which application implementation backs the application-service interfaces**
+and **how authentication state is established**. This page focuses on the Blazor Server topology:
+a single ASP.NET Core host that serves both the Razor `Login.cshtml`/`Register.cshtml` pages and the
+Blazor `AccountManage.razor` component over the same circuit-backed SignalR connection.
+
+Read [blazor](/modules/account/blazor) first for the component's internals — this page concentrates
+on the *host wiring* unique to Blazor Server.
+
+## When to use Blazor Server
+
+Pick Blazor Server when:
+
+- The app is internal / behind a corporate gateway, latency between client and server is low.
+- You want a thin client without WebAssembly's download cost.
+- The sign-in flow is **cookie-based** (the user authenticates on the same host that serves the
+  Blazor circuit) — Razor Pages and Blazor share `HttpContext.User`.
+
+If you instead run a SPA + API split, see [blazor](/modules/account/blazor) for the WebAssembly
+recipe and [web-openiddict](/modules/account/web-openiddict) for the API host's login page.
+
+## Packages to reference
+
+A Blazor Server host that wants the full Account experience references:
+
+```xml
+<PackageReference Include="Volo.Abp.Account.Application" />
+<PackageReference Include="Volo.Abp.Account.HttpApi" />
+<PackageReference Include="Volo.Abp.Account.Web" />
+<PackageReference Include="Volo.Abp.Account.Blazor" />
+```
+
+Optionally:
+
+- `Volo.Abp.Account.Web.OpenIddict` if the host *also* serves as an OIDC authorization server.
+- `Volo.Abp.Account.HttpApi.Client` is **not** needed — the Blazor components run in the same
+  process as the application service.
+
+## Module composition
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountWebModule),
+    typeof(AbpAccountApplicationModule),
+    typeof(AbpAccountHttpApiModule),
+    typeof(AbpAccountBlazorModule),
+    typeof(AbpAspNetCoreComponentsServerThemingModule)
+)]
+public class MyBlazorServerHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        // … your own services …
+    }
+}
+```
+
+- `AbpAccountWebModule` brings in the Razor `Login`, `Register`, `ForgotPassword`, `ResetPassword`,
+  `Manage`, `Logout` pages and the user-menu + toolbar contributors. See
+  [web](/modules/account/web).
+- `AbpAccountApplicationModule` is the in-process implementation of `IAccountAppService` and
+  `IProfileAppService`. See [application](/modules/account/application).
+- `AbpAccountHttpApiModule` (optional but common) re-publishes the REST endpoints so a mobile
+  companion app can hit `/api/account/...` against the same host.
+- `AbpAccountBlazorModule` exposes the `AccountManage.razor` route, the user-menu contributor and
+  the AutoMapper profile for `PersonalInfoModel`.
+- `AbpAspNetCoreComponentsServerThemingModule` (not Web — the Server variant) is what wires Blazor
+  Server's `_Host.cshtml`, the Blazorise resources, and the `AbpRouter`.
+
+The combination of `AbpAccountWebModule` + `AbpAccountBlazorModule` means the user menu actually
+receives contributions from **both** `AbpAccountUserMenuContributor` (web) and
+`AbpAccountBlazorUserMenuContributor` (blazor). Each adds a `"Account.Manage"` entry — the second
+registration is filtered by `ApplicationMenuItem.Name` collision in the theme renderer, so only one
+appears at runtime. The Blazor one points at `account/manage-profile` (the Blazor component), the
+Web one points at `~/Account/Manage` (the Razor page). Pick which UI you want to show users by
+**removing** the contributor you don't want:
+
+```csharp
+Configure<AbpNavigationOptions>(options =>
+{
+    options.MenuContributors.RemoveAll(c => c is AbpAccountUserMenuContributor);
+});
+```
+
+If you skip the removal step both URLs work; the menu just picks whichever contributor ran last.
+
+## How authentication is shared
+
+1. User clicks "Login" in the navbar → `~/Account/Login` (Razor Page, MVC pipeline).
+2. `LoginModel.OnPostAsync` calls `SignInManager.PasswordSignInAsync` — Identity sets the
+   `.AspNetCore.Identity.Application` cookie.
+3. Browser is redirected to a Blazor route (`/` or wherever the user came from). The SignalR
+   negotiate request carries the cookie; ASP.NET Core uses `IDataProtectionProvider` to unwrap the
+   ticket and populate `HttpContext.User`.
+4. Blazor's `AuthenticationStateProvider` reads `HttpContext.User` and exposes it through
+   `<CascadingAuthenticationState>`.
+5. When the circuit renders `AccountManage.razor`, the component's `[Inject] IProfileAppService`
+   resolves to the **in-process** `ProfileAppService`. The `[Authorize]` attribute on
+   `ProfileAppService` is satisfied because `CurrentUser` reflects the cookie-borne principal.
+
+That round-trip avoids any HTTP round-trip — `ProfileAppService.GetAsync()` reads `IdentityUser`
+straight from EF Core / MongoDB.
+
+## Routing for `/account/manage-profile`
+
+`AbpAccountBlazorModule.ConfigureServices` adds the module's assembly to `AbpRouterOptions`:
+
+```csharp
+Configure<AbpRouterOptions>(options =>
+{
+    options.AdditionalAssemblies.Add(typeof(AbpAccountBlazorModule).Assembly);
+});
+```
+
+In a Server host that means the Blazor `<Router AdditionalAssemblies>` parameter receives this
+assembly when the theme renders `Router.razor`. The user navigating to `/account/manage-profile`
+hits `AccountManage.razor` directly.
+
+There is potential overlap with `~/Account/Manage` (Razor Page). MVC and Blazor both register
+routes, but MVC's routes use *case-sensitive* segments by default and require `/Account/Manage`
+(capital A, capital M), while Blazor's `/account/manage-profile` is a different path. Both can
+coexist, but the user menu only shows one of them — see the contributor-removal snippet above.
+
+## Cookie sign-out from Blazor
+
+A Blazor component **cannot** call `SignInManager.SignOutAsync` directly because the
+`Set-Cookie` header has to be written during a real HTTP response, not during a SignalR message.
+The Razor `Logout.cshtml` page solves this — Blazor code that wants to sign out should call
+`NavigationManager.NavigateTo("~/Account/Logout?returnUrl=...", forceLoad: true)`. The `forceLoad`
+flag triggers a real HTTP GET, which lets the page model run `SignInManager.SignOutAsync` and clear
+the cookie before redirecting.
+
+## Tenant resolution
+
+In a Blazor Server host with multi-tenancy, the tenant is resolved on the *initial HTTP request*
+that establishes the SignalR circuit — typically from the `__tenant` cookie set during sign-in.
+Because the circuit lives for the life of the connection, switching tenants requires terminating
+the circuit (close the browser tab or call `NavigationManager.NavigateTo(..., forceLoad: true)`).
+See [multi-tenancy resolution](/flows/multi-tenancy-resolution) for the middleware order.
+
+The Account application service honours `CurrentTenant.Id` when creating the user during
+self-registration; in a Blazor Server host this means the user appears in whichever tenant the
+circuit is currently in.
+
+## Concurrency, circuits and the profile form
+
+Blazor Server's stateful component model means the `PersonalInfoModel` lives in server memory for
+the duration of the circuit. Two consequences:
+
+1. **Optimistic concurrency.** `ProfileDto.ConcurrencyStamp` is loaded once on
+   `OnInitializedAsync` and posted back on `UpdatePersonalInfoAsync`. If another tab updated the
+   user in the meantime, EF Core raises `AbpDbConcurrencyException`. The base component does not
+   handle this — override `UpdatePersonalInfoAsync` to re-fetch and prompt the user.
+2. **Circuit memory.** Holding a `PersonalInfoModel` per circuit is cheap, but if you add large
+   extra properties (e.g. uploaded avatar as base64) memory grows linearly with concurrent users.
+   Stream large data through a separate endpoint rather than binding it to the form.
+
+## Logging and audit
+
+`AccountAppService` and `ProfileAppService` already write to `IdentitySecurityLog` when registering
+or resetting/changing a password — those entries appear in the
+[Identity admin UI](/modules/identity/web) without any extra wiring in the Blazor host.
+
+Application service calls from Blazor flow through the same ABP unit-of-work and audit interceptors
+as MVC actions, so an `[Audited]` attribute on a custom subclass of `ProfileAppService` is honoured
+end-to-end.
+
+## Recipe — adding a custom tab in Blazor Server
+
+```csharp
+public class TwoFactorTabContributor : IProfileManagementPageContributor
+{
+    public Task ConfigureAsync(ProfileManagementPageCreationContext context)
+    {
+        context.Groups.Add(new ProfileManagementPageGroup(
+            "MyCompany.TwoFactor",
+            "Two-factor authentication",
+            typeof(MyTwoFactorViewComponent)
+        ));
+        return Task.CompletedTask;
+    }
+}
+
+// In the host module
+Configure<ProfileManagementPageOptions>(options =>
+{
+    options.Contributors.Add(new TwoFactorTabContributor());
+});
+```
+
+This adds a tab to **`~/Account/Manage`** (the Razor host). Blazor's `AccountManage.razor` uses a
+different mechanism — the `<Tabs>` markup is hard-coded. To add a tab to the Blazor view, fork the
+component (or wrap it in a parent that conditionally renders) and contribute tabs through the
+forked markup. The Razor variant is more extensible by design; if you need a single management UI
+across many tenants, hosting the Razor page is the simpler path.
+
+## Performance considerations
+
+- **First circuit creation is HTTP-bound.** Once the SignalR connection is established subsequent
+  `ProfileAppService` calls are in-process — no JSON serialisation, no HTTP round-trip.
+- **Re-render frequency.** Blazorise's `<TextEdit @bind-Text="...">` re-renders on every keystroke;
+  for long forms with many extension properties consider `@bind-Text:event="onchange"` to throttle.
+- **Cookie revocation.** Logging the user out invalidates the cookie but the SignalR circuit keeps
+  running until the user closes the tab or navigates. Add a `<SecurityStampValidator>` middleware
+  step to revalidate periodically (Identity's default is every 30 minutes).
+
+## Gotchas
+
+1. **Mixing user-menu contributors.** With both `AbpAccountWebModule` and `AbpAccountBlazorModule`
+   loaded, you get two "My account" entries unless you remove one contributor. The Blazor
+   contributor uses a relative URL (`account/manage-profile`) and the Web one uses an absolute one
+   (`~/Account/Manage`).
+2. **Forgetting `forceLoad: true` on logout.** A Blazor `NavigationManager.NavigateTo("~/Account/Logout")`
+   without `forceLoad` performs *client-side* navigation and never round-trips the server; the
+   cookie stays. Always force-load when targeting Razor Pages that mutate auth state.
+3. **`SignInManager` is not injectable in Blazor components.** Use a Razor Page for any operation
+   that must read or write `Set-Cookie`. The `IProfileAppService` calls (`UpdateAsync`,
+   `ChangePasswordAsync`) are safe in components because they only mutate database state.
+4. **Tenant switch needs a full reload.** Changing `CurrentTenant` inside a circuit only affects
+   the in-flight call; the next render still uses the original tenant from the circuit's
+   ambient context.
+5. **OpenIddict in the same host.** If you reference `Volo.Abp.Account.Web.OpenIddict` next to the
+   Blazor module you get a single process that issues tokens *and* renders a Blazor profile UI —
+   typical for ABP's startup template. The OpenIddict variant overrides `LoginModel`, leaving the
+   Blazor side untouched.
+
+## Concrete startup walkthrough
+
+A minimal `Program.cs` for an ABP Blazor Server host with the full Account stack looks like:
+
+```csharp
+public static async Task<int> Main(string[] args)
+{
+    var builder = WebApplication.CreateBuilder(args);
+
+    await builder.AddApplicationAsync<MyBlazorServerHostModule>();
+
+    var app = builder.Build();
+    await app.InitializeApplicationAsync();
+    await app.RunAsync();
+    return 0;
+}
+```
+
+Inside `MyBlazorServerHostModule.OnApplicationInitialization`:
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+
+    app.UseAbpRequestLocalization();
+    app.UseStaticFiles();
+    app.UseRouting();
+    app.UseAuthentication();
+    app.UseAbpOpenIddictValidation();   // if OpenIddict is hosted here
+    app.UseMultiTenancy();
+    app.UseAuthorization();
+    app.UseAuditing();
+    app.UseAbpSerilogEnrichers();
+    app.UseConfiguredEndpoints(endpoints =>
+    {
+        endpoints.MapBlazorHub();
+        endpoints.MapFallbackToPage("/_Host");
+    });
+}
+```
+
+Notice the *order* — `UseAuthentication` runs **before** `UseMultiTenancy`, so the cookie's
+`__tenant` claim (if you stored one) is unwrapped before tenant resolution. The
+[multi-tenancy resolution flow](/flows/multi-tenancy-resolution) explains why mis-ordering this
+silently breaks Account's per-tenant logic.
+
+### Razor + Blazor coexistence in `_Host.cshtml`
+
+The standard `Pages/_Host.cshtml` fallback renders the Blazor router *inside* a layout that already
+provides the toolbar (with the user-login link) and the user menu (with "My account" + "Logout"):
+
+```cshtml
+@page "/"
+@namespace MyApp.Pages
+@using Microsoft.AspNetCore.Components.Web
+<!DOCTYPE html>
+<html>
+<head>
+    <component type="typeof(HeadOutlet)" render-mode="ServerPrerendered" />
+</head>
+<body>
+    <component type="typeof(App)" render-mode="ServerPrerendered" />
+    <script src="_framework/blazor.server.js"></script>
+</body>
+</html>
+```
+
+The `<component>` tag-helper bootstraps the Blazor circuit; once the user clicks "Login" they leave
+Blazor land, post to the MVC pipeline (`/Account/Login`), and on success are redirected back to `/`
+where the circuit re-connects with a populated `HttpContext.User`.
+
+## Diagnostic tips
+
+- **Cookie not flowing into circuit.** Confirm `services.AddDataProtection().PersistKeysToFileSystem(...)`
+  uses the same key ring across restarts; otherwise the cookie is unreadable after a deploy.
+- **`ProfileAppService.GetAsync` throws `AbpAuthorizationException`.** The circuit started before
+  authentication completed — verify the `<AuthorizeRouteView>` wraps the router and that the
+  cascading `Task<AuthenticationState>` is in scope.
+- **Stale user-menu after profile update.** The user-menu contributor reads `ICurrentUser.UserName`;
+  changes to the username only refresh after the auth cookie is re-issued. Force a
+  `forceLoad: true` navigation after username change.
+- **Self-registration setting changes mid-circuit.** `ISettingProvider` reads from the cache; if you
+  change `Abp.Account.IsSelfRegistrationEnabled` from the admin UI, the circuit picks it up the
+  next time a method calls `SettingProvider.IsTrueAsync`.
+
+## Cross-references
+
+- [blazor](/modules/account/blazor) — component internals and the WASM recipe.
+- [web](/modules/account/web) — Razor Pages that handle sign-in and own the cookie.
+- [web-openiddict](/modules/account/web-openiddict) — when the same Blazor Server host also acts as
+  an OIDC authorization server.
+- [application](/modules/account/application) — the in-process services the Blazor component calls.
+- [Identity Blazor](/modules/identity/blazor) — admin user management UI that pairs with this
+  self-service profile.

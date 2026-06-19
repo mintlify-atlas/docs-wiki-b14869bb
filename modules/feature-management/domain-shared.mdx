@@ -1,0 +1,322 @@
+---
+title: "Volo.Abp.FeatureManagement.Domain.Shared: constants, exceptions, and IStringValueType JSON converters"
+sidebarTitle: "Domain.Shared"
+description: "Field length constants for FeatureValue / FeatureDefinitionRecord, the FeatureValueInvalidException, the AbpFeatureManagementResource localization root, and the polymorphic IStringValueType / IValueValidator JSON converters used over the wire."
+---
+
+`Volo.Abp.FeatureManagement.Domain.Shared` is the smallest assembly in the module — but it underpins every layer above. Anything that needs to know how long a feature value can be, what error code an invalid value raises, or how to deserialize the polymorphic `IStringValueType` shape coming from the HTTP API pulls a reference here.
+
+The module's frame is `AbpFeatureManagementDomainSharedModule`:
+
+```csharp
+[DependsOn(
+    typeof(AbpValidationModule),
+    typeof(AbpJsonSystemTextJsonModule)
+)]
+public class AbpFeatureManagementDomainSharedModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+            options.FileSets.AddEmbedded<AbpFeatureManagementDomainSharedModule>());
+
+        Configure<AbpLocalizationOptions>(options =>
+            options.Resources
+                .Add<AbpFeatureManagementResource>("en")
+                .AddBaseTypes(typeof(AbpValidationResource))
+                .AddVirtualJson("Volo/Abp/FeatureManagement/Localization/Domain"));
+
+        Configure<AbpExceptionLocalizationOptions>(options =>
+            options.MapCodeNamespace("Volo.Abp.FeatureManagement",
+                typeof(AbpFeatureManagementResource)));
+
+        var valueValidatorFactoryOptions =
+            context.Services.GetPreConfigureActions<ValueValidatorFactoryOptions>();
+        Configure<ValueValidatorFactoryOptions>(options =>
+            valueValidatorFactoryOptions.Configure(options));
+
+        Configure<AbpSystemTextJsonSerializerOptions>(options =>
+            options.JsonSerializerOptions.Converters.Add(
+                new StringValueTypeJsonConverter(valueValidatorFactoryOptions.Configure())));
+    }
+}
+```
+
+Three things matter here:
+
+1. The exception namespace `Volo.Abp.FeatureManagement` is mapped to the localization resource — so `FeatureValueInvalidException` (error code `Volo.Abp.FeatureManagement:InvalidFeatureValue`) is rendered using `AbpFeatureManagementResource`.
+2. The pre-configure pattern is used for `ValueValidatorFactoryOptions` because the JSON converter has to be constructed *before* any consumer reads JSON — i.e. before any other module configures System.Text.Json. `GetPreConfigureActions<T>` lets a caller add custom factories from `PreConfigureServices` and have them picked up by both the validator registry and the converter in one place.
+3. The `StringValueTypeJsonConverter` is registered on the System.Text.Json options, so System.Text.Json knows how to round-trip `IStringValueType` (an abstract type from `Volo.Abp.Validation.StringValues`).
+
+## File inventory
+
+| Path under `Volo/Abp/FeatureManagement/` | Role |
+| --- | --- |
+| `AbpFeatureManagementDomainSharedModule.cs` | Module class — registers resources, converters, validator factories. |
+| `FeatureDefinitionRecordConsts.cs` | EF Core column lengths for `FeatureDefinitionRecord` (used by both EF mapping and `Check.NotNullOrWhiteSpace` in the entity ctor). |
+| `FeatureGroupDefinitionRecordConsts.cs` | Same, for `FeatureGroupDefinitionRecord`. |
+| `FeatureValueConsts.cs` | Same, for `FeatureValue`. |
+| `FeatureManagementDomainErrorCodes.cs` | Single constant: `"Volo.Abp.FeatureManagement:InvalidFeatureValue"`. |
+| `FeatureValueInvalidException.cs` | `BusinessException` raised by `FeatureManager.SetAsync` when `IStringValueType.Validator.IsValid` returns false. |
+| `ValueValidatorFactoryOptions.cs` | Default set of `IValueValidatorFactory` for `NULL`, `BOOLEAN`, `NUMERIC`, `STRING`. |
+| `JsonConverters/IValueValidatorFactory.cs` | `CanCreate(string name) + Create()` — discriminator-keyed factory. |
+| `JsonConverters/ValueValidatorFactory.cs` | Open-generic implementation `ValueValidatorFactory<TValueValidator>`. |
+| `JsonConverters/StringValueTypeJsonConverter.cs` | Discriminator-based `JsonConverter<IStringValueType>` for `Toggle/FreeText/Selection`. |
+| `JsonConverters/ValueValidatorJsonConverter.cs` | Companion converter for nested `IValueValidator`. |
+| `JsonConverters/SelectionStringValueItemSourceJsonConverter.cs` | Converter for `ISelectionStringValueItemSource` (item-list provider). |
+| `Localization/AbpFeatureManagementResource.cs` | Empty marker class with `[LocalizationResourceName("AbpFeatureManagement")]`. |
+| `Localization/*.json` (embedded) | Translations under `Localization/Domain/`. |
+
+## Constants
+
+The three `*Consts` classes carry **static settable** ints so a host application can widen the columns. Defaults below are taken straight from source.
+
+`FeatureValueConsts`:
+
+| Property | Default | Used for |
+| --- | --- | --- |
+| `MaxNameLength` | `128` | `FeatureValue.Name` and `FeatureDefinitionRecord.Name`. |
+| `MaxProviderNameLength` | `64` | `FeatureValue.ProviderName`. |
+| `MaxProviderKeyLength` | `64` | `FeatureValue.ProviderKey`. Note: a tenant Guid is 36 chars, an edition Guid (formatted with `"N"`) is 32 chars — both fit comfortably. |
+| `MaxValueLength` | `128` | `FeatureValue.Value`. Affects how large a free-text feature can be. |
+
+`FeatureDefinitionRecordConsts`:
+
+| Property | Default | Used for |
+| --- | --- | --- |
+| `MaxNameLength` | `128` | `FeatureDefinitionRecord.Name`, `GroupName`, `ParentName`. |
+| `MaxDisplayNameLength` | `256` | `FeatureDefinitionRecord.DisplayName`. |
+| `MaxDescriptionLength` | `256` | `FeatureDefinitionRecord.Description`. |
+| `MaxDefaultValueLength` | `256` | `FeatureDefinitionRecord.DefaultValue`. *Note*: this differs from `FeatureValueConsts.MaxValueLength = 128`. A static-definition default can be longer than a stored override. |
+| `MaxAllowedProvidersLength` | `256` | Comma-joined `IFeatureDefinitionProvider` list. |
+| `MaxValueTypeLength` | `2048` | Serialized `IStringValueType` JSON. The default 2 KB comfortably fits a `SelectionStringValueType` with a small item list — bump it if you ship enums with thousands of options. |
+
+`FeatureGroupDefinitionRecordConsts`:
+
+| Property | Default | Used for |
+| --- | --- | --- |
+| `MaxNameLength` | `128` | `FeatureGroupDefinitionRecord.Name`. |
+| `MaxDisplayNameLength` | `256` | `FeatureGroupDefinitionRecord.DisplayName`. |
+
+Because the consts are static settable, *change them before any module configures EF Core*. The recommended hook is `PreConfigureServices` of a top-level host module:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    FeatureValueConsts.MaxValueLength = 1024;
+    FeatureDefinitionRecordConsts.MaxValueTypeLength = 16 * 1024;
+}
+```
+
+After this widening, generate a new EF Core migration — the `OnModelCreating` callback reads the current values, not migration-time snapshots.
+
+## Localization resource
+
+```csharp
+[LocalizationResourceName("AbpFeatureManagement")]
+public class AbpFeatureManagementResource
+{
+}
+```
+
+Resource files are embedded under `Volo/Abp/FeatureManagement/Localization/Domain/{culture}.json`. The shared module also adds `AbpValidationResource` as a base type, so anywhere `L["FieldRequired"]` is used in this module the framework's validation strings resolve.
+
+## FeatureValueInvalidException
+
+```csharp
+[Serializable]
+public class FeatureValueInvalidException : BusinessException
+{
+    public FeatureValueInvalidException(string name) :
+        base(FeatureManagementDomainErrorCodes.FeatureValueInvalid)
+    {
+        WithData("0", name);
+    }
+}
+```
+
+Two notes:
+
+1. The `WithData("0", name)` lines up with the localization template — the JSON file contains a string with the placeholder `{0}` (positional). Look in `Localization/Domain/en.json` for `"InvalidFeatureValue": "{0} feature value is not valid!"`.
+2. Because the error code is `Volo.Abp.FeatureManagement:InvalidFeatureValue` and the namespace mapping in the module class maps `Volo.Abp.FeatureManagement` to this resource, the framework's `AbpExceptionLocalizationOptions` will localize this exception automatically when it bubbles up through `ExceptionHandlingMiddleware`.
+
+`FeatureManager.SetAsync` is the only thrower:
+
+```csharp
+if (feature.ValueType?.Validator.IsValid(value) == false)
+{
+    throw new FeatureValueInvalidException(feature.DisplayName.Localize(StringLocalizerFactory));
+}
+```
+
+So the displayed value in the exception is the **localized** display name, not the raw `Name` — which is what the UI shows.
+
+## ValueValidatorFactoryOptions
+
+A single, mutable set of `IValueValidatorFactory` keyed by the discriminator name a `ValueValidatorJsonConverter` writes into the JSON payload.
+
+```csharp
+public class ValueValidatorFactoryOptions
+{
+    public HashSet<IValueValidatorFactory> ValueValidatorFactory { get; }
+
+    public ValueValidatorFactoryOptions()
+    {
+        ValueValidatorFactory = new HashSet<IValueValidatorFactory>
+        {
+            new ValueValidatorFactory<AlwaysValidValueValidator>("NULL"),
+            new ValueValidatorFactory<BooleanValueValidator>("BOOLEAN"),
+            new ValueValidatorFactory<NumericValueValidator>("NUMERIC"),
+            new ValueValidatorFactory<StringValueValidator>("STRING")
+        };
+    }
+}
+```
+
+The open-generic factory:
+
+```csharp
+public class ValueValidatorFactory<TValueValidator> : IValueValidatorFactory
+    where TValueValidator : IValueValidator, new()
+{
+    protected readonly string Name;
+    public ValueValidatorFactory(string name) => Name = name;
+    public bool CanCreate(string name) => Name == name;
+    public IValueValidator Create() => new TValueValidator() as IValueValidator;
+}
+```
+
+Two things to remember:
+
+- The discriminator name (`"NULL"`, `"BOOLEAN"`, `"NUMERIC"`, `"STRING"`) is **not** the .NET type name. It is the name the JSON converter writes. If you register a custom `IValueValidator` and forget the discriminator, the converter throws on read with `ArgumentException`.
+- `IValueValidator` instances are created **once per JSON deserialization** via `new TValidator()`. They must be parameterless. Any external state (regex pool, distributed cache) must be statically wired.
+
+## Polymorphic JSON converters
+
+The framework's `Volo.Abp.Validation.StringValues.IStringValueType` is an abstract record with three known implementations:
+
+| Discriminator (`Name`) | Concrete type | Renders as |
+| --- | --- | --- |
+| `"ToggleStringValueType"` | `ToggleStringValueType` | checkbox |
+| `"FreeTextStringValueType"` | `FreeTextStringValueType` | text input |
+| `"SelectionStringValueType"` | `SelectionStringValueType` | drop-down with `Items` |
+
+`StringValueTypeJsonConverter` is a discriminator-by-property-name converter:
+
+```csharp
+public override IStringValueType Read(ref Utf8JsonReader reader, ...)
+{
+    var rootElement = JsonDocument.ParseValue(ref reader).RootElement;
+
+    var nameJsonProperty = rootElement.EnumerateObject().FirstOrDefault(x =>
+        x.Name.Equals(nameof(IStringValueType.Name), StringComparison.OrdinalIgnoreCase));
+
+    if (nameJsonProperty.Value.ValueKind == JsonValueKind.String)
+    {
+        var name = nameJsonProperty.Value.GetString();
+        _readJsonSerializerOptions ??= JsonSerializerOptionsHelper.Create(options, this,
+            new ValueValidatorJsonConverter(Options),
+            new SelectionStringValueItemSourceJsonConverter());
+
+        return name switch
+        {
+            "SelectionStringValueType" => rootElement.Deserialize<SelectionStringValueType>(_readJsonSerializerOptions),
+            "FreeTextStringValueType"  => rootElement.Deserialize<FreeTextStringValueType>(_readJsonSerializerOptions),
+            "ToggleStringValueType"    => rootElement.Deserialize<ToggleStringValueType>(_readJsonSerializerOptions),
+            _ => throw new ArgumentException($"{nameof(IStringValueType)} named {name} was not found!")
+        };
+    }
+
+    throw new JsonException($"Can't to get the {nameof(IStringValueType.Name)} property of {nameof(IStringValueType)}!");
+}
+```
+
+Notice three details:
+
+- The `Name` property comparison is **case-insensitive** — older clients that emitted lowercased property names still deserialize.
+- Read and write `JsonSerializerOptions` are cached in fields, not constructor-supplied. This avoids `Stack overflow` from the converter being re-invoked when deserializing the *inner* properties (otherwise the converter chain would recurse forever).
+- The companion converters `ValueValidatorJsonConverter` and `SelectionStringValueItemSourceJsonConverter` are *not* registered globally — they are added only inside the read-options copy. That keeps validators from leaking into application-level serialization when the consumer never opted in.
+
+`ValueValidatorJsonConverter` follows the same pattern: read the `Name` discriminator, consult `ValueValidatorFactoryOptions.ValueValidatorFactory.FirstOrDefault(f => f.CanCreate(name))`, and dispatch.
+
+`SelectionStringValueItemSourceJsonConverter` exists because `SelectionStringValueType.ItemSource` is `ISelectionStringValueItemSource` — itself an interface — and ABP serializes the concrete `StaticSelectionStringValueItemSource` to JSON with its public `Items` property.
+
+## Where the HttpApi module re-registers
+
+The same `StringValueTypeJsonConverter` instance must also be added to ASP.NET Core's MVC JSON options for HTTP responses to serialize correctly. `AbpFeatureManagementHttpApiModule.ConfigureServices` re-runs the pre-configured actions and adds the converter to `JsonOptions`:
+
+```csharp
+var valueValidatorFactoryOptions = context.Services.ExecutePreConfiguredActions<ValueValidatorFactoryOptions>();
+Configure<JsonOptions>(options =>
+{
+    options.JsonSerializerOptions.Converters.AddIfNotContains(
+        new StringValueTypeJsonConverter(valueValidatorFactoryOptions));
+});
+```
+
+This is the only reason the HTTP API works — without it `GET /api/feature-management/features` would 500 trying to serialize the polymorphic `ValueType` field of `FeatureDto`.
+
+## Gotchas
+
+- **`StringValueTypeJsonConverter.Read` returns `null` if the JSON property name `Name` is missing.** The throw uses `JsonException` — under the default ASP.NET Core pipeline that translates to a 400 with a poorly-localized body. Validate inbound JSON shape at the controller boundary if you accept untrusted DTOs.
+- **`Configure<ValueValidatorFactoryOptions>` runs twice** — once inside `AbpFeatureManagementDomainSharedModule` to capture pre-configure actions, and once inside `AbpFeatureManagementHttpApiModule` via `ExecutePreConfiguredActions`. If you register the same factory from two different modules you will get a duplicate `HashSet` entry rejected silently (`HashSet<T>.Add` returns false).
+- **`AbpFeatureManagementResource` derives from `AbpValidationResource`.** If you swap base types from a module that loads later, watch for translation collisions on `FieldRequired`/`InvalidValue` strings.
+- **Don't bump column lengths above 4000 on SQL Server without `nvarchar(max)`.** `MaxValueTypeLength = 2048` is comfortably below the row-page limit; raising it past 4000 forces SQL Server to store the column off-page, which has subtle cost during the static-saver hash comparison.
+- For background on `IFeatureChecker`, `IStringValueType`, and the `Validator` property, see [framework/cross/features](/framework/cross/features). This module's JSON converters and validators all extend types defined there.
+
+## Adding a custom value validator
+
+To support a new `IValueValidator` (say, a regex pattern validator):
+
+```csharp
+public class RegexValueValidator : IValueValidator
+{
+    public string Name => "REGEX";
+    public Dictionary<string, object> Properties { get; } = new();
+
+    public bool IsValid(string value)
+    {
+        if (!Properties.TryGetValue("Pattern", out var p) || p is not string pattern) return false;
+        return value != null && System.Text.RegularExpressions.Regex.IsMatch(value, pattern);
+    }
+}
+```
+
+Register the factory in `PreConfigureServices`:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    context.Services.PreConfigure<ValueValidatorFactoryOptions>(options =>
+    {
+        options.ValueValidatorFactory.Add(new ValueValidatorFactory<RegexValueValidator>("REGEX"));
+    });
+}
+```
+
+Now any `FreeTextStringValueType` whose `Validator.Name == "REGEX"` will round-trip through `ValueValidatorJsonConverter` and rehydrate as a `RegexValueValidator`. The pre-configure pattern is essential — the converter is built from the *captured* `ValueValidatorFactoryOptions` snapshot, not the live options object.
+
+## How the converter avoids stack overflow
+
+A naïve `JsonConverter<IStringValueType>` would recurse when serializing the *concrete* type's properties — System.Text.Json's `Serialize<T>` for the concrete type would dispatch back through this converter (because the runtime type matches the registered converter). The trick is in:
+
+```csharp
+public override void Write(Utf8JsonWriter writer, IStringValueType value, JsonSerializerOptions options)
+{
+    _writeJsonSerializerOptions ??= JsonSerializerOptionsHelper.Create(options, this);
+    JsonSerializer.Serialize(writer, value, value.GetType(), _writeJsonSerializerOptions);
+}
+```
+
+`JsonSerializerOptionsHelper.Create(options, this)` builds a *copy* of the options without this converter registered, so the inner `Serialize` walks the concrete type's properties directly. The same technique appears in `ValueValidatorJsonConverter` and `SelectionStringValueItemSourceJsonConverter`.
+
+This is also why the read-side cache uses a separate `_readJsonSerializerOptions` field — the converter set differs (read pulls in the validator factory; write does not).
+
+## Resource inheritance chain
+
+When `AbpFeatureManagementResource` is added to `AbpLocalizationOptions` with `AbpValidationResource` as a base, the resolution order at runtime is:
+
+1. Try the key in the requesting resource's culture-specific JSON file.
+2. Walk up base types — `AbpValidationResource` → `AbpUiResource` (added by HTTP API module) → defaults.
+
+That gives `L["FieldRequired"]` from validation, `L["Cancel"]` from UI, and `L["Permission:FeatureManagement"]` from this module's own resources — all without per-call disambiguation.

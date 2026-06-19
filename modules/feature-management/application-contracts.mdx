@@ -1,0 +1,336 @@
+---
+title: "Volo.Abp.FeatureManagement.Application.Contracts: IFeatureAppService, DTOs, and the ManageHostFeatures permission"
+sidebarTitle: "Application.Contracts"
+description: "The DTOs (FeatureDto, FeatureGroupDto, UpdateFeaturesDto), the IFeatureAppService contract, the FeaturePermissionDefinitionProvider for ManageHostFeatures, and the AbpFeatureManagement remote-service constants."
+---
+
+`Volo.Abp.FeatureManagement.Application.Contracts` is the cross-tier contract — it carries the interfaces a UI (Razor Pages, Blazor, MAUI, …) needs to talk to a remote feature-management service. Both the in-proc application module and the static HTTP client proxy implement `IFeatureAppService`; both UI flavours consume the DTOs defined here.
+
+The module class only carries dependencies and adds the embedded localization file set:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementDomainSharedModule),
+    typeof(AbpDddApplicationContractsModule),
+    typeof(AbpAuthorizationAbstractionsModule),
+    typeof(AbpJsonModule))]
+public class AbpFeatureManagementApplicationContractsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpFeatureManagementApplicationContractsModule>();
+        });
+    }
+}
+```
+
+`AbpAuthorizationAbstractionsModule` is the dependency that lets `FeaturePermissionDefinitionProvider` (a `PermissionDefinitionProvider`) plug in without pulling the full Permission Management module.
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `AbpFeatureManagementApplicationContractsModule.cs` | Module class — embedded JSON resources, contract-tier dependencies. |
+| `IFeatureAppService.cs` | Three-method contract — `GetAsync`, `UpdateAsync`, `DeleteAsync`. |
+| `FeatureDto.cs` | Per-feature payload — `Name`, `DisplayName`, `Value`, `Provider`, `Description`, `ValueType`, `Depth`, `ParentName`. |
+| `FeatureGroupDto.cs` | Wraps a `List<FeatureDto>` with `Name`, `DisplayName`, `GetNormalizedGroupName()`. |
+| `FeatureProviderDto.cs` | `{ Name, Key }` flat pair returned with each value. |
+| `GetFeatureListResultDto.cs` | `List<FeatureGroupDto> Groups`. |
+| `UpdateFeatureDto.cs` | `Name` + `Value` (string). |
+| `UpdateFeaturesDto.cs` | `List<UpdateFeatureDto> Features`. |
+| `FeatureManagementPermissions.cs` | `GroupName = "FeatureManagement"`, `ManageHostFeatures = "FeatureManagement.ManageHostFeatures"`. |
+| `FeaturePermissionDefinitionProvider.cs` | `PermissionDefinitionProvider` that exposes `ManageHostFeatures` as a host-only permission. |
+| `FeatureManagementRemoteServiceConsts.cs` | `RemoteServiceName = "AbpFeatureManagement"`, `ModuleName = "featureManagement"`. |
+
+## `IFeatureAppService`
+
+```csharp
+public interface IFeatureAppService : IApplicationService
+{
+    Task<GetFeatureListResultDto> GetAsync([NotNull] string providerName, string providerKey);
+    Task UpdateAsync([NotNull] string providerName, string providerKey, UpdateFeaturesDto input);
+    Task DeleteAsync([NotNull] string providerName, string providerKey);
+}
+```
+
+Three observations:
+
+- `providerKey` is nullable. `null` means "the default scope of the provider" — for `"T"` (Tenant), `null` plus `CurrentTenant.Id == null` means "host-level defaults"; for `"E"` it would mean "edition default" (unused in stock code).
+- There is no single-feature `Get(name)` — the UI always pulls the entire list because it renders every group/feature together in a tabbed modal. Application code that needs one value uses `IFeatureChecker.GetOrNullAsync` directly.
+- There is no granular `SetAsync(name, value)` either — the modal saves a batch. The controller and client proxy mirror this.
+
+## DTOs
+
+### `FeatureDto`
+
+```csharp
+public class FeatureDto
+{
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public string Value { get; set; }
+    public FeatureProviderDto Provider { get; set; }
+    public string Description { get; set; }
+    public IStringValueType ValueType { get; set; }
+    public int Depth { get; set; }
+    public string ParentName { get; set; }
+}
+```
+
+Notable fields:
+
+| Field | Notes |
+| --- | --- |
+| `Value` | Always a string (the framework's `IFeatureChecker.GetAsync<T>` does the conversion). For a `ToggleStringValueType` this is `"True"` / `"False"`. |
+| `Provider` | The `FeatureValueProviderInfo` that *granted* this value, i.e. the topmost provider in the chain that had a non-null answer. UIs grey the toggle out when `Provider.Name != currentProviderName` — meaning "this value is inherited, you can't change it from here". |
+| `ValueType` | The polymorphic `IStringValueType` from `Volo.Abp.Validation.StringValues`. Round-tripped via `StringValueTypeJsonConverter` (see [domain-shared](/modules/feature-management/domain-shared)). |
+| `Depth` | Computed server-side by `FeatureAppService.SetFeatureDepth` (recursion over `ParentName`). Root features are `0`. UIs indent rendering by `Depth * 20px`. |
+| `ParentName` | Matches `FeatureDefinition.Parent.Name`. The Blazor modal uses this to auto-cascade `ToggleStringValueType` toggles — checking a child checks all parents; unchecking a parent unchecks all children. |
+
+### `FeatureGroupDto`
+
+```csharp
+public class FeatureGroupDto
+{
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public List<FeatureDto> Features { get; set; }
+
+    public string GetNormalizedGroupName() => Name.Replace(".", "_");
+}
+```
+
+The `GetNormalizedGroupName` helper exists because group names can legally contain dots (e.g. `"MyApp.Reporting"`) but the MVC view uses the name as a DOM `id` and a tab anchor. The MVC view does this conversion at the view layer; the Blazor view re-implements its own variant inside `FeatureManagementModal.GetNormalizedGroupName` to prefix `"FeatureGroup_"`.
+
+### `FeatureProviderDto`
+
+```csharp
+public class FeatureProviderDto
+{
+    public string Name { get; set; }
+    public string Key { get; set; }
+}
+```
+
+Returned per `FeatureDto`. `Name` is one of `"D"`, `"E"`, `"T"`, or a custom provider discriminator. `Key` is the same string the caller would pass to `IFeatureManager.SetAsync` — e.g. a tenant Guid or an edition Guid formatted with `"N"`.
+
+### `UpdateFeatureDto` / `UpdateFeaturesDto`
+
+```csharp
+public class UpdateFeatureDto { public string Name; public string Value; }
+public class UpdateFeaturesDto { public List<UpdateFeatureDto> Features; }
+```
+
+The controller never validates `Value` server-side — validation happens inside `FeatureManager.SetAsync` via `feature.ValueType.Validator.IsValid(value)`, which throws `FeatureValueInvalidException` on failure. That exception gets localized to `Volo.Abp.FeatureManagement:InvalidFeatureValue`.
+
+### `GetFeatureListResultDto`
+
+```csharp
+public class GetFeatureListResultDto { public List<FeatureGroupDto> Groups; }
+```
+
+The list excludes groups whose features were all filtered out — `FeatureAppService.GetAsync` skips empty groups, and individual features are also skipped when the call is for the host context (`CurrentTenant.Id == null`, `providerKey == null`, providerName = `"T"`) **and** `featureDefinition.IsAvailableToHost == false`.
+
+## `FeatureManagementPermissions`
+
+```csharp
+public class FeatureManagementPermissions
+{
+    public const string GroupName = "FeatureManagement";
+    public const string ManageHostFeatures = GroupName + ".ManageHostFeatures";
+
+    public static string[] GetAll() =>
+        ReflectionHelper.GetPublicConstantsRecursively(typeof(FeatureManagementPermissions));
+}
+```
+
+Only one permission — `FeatureManagement.ManageHostFeatures`. Everything *else* is enforced by per-provider policy mapping in `FeatureManagementOptions.ProviderPolicies`:
+
+| Provider | Authorization |
+| --- | --- |
+| Host-level defaults (`providerName = "T"`, `CurrentTenant.Id == null`, `providerKey == null`) | `FeatureManagementPermissions.ManageHostFeatures` |
+| Tenant-specific (`providerName = "T"`, `providerKey != null`) | `AbpTenantManagement.Tenants.ManageFeatures` (mapped by Domain module) |
+| Edition (`providerName = "E"`) | **Unconfigured** — caller-supplied policy via `Options.ProviderPolicies["E"] = "..."`. |
+| Custom provider | Caller-supplied policy. Missing entries → `AbpException` at runtime. |
+
+## `FeaturePermissionDefinitionProvider`
+
+```csharp
+public class FeaturePermissionDefinitionProvider : PermissionDefinitionProvider
+{
+    public override void Define(IPermissionDefinitionContext context)
+    {
+        var featureManagementGroup = context.AddGroup(
+            FeatureManagementPermissions.GroupName,
+            L("Permission:FeatureManagement"));
+
+        featureManagementGroup.AddPermission(
+            FeatureManagementPermissions.ManageHostFeatures,
+            L("Permission:FeatureManagement.ManageHostFeatures"),
+            multiTenancySide: MultiTenancySides.Host);
+    }
+
+    private static LocalizableString L(string name)
+        => LocalizableString.Create<AbpFeatureManagementResource>(name);
+}
+```
+
+The `multiTenancySide: MultiTenancySides.Host` flag is the important bit — the framework's permission UI will hide this permission entirely for tenant-side users.
+
+## Remote-service constants
+
+```csharp
+public class FeatureManagementRemoteServiceConsts
+{
+    public const string RemoteServiceName = "AbpFeatureManagement";
+    public const string ModuleName        = "featureManagement";
+}
+```
+
+- `RemoteServiceName` is the key the `AbpFeatureManagementHttpApiClientModule` uses to look up the base URL: `AbpRemoteServiceOptions.RemoteServices["AbpFeatureManagement"]`. Apps deploy the HTTP API at the same origin as their gateway, so the default fallback to `"Default"` is usually fine.
+- `ModuleName` is the area route (the `[Area("featureManagement")]` on `FeaturesController`). It's also the key passed to `Configure<DynamicJavaScriptProxyOptions>` in `AbpFeatureManagementHttpApiModule.ConfigureServices` to **disable** the dynamic JS proxy generator for this module.
+
+## How the contract is consumed
+
+Three implementations of `IFeatureAppService` exist (only one is registered at a time per process):
+
+| Implementation | Lives in | Registration |
+| --- | --- | --- |
+| `FeatureAppService` (in-proc) | `Volo.Abp.FeatureManagement.Application` | Auto-discovered by `AbpDddApplicationModule` convention. |
+| `FeaturesClientProxy` (HTTP) | `Volo.Abp.FeatureManagement.HttpApi.Client` | `[Dependency(ReplaceServices = true)]` + `[ExposeServices(typeof(IFeatureAppService), typeof(FeaturesClientProxy))]`. |
+| `FeaturesController` (REST adapter) | `Volo.Abp.FeatureManagement.HttpApi` | Implements `IFeatureAppService` only to expose the same shape to Swagger; the controller methods delegate to the injected `IFeatureAppService` (i.e. `FeatureAppService`). |
+
+A Blazor WebAssembly host references `AbpFeatureManagementHttpApiClientModule` and gets `FeaturesClientProxy`. A Blazor Server / MVC host references `AbpFeatureManagementApplicationModule` and gets `FeatureAppService`. Microservice gateways reference the contracts only and rely on the dynamic proxy generator from `Volo.Abp.Http.Client.DynamicProxying` — though the dynamic-JS proxy is disabled, the C# dynamic proxy still works for typed `IFeatureAppService` injection.
+
+## Why everything is string-typed
+
+A recurring source of confusion: `FeatureDto.Value` is `string` even for numeric or boolean features. The framework's contract is that feature values are **always** strings; conversion is up to the consumer. `IFeatureChecker.IsEnabledAsync(name)` does `bool.Parse(GetOrNullAsync(name))`, and `IFeatureChecker.GetAsync<T>(name, default)` calls `value.To<T>()` from the framework's reflection helpers. The UI mirror calls `bool.Parse(featureDto.Value)` when `ValueType is ToggleStringValueType`.
+
+This means a UI that maps `FeatureDto.Value` to a strongly typed property without conversion will silently leak the string `"True"` and `"False"` into JSON outputs.
+
+## DTO ↔ entity differences
+
+| Entity (`FeatureValue`) | DTO (`FeatureDto`) |
+| --- | --- |
+| `Name` | `Name` |
+| `Value` | `Value` |
+| `ProviderName` | `Provider.Name` |
+| `ProviderKey` | `Provider.Key` |
+| — | `DisplayName` (resolved via `feature.DisplayName.Localize(StringLocalizerFactory)`) |
+| — | `Description`, `ValueType`, `Depth`, `ParentName` (sourced from the `FeatureDefinition`) |
+
+The mapping is hand-coded in `FeatureAppService.CreateFeatureDto`. There is no AutoMapper profile.
+
+## Gotchas
+
+- **No bulk validation on the client side.** `UpdateFeaturesDto` can contain dozens of `UpdateFeatureDto`s; if any single one fails validation server-side, the *whole* batch aborts because `FeatureAppService.UpdateAsync` loops synchronously and throws on the first failure. The earlier successful entries in the batch *are* persisted because there's no enclosing transaction in `FeatureAppService.UpdateAsync` — that's a behaviour to be aware of when designing UIs.
+- **`FeatureProviderDto.Key` is the granting provider's key, not the requested provider's key.** If you request `(providerName = "T", providerKey = "abc")` and the value actually lives at the edition level, the returned DTO has `Provider.Name = "E"` and `Provider.Key = editionId`. UIs use this to disable the input (you can't *change* an inherited value from a child scope).
+- **`GroupName` collisions are silent.** The application service skips groups that end up with zero features, but it doesn't merge groups with the same name from different definition providers — the framework's `IFeatureDefinitionContext.AddGroup` throws on duplicates instead. Make sure each `IFeatureDefinitionProvider` uses unique group names.
+- **The `IStringValueType` polymorphism requires the JSON converter.** A Blazor WASM host that forgets to depend on `AbpFeatureManagementDomainSharedModule` (the Application.Contracts dependency takes care of this transitively) will deserialize `FeatureDto.ValueType` as a base type and the UI breaks. Verify the converter is registered if you see `NullReferenceException` reading `feature.ValueType`.
+- For `LocalizableString`, `PermissionDefinitionProvider`, `MultiTenancySides`, and `IApplicationService`, see the [framework/cross/features](/framework/cross/features) page and the framework Auth/Permissions docs.
+
+## DTO depth ordering example
+
+To make `SetFeatureDepth` concrete — given the following definitions:
+
+```csharp
+group.AddFeature("Reports", defaultValue: "false");
+group.GetFeature("Reports").CreateChildFeature("Reports.Pdf", defaultValue: "false");
+group.GetFeature("Reports").CreateChildFeature("Reports.Csv", defaultValue: "false");
+group.GetFeature("Reports.Pdf").CreateChildFeature("Reports.Pdf.Watermark", defaultValue: "false");
+```
+
+The DTOs after `FeatureAppService.GetAsync` look like:
+
+| Name | ParentName | Depth |
+| --- | --- | --- |
+| `Reports` | `null` | 0 |
+| `Reports.Pdf` | `Reports` | 1 |
+| `Reports.Pdf.Watermark` | `Reports.Pdf` | 2 |
+| `Reports.Csv` | `Reports` | 1 |
+
+The UI renders each row with `margin-left: depth * 20px`. The Blazor modal additionally cascades toggles up/down via `CheckParents`/`UncheckChildren` (see [blazor](/modules/feature-management/blazor)).
+
+## Application-Configuration integration
+
+The framework's `ApplicationConfigurationAppService` (separate module) reads `IFeatureChecker` to populate the `features` slice of `/api/abp/application-configuration`. That endpoint backs the SPA-side cache of current feature flags. After `IFeatureAppService.UpdateAsync`, the Blazor / MVC modal publishes `CurrentApplicationConfigurationCacheResetEventData` so the SPA picks up the change without waiting for cache expiry.
+
+The features slice only includes definitions where `FeatureDefinition.IsVisibleToClients == true`. So a *server-only* feature (rare — usually for licensing) won't reach the SPA, even though it's still readable via `IFeatureAppService.GetAsync` for the management modal.
+
+## Choosing the right `providerName`
+
+| Use case | `providerName` | `providerKey` |
+| --- | --- | --- |
+| Show / edit a tenant's effective feature values | `"T"` | tenant Guid as string |
+| Show / edit host-default feature values (no tenant) | `"T"` | `null` |
+| Show / edit an edition's feature values | `"E"` | edition Guid as `"N"`-formatted string |
+| Show defaults baked into code | `"D"` | `null` (writes throw `AbpException`) |
+| Custom provider (e.g. "User") | your provider's `ProviderName` | your key |
+
+The framework's three constants are `DefaultValueFeatureValueProvider.ProviderName = "D"`, `EditionFeatureValueProvider.ProviderName = "E"`, `TenantFeatureValueProvider.ProviderName = "T"`. Hard-coding these literals works but using the constants makes refactoring safer.
+
+## Sample raw JSON payload
+
+A typical response from `IFeatureAppService.GetAsync("T", tenantGuid.ToString())`:
+
+```json
+{
+  "groups": [
+    {
+      "name": "MyApp.Billing",
+      "displayName": "Billing",
+      "features": [
+        {
+          "name": "MyApp.Billing.MaxInvoices",
+          "displayName": "Max invoices per month",
+          "value": "50",
+          "provider": { "name": "T", "key": "5a47abc1-..." },
+          "description": "Maximum invoices the tenant can issue per month.",
+          "valueType": {
+            "name": "FreeTextStringValueType",
+            "validator": { "name": "NUMERIC", "properties": { "MinValue": "0" } }
+          },
+          "depth": 0,
+          "parentName": null
+        },
+        {
+          "name": "MyApp.Billing.AllowPdf",
+          "displayName": "Allow PDF download",
+          "value": "True",
+          "provider": { "name": "E", "key": "abc123..." },
+          "description": "Granted at the edition level.",
+          "valueType": { "name": "ToggleStringValueType" },
+          "depth": 0,
+          "parentName": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notice that `MaxInvoices` was granted at provider `"T"` (tenant override), while `AllowPdf` was granted at `"E"` (edition). The UI greys out the `AllowPdf` toggle because `provider.name != "T"` and `provider.name != "D"` — `IsDisabled` logic.
+
+## Sample update payload
+
+```json
+{
+  "features": [
+    { "name": "MyApp.Billing.MaxInvoices", "value": "100" },
+    { "name": "MyApp.Billing.AllowPdf",   "value": null }
+  ]
+}
+```
+
+The first entry sets a new value. The second entry clears the override (because `value: null` passes through `FeatureManager.SetAsync` which dispatches to `provider.ClearAsync`). After this batch:
+
+- `MaxInvoices` is `"100"` for that tenant.
+- `AllowPdf` reverts to its edition value (or default if no edition row exists).
+
+## Contract-only consumers
+
+A microservice that only *reads* feature flags doesn't need any of these DTOs — it uses the framework's `IFeatureChecker.IsEnabledAsync(name)` directly. The contracts in this assembly are for the *management* tier: the modal, the controller, the client proxy.
+
+If you build a custom UI (e.g. a TUI for ops), you reference `Volo.Abp.FeatureManagement.Application.Contracts` and use the static client proxy from `Volo.Abp.FeatureManagement.HttpApi.Client` — same DTOs, same wire format.

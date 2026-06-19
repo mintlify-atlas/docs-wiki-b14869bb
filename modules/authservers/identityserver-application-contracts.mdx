@@ -1,0 +1,247 @@
+---
+title: "Volo.Abp.IdentityServer.Application.Contracts — Pro management DTOs"
+sidebarTitle: "IdentityServer Application.Contracts"
+description: "Pro-only contracts layer for the IdentityServer4 module — the IClientAppService / IIdentityResourceAppService / IApiResourceAppService / IApiScopeAppService surface, DTOs, permission constants, and the OSS seams that make it possible."
+---
+
+`Volo.Abp.IdentityServer.Application.Contracts` is part of **ABP Commercial / Pro** — it is *not* in the open-source monorepo at v7.4.0. The OSS modules ship only `Domain.Shared`, `Domain`, `EntityFrameworkCore` and `MongoDB`; an HTTP management surface is a Pro deliverable. This page documents:
+
+1. The expected shape of the contracts layer based on the OSS repository interfaces and persisted aggregates it would mirror.
+2. The OSS seams (`IClientRepository`, `IApiResourceRepository`, `IApiScopeRepository`, `IIdentityResourceRepository`, `ObjectExtensionManager`) any Pro management layer must build on.
+3. How to write your own minimal application service against the OSS layer if you don't have the Pro packages.
+
+If you have Pro packages installed, your `Volo.Abp.IdentityServer.Application.Contracts.dll` will contain the types described below; if you don't, the OSS seams documented here are everything you need to build an equivalent surface yourself.
+
+## Expected file inventory (Pro)
+
+A Pro contracts package mirrors the four user-manageable aggregates in `Volo.Abp.IdentityServer.Domain`:
+
+```
+Volo.Abp.IdentityServer.Application.Contracts/
+└── Volo/Abp/IdentityServer/
+    ├── AbpIdentityServerApplicationContractsModule.cs
+    ├── ApiResources/
+    │   ├── IApiResourceAppService.cs
+    │   ├── ApiResourceDto.cs / ApiResourceWithDetailsDto.cs
+    │   ├── ApiResourceCreateDto.cs / ApiResourceUpdateDto.cs
+    │   └── GetApiResourceListInput.cs
+    ├── ApiScopes/
+    │   ├── IApiScopeAppService.cs
+    │   ├── ApiScopeDto.cs / ApiScopeWithDetailsDto.cs
+    │   ├── ApiScopeCreateDto.cs / ApiScopeUpdateDto.cs
+    │   └── GetApiScopeListInput.cs
+    ├── Clients/
+    │   ├── IClientAppService.cs
+    │   ├── ClientDto.cs / ClientWithDetailsDto.cs
+    │   ├── ClientCreateDto.cs / ClientUpdateDto.cs / ClientCloneInput.cs
+    │   └── GetClientListInput.cs
+    ├── IdentityResources/
+    │   ├── IIdentityResourceAppService.cs
+    │   ├── IdentityResourceDto.cs / IdentityResourceWithDetailsDto.cs
+    │   ├── IdentityResourceCreateDto.cs / IdentityResourceUpdateDto.cs
+    │   └── GetIdentityResourceListInput.cs
+    └── Permissions/
+        ├── AbpIdentityServerPermissionDefinitionProvider.cs
+        └── AbpIdentityServerPermissions.cs
+```
+
+## Application-service interfaces
+
+The four CRUD app services follow the standard ABP `ICrudAppService<TGetOutputDto, TGetListOutputDto, TKey, TGetListInput, TCreateInput, TUpdateInput>` pattern. The expected shapes are derived 1-to-1 from the repository methods in the Domain layer (see [`identityserver-domain`](/modules/authservers/identityserver-domain)):
+
+```csharp
+// Conceptual — Pro package
+public interface IClientAppService : ICrudAppService<
+    ClientWithDetailsDto,
+    ClientDto,
+    Guid,
+    GetClientListInput,
+    ClientCreateDto,
+    ClientUpdateDto>
+{
+    Task<List<string>> GetAllDistinctAllowedCorsOriginsAsync();
+    Task<ClientWithDetailsDto> CloneAsync(ClientCloneInput input);
+}
+```
+
+`ClientCloneInput` typically carries the source `Guid` plus a new `ClientId` and switches: `CopyAllowedScopes`, `CopyClientSecrets`, `CopyAllowedGrantTypes`, `CopyAllowedCorsOrigins`, `CopyRedirectUris`, `CopyPostLogoutRedirectUris`, `CopyIdentityProviderRestrictions`, `CopyClaims`, `CopyProperties`. The implementation deep-copies the aggregate via the constructor + the `AddXxx` helpers.
+
+```csharp
+public interface IApiResourceAppService : ICrudAppService<
+    ApiResourceWithDetailsDto, ApiResourceDto, Guid,
+    GetApiResourceListInput, ApiResourceCreateDto, ApiResourceUpdateDto>;
+
+public interface IApiScopeAppService : ICrudAppService<
+    ApiScopeWithDetailsDto, ApiScopeDto, Guid,
+    GetApiScopeListInput, ApiScopeCreateDto, ApiScopeUpdateDto>;
+
+public interface IIdentityResourceAppService : ICrudAppService<
+    IdentityResourceWithDetailsDto, IdentityResourceDto, Guid,
+    GetIdentityResourceListInput, IdentityResourceCreateDto, IdentityResourceUpdateDto>
+{
+    Task<IdentityResourceWithDetailsDto> CreateStandardResourcesAsync();
+}
+```
+
+`CreateStandardResourcesAsync` simply calls into `IIdentityResourceDataSeeder.CreateStandardResourcesAsync` from the OSS Domain layer — the same code that seeds `openid`, `profile`, `email`, `address`, `phone`, `role` resources on first run.
+
+## DTO shape
+
+DTOs mirror the aggregate's scalar surface and project child collections as flat lists of strings or small embedded DTOs:
+
+```csharp
+// Conceptual — Pro package
+public class ClientDto : ExtensibleAuditedEntityDto<Guid>
+{
+    public string ClientId { get; set; }
+    public string ClientName { get; set; }
+    public string Description { get; set; }
+    public bool Enabled { get; set; }
+    public string ProtocolType { get; set; }
+    // …all scalar properties from Client…
+}
+
+public class ClientWithDetailsDto : ClientDto
+{
+    public List<string> AllowedScopes { get; set; }
+    public List<string> AllowedGrantTypes { get; set; }
+    public List<string> AllowedCorsOrigins { get; set; }
+    public List<string> RedirectUris { get; set; }
+    public List<string> PostLogoutRedirectUris { get; set; }
+    public List<string> IdentityProviderRestrictions { get; set; }
+    public List<ClientClaimDto> Claims { get; set; }
+    public List<ClientSecretDto> ClientSecrets { get; set; }
+    public List<ClientPropertyDto> Properties { get; set; }
+}
+```
+
+The base type `ExtensibleAuditedEntityDto<Guid>` carries the `ExtraProperties` bag so values written through the OSS `ObjectExtensionManager` round-trip through the DTOs automatically — see the discussion of `IdentityServerModuleExtensionConsts` in [`identityserver-domain-shared`](/modules/authservers/identityserver-domain-shared).
+
+## Permission constants
+
+```csharp
+// Conceptual — Pro package
+public static class AbpIdentityServerPermissions
+{
+    public const string GroupName = "AbpIdentityServer";
+
+    public static class Clients
+    {
+        public const string Default = GroupName + ".Clients";
+        public const string Create  = Default + ".Create";
+        public const string Update  = Default + ".Update";
+        public const string Delete  = Default + ".Delete";
+        public const string ManageClaims      = Default + ".ManageClaims";
+        public const string ManageScopes      = Default + ".ManageScopes";
+        public const string ManageSecrets     = Default + ".ManageSecrets";
+        public const string ManageGrantTypes  = Default + ".ManageGrantTypes";
+        public const string ManageCorsOrigins = Default + ".ManageCorsOrigins";
+        public const string ManageProperties  = Default + ".ManageProperties";
+    }
+
+    public static class IdentityResources { /* Default / Create / Update / Delete */ }
+    public static class ApiResources      { /* Default / Create / Update / Delete */ }
+    public static class ApiScopes         { /* Default / Create / Update / Delete */ }
+}
+```
+
+A `PermissionDefinitionProvider` registers them under the `AbpIdentityServer` group so they appear in the standard permission management UI.
+
+## The OSS seams a Pro service uses
+
+Even though the Pro contracts package is closed-source, its implementation can only use the **OSS Domain** primitives. The following are stable public extension points you can rely on, whether you consume the Pro package or write your own service:
+
+| Seam | Lives in | Used for |
+| --- | --- | --- |
+| `IClientRepository` | OSS Domain | All client CRUD; `FindByClientIdAsync`, paging, CORS-origin aggregation, duplicate-ClientId check |
+| `IApiResourceRepository` | OSS Domain | `FindByNameAsync`, paging, scope-based lookup |
+| `IApiScopeRepository` | OSS Domain | `FindByNameAsync`, paging |
+| `IIdentityResourceRepository` | OSS Domain | `FindByNameAsync`, paging, name-uniqueness check |
+| `IIdentityResourceDataSeeder` | OSS Domain | Standard OIDC scope seeding |
+| `Client.AddSecret / AddGrantType / AddScope / AddRedirectUri / …` | OSS Domain | Aggregate mutation — Pro service should call these, not write children directly |
+| `ObjectExtensionManager` registry | OSS Domain.Shared | Extension-property storage and discovery |
+| `IGuidGenerator` | ABP framework | Generating Ids respecting tenant / sequential strategy |
+| `IPermissionGrantRepository` | Permission Mgmt | Authorising operations |
+
+## Writing your own minimal app service (OSS-only path)
+
+If you don't have Pro packages, a thin app service over the OSS repos is straightforward:
+
+```csharp
+[Authorize("MyAuth.Clients")]
+public class ClientAppService : ApplicationService, IClientAppService
+{
+    private readonly IClientRepository _repo;
+
+    public ClientAppService(IClientRepository repo) => _repo = repo;
+
+    public async Task<ClientDto> GetAsync(Guid id)
+        => ObjectMapper.Map<Client, ClientDto>(await _repo.GetAsync(id));
+
+    public async Task<PagedResultDto<ClientDto>> GetListAsync(GetClientListInput input)
+    {
+        var count = await _repo.GetCountAsync(input.Filter);
+        var list  = await _repo.GetListAsync(input.Sorting, input.SkipCount,
+                                             input.MaxResultCount, input.Filter);
+        return new PagedResultDto<ClientDto>(count,
+            ObjectMapper.Map<List<Client>, List<ClientDto>>(list));
+    }
+
+    public async Task<ClientDto> CreateAsync(ClientCreateDto input)
+    {
+        if (await _repo.CheckClientIdExistAsync(input.ClientId))
+            throw new BusinessException("MyAuth:ClientIdAlreadyExists");
+
+        var client = new Client(GuidGenerator.Create(), input.ClientId)
+        {
+            ClientName  = input.ClientName,
+            Description = input.Description,
+            // … scalars
+        };
+        foreach (var g in input.AllowedGrantTypes) client.AddGrantType(g);
+        foreach (var s in input.AllowedScopes)     client.AddScope(s);
+        foreach (var r in input.RedirectUris)      client.AddRedirectUri(r);
+        // …
+
+        await _repo.InsertAsync(client);
+        return ObjectMapper.Map<Client, ClientDto>(client);
+    }
+}
+```
+
+That's effectively what the Pro service does, plus polish: cloning, child-management endpoints (`AddSecret` / `UpdateSecret` / `DeleteSecret`), extension-property handling, and the permission-group-aware audit log.
+
+## How Pro plugs into the OSS extension registry
+
+The Pro DTOs and service inherit ABP's `ExtensibleObject` chain, so they automatically pick up any property registered via:
+
+```csharp
+ObjectExtensionManager.Instance.Modules()
+    .ConfigureIdentityServer(is4 =>
+    {
+        is4.ConfigureClient(client =>
+        {
+            client.AddOrUpdateProperty<string>("CustomerSegment", p =>
+            {
+                p.UI.OnTable.IsVisible = true;
+                p.UI.OnCreateForm.IsVisible = true;
+            });
+        });
+    });
+```
+
+`IdentityServerModuleExtensionConsts.EntityNames` (`Client`, `IdentityResource`, `ApiResource`, `ApiScope`) are the canonical handles. The OSS Domain module calls `ApplyEntityConfigurationToEntity` for each of those in its `PostConfigureServices` — see the `AbpIdentityServerDomainModule.PostConfigureServices` snippet on [`identityserver-domain`](/modules/authservers/identityserver-domain).
+
+## Gotchas
+
+- **`DeviceFlowCodes` and `PersistedGrant` are intentionally not on the management surface.** They're protocol state, not configuration — you cleanup, you don't curate.
+- **Cloning a client must regenerate the `Id` and ask for a new `ClientId`.** `Client.ClientId` is `[NotNull]` and indexed; reusing the same value would crash on `CheckClientIdExistAsync`.
+- **`AddSecret` accepts plain text.** IS4 expects secrets to live as plain (or hashed-by-secret-validator) values in the persisted form — don't pre-hash on the create DTO unless your secret validator knows.
+- **Permissions group name must match your provider.** If you ship your own `IPermissionDefinitionProvider`, use a unique group name (not `AbpIdentityServer`) so you don't collide with a future Pro install.
+
+## Cross-links
+
+- Aggregates and repository contracts the service operates on: [`identityserver-domain`](/modules/authservers/identityserver-domain)
+- Where the implementation actually lives (Pro): [`identityserver-application`](/modules/authservers/identityserver-application)
+- Persistence backends: [`identityserver-efcore`](/modules/authservers/identityserver-efcore), [`identityserver-mongodb`](/modules/authservers/identityserver-mongodb)
+- Module extension consts: [`identityserver-domain-shared`](/modules/authservers/identityserver-domain-shared)

@@ -1,0 +1,332 @@
+---
+title: "Dapr Client Factory"
+description: "AbpDaprOptions, IAbpDaprClientFactory and the API-token provider in Volo.Abp.Dapr — the transport-level integration that other ABP Dapr modules build on."
+---
+
+`Volo.Abp.Dapr` is the **transport-level** Dapr package. It is intentionally tiny: a strongly-typed options class, a client factory that constructs `DaprClient` and `HttpClient` instances with consistent serialization and tokens, and an API-token provider that bridges configuration, environment variables and the Dapr sidecar.
+
+Other ABP packages (`Volo.Abp.EventBus.Dapr`, the Dapr state-store integrations, the Dapr distributed lock provider) all consume `IAbpDaprClientFactory`. This page documents what those layers see; for the event-bus story, jump to [Distributed Event Bus — Dapr](/framework/eventbus/dapr).
+
+## Package layout
+
+All types live under `Volo.Abp.Dapr`:
+
+| File | Type | Purpose |
+| --- | --- | --- |
+| `AbpDaprModule.cs` | `AbpDaprModule` | Binds the `Dapr` configuration section, pulls API tokens from environment variables, exposes a singleton `DaprClient`. |
+| `AbpDaprOptions.cs` | `AbpDaprOptions` | Sidecar endpoints and API tokens. |
+| `IAbpDaprClientFactory.cs` / `AbpDaprClientFactory.cs` | Factory for `DaprClient` and `HttpClient` (service-to-service invocation). |
+| `IDaprApiTokenProvider.cs` / `DaprApiTokenProvider.cs` | Returns the Dapr and App API tokens for outbound calls. |
+| `IDaprSerializer.cs` / `Utf8JsonDaprSerializer.cs` | UTF‑8 JSON serializer backed by `IJsonSerializer`. |
+
+## Options
+
+```csharp
+public class AbpDaprOptions
+{
+    public string? HttpEndpoint { get; set; }
+
+    public string? GrpcEndpoint { get; set; }
+
+    public string? DaprApiToken { get; set; }
+
+    public string? AppApiToken { get; set; }
+}
+```
+
+| Property | Purpose | Default sidecar value |
+| --- | --- | --- |
+| `HttpEndpoint` | URL of the Dapr sidecar HTTP API. Passed to `DaprClientBuilder.UseHttpEndpoint`. When set, also becomes the default `daprEndpoint` for `CreateHttpClient`. | `http://127.0.0.1:3500` |
+| `GrpcEndpoint` | URL of the Dapr sidecar gRPC API. Passed to `DaprClientBuilder.UseGrpcEndpoint`. | `http://127.0.0.1:50001` |
+| `DaprApiToken` | Token Dapr expects on incoming sidecar calls (`dapr-api-token` header). | `DAPR_API_TOKEN` env var. |
+| `AppApiToken` | Token your application expects when Dapr invokes it. ABP does not consume this directly in the factory — it is surfaced for ASP.NET Core middleware (e.g. the inbox/outbox layer) that validates the incoming `dapr-api-token`. | `APP_API_TOKEN` env var. |
+
+A typical configuration block:
+
+```json title="appsettings.json"
+{
+  "Dapr": {
+    "HttpEndpoint": "http://localhost:3500",
+    "GrpcEndpoint": "http://localhost:50001"
+  }
+}
+```
+
+When you do not set the endpoints, the SDK falls back to the standard `DAPR_HTTP_PORT` / `DAPR_GRPC_PORT` environment variables that the Dapr CLI injects.
+
+## Module
+
+`AbpDaprModule` does three things:
+
+```csharp
+[DependsOn(typeof(AbpJsonModule))]
+public class AbpDaprModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        ConfigureDaprOptions(configuration);
+
+        context.Services.TryAddSingleton(
+            serviceProvider => serviceProvider
+                .GetRequiredService<IAbpDaprClientFactory>()
+                .Create()
+        );
+    }
+
+    private void ConfigureDaprOptions(IConfiguration configuration)
+    {
+        Configure<AbpDaprOptions>(configuration.GetSection("Dapr"));
+        Configure<AbpDaprOptions>(options =>
+        {
+            if (options.DaprApiToken.IsNullOrWhiteSpace())
+            {
+                var confEnv = configuration["DAPR_API_TOKEN"];
+                if (!confEnv.IsNullOrWhiteSpace())
+                {
+                    options.DaprApiToken = confEnv!;
+                }
+                else
+                {
+                    var env = Environment.GetEnvironmentVariable("DAPR_API_TOKEN");
+                    if (!env.IsNullOrWhiteSpace())
+                    {
+                        options.DaprApiToken = env!;
+                    }
+                }
+            }
+
+            if (options.AppApiToken.IsNullOrWhiteSpace())
+            {
+                var confEnv = configuration["APP_API_TOKEN"];
+                if (!confEnv.IsNullOrWhiteSpace())
+                {
+                    options.AppApiToken = confEnv!;
+                }
+                else
+                {
+                    var env = Environment.GetEnvironmentVariable("APP_API_TOKEN");
+                    if (!env.IsNullOrWhiteSpace())
+                    {
+                        options.AppApiToken = env!;
+                    }
+                }
+            }
+        });
+    }
+}
+```
+
+What this means in practice:
+
+- **Configuration section is `Dapr`.** Bound onto `AbpDaprOptions`.
+- **Token fallback order.** `AbpDaprOptions.DaprApiToken` → `IConfiguration["DAPR_API_TOKEN"]` → `Environment.GetEnvironmentVariable("DAPR_API_TOKEN")`. The same chain applies to `AppApiToken` via `APP_API_TOKEN`. This means you can ship the token in `appsettings`, in a `.env` file picked up by configuration, or via the standard Dapr sidecar variables — whichever appears first wins.
+- **A singleton `DaprClient` is registered.** `TryAddSingleton` calls `IAbpDaprClientFactory.Create()` once and caches the result. Injecting `DaprClient` anywhere gets that shared instance.
+
+## Client factory
+
+`IAbpDaprClientFactory` has just two methods:
+
+```csharp
+public interface IAbpDaprClientFactory
+{
+    DaprClient Create(Action<DaprClientBuilder>? builderAction = null);
+
+    HttpClient CreateHttpClient(
+        string? appId = null,
+        string? daprEndpoint = null,
+        string? daprApiToken = null
+    );
+}
+```
+
+The default implementation `AbpDaprClientFactory` is a singleton that holds the options, a copy of `AbpSystemTextJsonSerializerOptions.JsonSerializerOptions`, and the token provider.
+
+### Creating a `DaprClient`
+
+```csharp
+public virtual DaprClient Create(Action<DaprClientBuilder>? builderAction = null)
+{
+    var builder = new DaprClientBuilder()
+        .UseJsonSerializationOptions(JsonSerializerOptions);
+
+    if (!DaprOptions.HttpEndpoint.IsNullOrWhiteSpace())
+    {
+        builder.UseHttpEndpoint(DaprOptions.HttpEndpoint);
+    }
+
+    if (!DaprOptions.GrpcEndpoint.IsNullOrWhiteSpace())
+    {
+        builder.UseGrpcEndpoint(DaprOptions.GrpcEndpoint);
+    }
+
+    var apiToken = DaprApiTokenProvider.GetDaprApiToken();
+    if (!apiToken.IsNullOrWhiteSpace())
+    {
+        builder.UseDaprApiToken(apiToken);
+    }
+
+    builderAction?.Invoke(builder);
+
+    return builder.Build();
+}
+```
+
+Observations:
+
+- **JSON options are aligned with ABP.** The factory copies `AbpSystemTextJsonSerializerOptions.JsonSerializerOptions` (via `CreateJsonSerializerOptions`) so payloads serialised by ABP and payloads serialised by `DaprClient` agree on naming policy, enum handling, etc.
+- **Endpoints are opt-in.** If you leave both `HttpEndpoint` and `GrpcEndpoint` `null`, the Dapr SDK falls back to its own discovery (`DAPR_HTTP_PORT` / `DAPR_GRPC_PORT`).
+- **API token is applied centrally.** You do not need to set the `dapr-api-token` header yourself; the factory does it via `DaprClientBuilder.UseDaprApiToken`.
+- **`builderAction` runs last.** That means user customisations override factory defaults — e.g. you can swap the serializer or pin a specific gRPC channel.
+
+### Creating an `HttpClient` for service invocation
+
+```csharp
+public virtual HttpClient CreateHttpClient(
+    string? appId = null,
+    string? daprEndpoint = null,
+    string? daprApiToken = null)
+{
+    if(daprEndpoint.IsNullOrWhiteSpace() &&
+       !DaprOptions.HttpEndpoint.IsNullOrWhiteSpace())
+    {
+        daprEndpoint = DaprOptions.HttpEndpoint;
+    }
+
+    return DaprClient.CreateInvokeHttpClient(
+        appId,
+        daprEndpoint,
+        daprApiToken ?? DaprApiTokenProvider.GetDaprApiToken()
+    );
+}
+```
+
+This wraps `DaprClient.CreateInvokeHttpClient`, the Dapr SDK's helper that returns an `HttpClient` whose `BaseAddress` resolves to `http://<sidecar>/v1.0/invoke/<app-id>/method/`. Two conveniences:
+
+1. **The sidecar URL is auto-filled.** If you do not pass `daprEndpoint`, the factory uses `AbpDaprOptions.HttpEndpoint`.
+2. **The Dapr API token is auto-attached.** Unless you pass an explicit `daprApiToken`, the provider's token is used.
+
+Typical use:
+
+```csharp
+public class OrderClient : ITransientDependency
+{
+    private readonly HttpClient _http;
+
+    public OrderClient(IAbpDaprClientFactory daprFactory)
+    {
+        _http = daprFactory.CreateHttpClient(appId: "orders-service");
+    }
+
+    public Task<HttpResponseMessage> GetOrderAsync(Guid id)
+        => _http.GetAsync($"orders/{id}");
+}
+```
+
+The `HttpClient` is not pooled by this factory; it is the caller's responsibility to keep it long-lived if needed.
+
+## Using the singleton `DaprClient`
+
+Because `AbpDaprModule` registers a singleton `DaprClient` via `TryAddSingleton`, the common case is to inject it directly:
+
+```csharp
+public class CartService : ITransientDependency
+{
+    private readonly DaprClient _dapr;
+
+    public CartService(DaprClient dapr) => _dapr = dapr;
+
+    public Task SaveAsync(CartState state) =>
+        _dapr.SaveStateAsync("statestore", state.UserId, state);
+}
+```
+
+If you need a customised instance (different gRPC channel, alternative serializer), inject `IAbpDaprClientFactory` and call `Create(builderAction)` yourself.
+
+## Token provider
+
+```csharp
+public class DaprApiTokenProvider : IDaprApiTokenProvider, ISingletonDependency
+{
+    protected AbpDaprOptions Options { get; }
+
+    public DaprApiTokenProvider(IOptions<AbpDaprOptions> options) => Options = options.Value;
+
+    public virtual string? GetDaprApiToken() => Options.DaprApiToken;
+
+    public virtual string? GetAppApiToken() => Options.AppApiToken;
+}
+```
+
+The provider is a thin wrapper over the options snapshot, but it is the seam ABP uses elsewhere — for example, the Dapr event-bus subscription layer reads `GetAppApiToken()` to validate the `dapr-api-token` header on incoming cloud-event posts. Replace this service if your tokens come from a vault or a managed identity rather than configuration.
+
+## Serializer
+
+`IDaprSerializer` exposes both byte-array and string variants because Dapr APIs accept both:
+
+```csharp
+public interface IDaprSerializer
+{
+    byte[] Serialize(object obj);
+    string SerializeToString(object obj);
+    object Deserialize(byte[] value, Type type);
+    object Deserialize(string value, Type type);
+}
+```
+
+The default `Utf8JsonDaprSerializer` delegates to ABP's `IJsonSerializer`:
+
+```csharp
+public class Utf8JsonDaprSerializer : IDaprSerializer, ITransientDependency
+{
+    public byte[] Serialize(object obj)
+        => Encoding.UTF8.GetBytes(_jsonSerializer.Serialize(obj));
+
+    public string SerializeToString(object obj)
+        => _jsonSerializer.Serialize(obj);
+
+    public object Deserialize(byte[] value, Type type)
+        => _jsonSerializer.Deserialize(type, Encoding.UTF8.GetString(value));
+
+    public object Deserialize(string value, Type type)
+        => _jsonSerializer.Deserialize(type, value);
+}
+```
+
+Note that `DaprClient` itself uses the `System.Text.Json` options the factory hands it, not `IDaprSerializer`. `IDaprSerializer` is for code paths that bypass `DaprClient` — for example, hand-crafted CloudEvents in the event-bus layer.
+
+## End-to-end configuration
+
+```csharp
+public class MyServiceModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpDaprOptions>(options =>
+        {
+            options.HttpEndpoint = "http://localhost:3500";
+            options.GrpcEndpoint = "http://localhost:50001";
+            // DaprApiToken / AppApiToken left null → picked from env or config
+        });
+    }
+}
+```
+
+Combined with sidecar variables that the Dapr CLI sets — `DAPR_HTTP_PORT`, `DAPR_GRPC_PORT`, `DAPR_API_TOKEN`, `APP_API_TOKEN` — this gives you a deployment in which the same image runs unchanged in `dapr run`, in self-hosted mode and on Kubernetes.
+
+## Gotchas
+
+- **Both endpoints must agree with the sidecar.** Setting only `HttpEndpoint` is fine, but if you point `GrpcEndpoint` at the wrong port the `DaprClient` will fail on gRPC calls (state, pubsub, secrets, …). Leave them both null and let the SDK use `DAPR_*_PORT` if you are unsure.
+- **The singleton `DaprClient` is built once at startup.** Changing `AbpDaprOptions` at runtime does **not** rebuild it. If you need late-bound options, inject `IAbpDaprClientFactory` and create on demand.
+- **Token discovery is one-shot.** `ConfigureDaprOptions` runs during module configuration. If you set `DAPR_API_TOKEN` after the host has started, the value is not re-read.
+- **`AppApiToken` is informational here.** The factory uses `DaprApiToken` for outbound calls. `AppApiToken` is for inbound validation; consume it via `IDaprApiTokenProvider.GetAppApiToken()` in your authentication pipeline.
+- **`CreateHttpClient` returns a fresh `HttpClient` every call.** It is not pooled. Cache it if you make repeated calls to the same `appId`.
+- **`builderAction` overrides defaults.** Calling `Create(b => b.UseHttpEndpoint("…"))` on top of an options-configured endpoint replaces the earlier value — the last `UseHttpEndpoint` wins inside `DaprClientBuilder`.
+- **Serializer choices are split.** `DaprClient` payloads use the System.Text.Json options from `AbpSystemTextJsonSerializerOptions`. Custom code paths use `IDaprSerializer`. Be consistent if you customise either.
+
+## See also
+
+- [Distributed Event Bus — Dapr](/framework/eventbus/dapr) — builds on `IAbpDaprClientFactory` to publish and receive integration events.
+- [Distributed Event Bus — Abstractions](/framework/eventbus/abstractions) — the layer above this transport.
+- [Inbox / Outbox](/framework/eventbus/inbox-outbox) — durable delivery on top of Dapr pub/sub.

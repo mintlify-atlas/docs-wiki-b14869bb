@@ -1,0 +1,297 @@
+---
+title: "Account Web — OpenIddict integration"
+description: "How AbpAccountWebOpenIddictModule plugs the standard Razor login into the OpenIddict authorization endpoint."
+---
+
+`Volo.Abp.Account.Web.OpenIddict` is the bridge between the
+[Account Razor Pages](/modules/account/web) and an
+[OpenIddict authorization server](/modules/openiddict/overview). It is a tiny package — one module
+class and one page model — but it carries critical responsibility: making sure that when the user
+lands on `/Account/Login?ReturnUrl=/connect/authorize?...`, the page knows it is in the middle of an
+OIDC authorization flow, pre-fills the username from `login_hint`, switches into the tenant from the
+`__tenant` parameter, and offers a **Cancel** button that issues an OAuth-spec-compliant
+`access_denied` response.
+
+## File inventory
+
+```
+Volo.Abp.Account.Web.OpenIddict/
+├── AbpAccountWebOpenIddictModule.cs
+└── Pages/Account/OpenIddictSupportedLoginModel.cs
+```
+
+The package ships no `.cshtml` files — it reuses the Razor view from `Volo.Abp.Account.Web` and only
+replaces the page-model class behind it.
+
+## Module declaration
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountWebModule),
+    typeof(AbpOpenIddictAspNetCoreModule)
+)]
+public class AbpAccountWebOpenIddictModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpAccountWebOpenIddictModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAccountWebOpenIddictModule>();
+        });
+    }
+}
+```
+
+The module depends on:
+
+- **`AbpAccountWebModule`** — to inherit the full Razor Pages catalogue (Login, Register,
+  ForgotPassword, Manage, etc.) and the user menu / toolbar contributions.
+- **`AbpOpenIddictAspNetCoreModule`** — to get `AbpOpenIddictRequestHelper`, the OpenIddict
+  authentication scheme constants, and the ASP.NET integration that intercepts `/connect/authorize`.
+
+`AddApplicationPartIfNotExists` ensures MVC discovers the assembly so its page model is reachable.
+
+## `OpenIddictSupportedLoginModel`
+
+```csharp
+[ExposeServices(typeof(LoginModel))]
+public class OpenIddictSupportedLoginModel : LoginModel
+{
+    protected AbpOpenIddictRequestHelper OpenIddictRequestHelper { get; }
+
+    public OpenIddictSupportedLoginModel(
+        IAuthenticationSchemeProvider schemeProvider,
+        IOptions<AbpAccountOptions> accountOptions,
+        IOptions<IdentityOptions> identityOptions,
+        AbpOpenIddictRequestHelper openIddictRequestHelper)
+        : base(schemeProvider, accountOptions, identityOptions)
+    {
+        OpenIddictRequestHelper = openIddictRequestHelper;
+    }
+    // ...
+}
+```
+
+The attribute `[ExposeServices(typeof(LoginModel))]` is the magic glue — ABP's auto-DI replaces the
+base `LoginModel` registration with this subclass. The Razor page (`Login.cshtml`) is unchanged;
+when MVC instantiates the model, it gets the OpenIddict-aware variant.
+
+### `OnGetAsync` — read the original authorize request
+
+```csharp
+public async override Task<IActionResult> OnGetAsync()
+{
+    LoginInput = new LoginInputModel();
+
+    var request = await OpenIddictRequestHelper.GetFromReturnUrlAsync(ReturnUrl);
+    if (request?.ClientId != null)
+    {
+        LoginInput.UserNameOrEmailAddress = request.LoginHint;
+
+        var tenant = request.GetParameter(TenantResolverConsts.DefaultTenantKey)?.ToString();
+        if (!string.IsNullOrEmpty(tenant))
+        {
+            CurrentTenant.Change(Guid.Parse(tenant));
+            Response.Cookies.Append(TenantResolverConsts.DefaultTenantKey, tenant);
+        }
+    }
+
+    return await base.OnGetAsync();
+}
+```
+
+Three things happen *before* the base GET runs:
+
+1. **`AbpOpenIddictRequestHelper.GetFromReturnUrlAsync`** parses the original
+   `/connect/authorize?...` URL out of `ReturnUrl` and rehydrates an `OpenIddictRequest`. This is
+   what gives the page access to the standard OAuth parameters: `client_id`, `scope`, `state`,
+   `nonce`, `code_challenge`, `login_hint`, etc.
+2. **`login_hint`** is copied into the username field so the user does not retype their identity.
+3. **Tenant resolution from query string.** If the relying-party SPA appended `__tenant=<guid>` to
+   the authorize request, the page switches `CurrentTenant` and **also** sets the tenant cookie so
+   subsequent requests in the same browser stay in that tenant.
+
+After this, `base.OnGetAsync()` runs the standard external-provider discovery and renders the page.
+
+### `OnPostAsync` — Cancel button → OAuth error
+
+```csharp
+public async override Task<IActionResult> OnPostAsync(string action)
+{
+    if (action == "Cancel")
+    {
+        var request = await OpenIddictRequestHelper.GetFromReturnUrlAsync(ReturnUrl);
+
+        var transaction = HttpContext.GetOpenIddictServerTransaction();
+        if (request?.ClientId != null && transaction != null)
+        {
+            transaction.EndpointType = OpenIddictServerEndpointType.Authorization;
+            transaction.Request = request;
+
+            var notification = new OpenIddictServerEvents.ValidateAuthorizationRequestContext(transaction);
+            transaction.SetProperty(typeof(OpenIddictServerEvents.ValidateAuthorizationRequestContext).FullName!, notification);
+
+            return Forbid(OpenIddictServerAspNetCoreDefaults.AuthenticationScheme);
+        }
+
+        return Redirect("~/");
+    }
+
+    return await base.OnPostAsync(action);
+}
+```
+
+The Cancel button on the Login view posts with `action="Cancel"`. When the page is in the middle of
+an authorize flow it must not just navigate to `~/` — that would leave the relying party hung
+waiting for a callback that never arrives. Instead the handler:
+
+1. Recreates the OpenIddict server **transaction** for the original request.
+2. Marks the transaction as `EndpointType = Authorization` so the OpenIddict middleware knows what
+   to do.
+3. Calls `Forbid(OpenIddictServerAspNetCoreDefaults.AuthenticationScheme)` — OpenIddict's response
+   handler turns that into a standard `error=access_denied&state=...` redirect to the client's
+   `redirect_uri`.
+
+Outside an authorize flow Cancel simply navigates home.
+
+### Windows authentication
+
+```csharp
+public async override Task<IActionResult> OnPostExternalLogin(string provider)
+{
+    if (AccountOptions.WindowsAuthenticationSchemeName == provider)
+    {
+        return await ProcessWindowsLoginAsync();
+    }
+    return await base.OnPostExternalLogin(provider);
+}
+
+protected virtual async Task<IActionResult> ProcessWindowsLoginAsync()
+{
+    var result = await HttpContext.AuthenticateAsync(AccountOptions.WindowsAuthenticationSchemeName);
+    if (result.Succeeded)
+    {
+        var props = new AuthenticationProperties
+        {
+            RedirectUri = Url.Page("./Login", pageHandler: "ExternalLoginCallback",
+                                   values: new { ReturnUrl, ReturnUrlHash }),
+            Items =
+            {
+                { "LoginProvider", AccountOptions.WindowsAuthenticationSchemeName }
+            }
+        };
+
+        var id = new ClaimsIdentity(AccountOptions.WindowsAuthenticationSchemeName);
+        id.AddClaim(new Claim(ClaimTypes.NameIdentifier, result.Principal.FindFirstValue(ClaimTypes.PrimarySid)));
+        id.AddClaim(new Claim(ClaimTypes.Name, result.Principal.FindFirstValue(ClaimTypes.Name)));
+
+        await HttpContext.SignInAsync(IdentityConstants.ExternalScheme, new ClaimsPrincipal(id), props);
+        return Redirect(props.RedirectUri!);
+    }
+
+    return Challenge(AccountOptions.WindowsAuthenticationSchemeName);
+}
+```
+
+The OpenIddict variant *also* takes over Windows / Negotiate flows. The standard
+`SignInManager.ExternalLoginSignInAsync` cannot directly consume a `WindowsPrincipal`, so the page
+authenticates against the `"Windows"` scheme manually, builds a `ClaimsIdentity` with the SID and
+name, signs in as the `IdentityConstants.ExternalScheme` cookie, and redirects to the *existing*
+external-login callback handler in the base class. From the callback's perspective there is no
+difference between "user came back from Google" and "user came back from Negotiate".
+
+## End-to-end authorization sequence
+
+```
+SPA → /connect/authorize?client_id=spa&scope=openid&redirect_uri=...&login_hint=alice&__tenant=...
+   ↓
+OpenIddict middleware (challenges the OIDC server-side handler)
+   ↓
+Redirect → /Account/Login?ReturnUrl=/connect/authorize/callback?... (URL-encoded original request)
+   ↓
+GET handler — OpenIddictSupportedLoginModel.OnGetAsync
+   • parses ReturnUrl → OpenIddictRequest
+   • copies LoginHint → UserNameOrEmailAddress
+   • applies __tenant → CurrentTenant.Change + cookie
+   • runs base.OnGetAsync() → renders Login.cshtml
+   ↓
+User submits form → POST OnPostAsync("login")
+   • base.OnPostAsync runs SignInManager.PasswordSignInAsync
+   • cookie is set, RedirectSafely(ReturnUrl) → /connect/authorize/callback?...
+   ↓
+OpenIddict authorization endpoint
+   • re-validates the request
+   • issues authorization code → redirect to client's redirect_uri
+```
+
+If the user clicks Cancel instead:
+
+```
+POST OnPostAsync("Cancel")
+   • Re-parse the OpenIddictRequest from ReturnUrl
+   • Recreate the OpenIddict server transaction (Endpoint = Authorization)
+   • Forbid(OpenIddictServerAspNetCoreDefaults.AuthenticationScheme)
+   ↓
+OpenIddict server transforms the Forbid into:
+   302 to redirect_uri?error=access_denied&state=...
+```
+
+## Coexistence with the IdentityServer variant
+
+The repository also ships `Volo.Abp.Account.Web.IdentityServer` which replaces `LoginModel` in the
+same way. Both packages use `[ExposeServices(typeof(LoginModel))]`, so **only one can be loaded** at
+runtime — ABP's DI will pick the last-registered implementation and the behaviour becomes
+implementation-defined. Choose your authorization server first; pick the matching Account package.
+
+## Logout flow
+
+`Volo.Abp.Account.Web.OpenIddict` does **not** override the `Logout` page model — but the existing
+`Logout.cshtml.cs` already calls `SignInManager.SignOutAsync` which clears the application cookie.
+For OIDC RP-initiated logout, you must also expose `/connect/endsession` (handled by OpenIddict's
+own session module) and ensure the SPA navigates to it after local logout. See
+[OpenIddict overview](/modules/openiddict/overview) for the dance.
+
+## Gotchas
+
+1. **`AbpOpenIddictRequestHelper.GetFromReturnUrlAsync` returns `null` when the `ReturnUrl` is local
+   (`/dashboard`) or missing.** All OIDC-specific branches in the page model are guarded with
+   `if (request?.ClientId != null)`, so a normal username/password sign-in still works on this page.
+2. **Setting the tenant from query string bypasses the standard tenant cookie precedence.** If the
+   user also has a `__tenant` cookie pointing at a different tenant, the query string wins, and the
+   cookie is overwritten. Document this behaviour for operators.
+3. **The Cancel button only works inside an authorize flow.** Outside of it the OpenIddict server
+   transaction is `null` and the page falls back to `Redirect("~/")`. Don't rely on Cancel returning
+   the user to the page they came from.
+4. **`ProcessWindowsLoginAsync` uses `result.Principal.FindFirstValue(ClaimTypes.PrimarySid)`** —
+   the SID is the only stable per-user identifier in `WindowsPrincipal`. Domain SAM names can change,
+   SIDs don't.
+5. **Don't mix `AbpAccountWebOpenIddictModule` with `AbpAccountWebIdentityServerModule`.** Both
+   replace `LoginModel`; the registration order is non-deterministic. Pick one host, one auth
+   server.
+
+## Customization
+
+- **Subclass `OpenIddictSupportedLoginModel`** to add Captcha / fraud-detection before
+  `PasswordSignInAsync`. Override `OnPostAsync` and call `base.OnPostAsync(action)` only after your
+  checks pass.
+- **Per-client login hints.** Read `request.ClientId` in `OnGetAsync` and adjust the visible
+  external providers or hide the local form for specific clients.
+- **Cross-tenant SSO restriction.** Reject `__tenant` query strings that the current user has no
+  membership in by checking `IIdentityUserAppService.IsInTenantAsync(...)` (your own extension).
+
+## Cross-references
+
+- [web](/modules/account/web) — base `LoginModel` and the rest of the Razor pages.
+- [OpenIddict overview](/modules/openiddict/overview) — server module, endpoints, scopes.
+- [OpenIddict AspNetCore](/modules/openiddict/aspnetcore) — `AbpOpenIddictRequestHelper`,
+  authentication scheme constants.
+- [Multi-tenancy resolution](/flows/multi-tenancy-resolution) — how `CurrentTenant.Change` and the
+  `__tenant` cookie interact with subsequent requests.

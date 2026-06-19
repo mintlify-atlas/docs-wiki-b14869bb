@@ -1,0 +1,153 @@
+---
+title: "Volo.Abp.SettingManagement.Blazor.Server"
+description: "Thin Blazor Server hosting wrapper around the Blazor module — what it adds beyond Volo.Abp.SettingManagement.Blazor and when to reference it."
+---
+
+`Volo.Abp.SettingManagement.Blazor.Server` is the smallest package in the entire module. It contains a single class — `AbpSettingManagementBlazorServerModule` — and exists solely to compose the Blazor UI module with the server-side theming integration. Applications targeting Blazor Server reference *this* package; applications targeting Blazor WebAssembly reference `Volo.Abp.SettingManagement.Blazor.WebAssembly` instead.
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingManagementBlazorModule),
+    typeof(AbpAspNetCoreComponentsServerThemingModule))]
+public class AbpSettingManagementBlazorServerModule : AbpModule
+{
+}
+```
+
+That is the entire contents of the package — no overrides, no services, no embedded files.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.Blazor.Server/
+└── AbpSettingManagementBlazorServerModule.cs
+```
+
+## What it actually does
+
+Two transitive effects:
+
+1. **It brings in `AbpAspNetCoreComponentsServerThemingModule`.** That module provides the Blazor Server-specific `IPageLayout`, `IBrowserWindowSizeProvider`, and the SignalR-aware theming primitives that the Blazorise components inside `Volo.Abp.SettingManagement.Blazor` consume. Without it, the page would render but with broken layout (no card, no header) under Blazor Server.
+2. **It transitively pulls in `AbpSettingManagementBlazorModule`.** That registers `SettingManagementComponentOptions`, the menu contributor, the AutoMapper profile, and the route assembly. So referencing only `Volo.Abp.SettingManagement.Blazor.Server` is enough to get the full UI.
+
+## When to use which package
+
+| Hosting model | Setting Management package to reference |
+| --- | --- |
+| Blazor Server (interactive server render) | `Volo.Abp.SettingManagement.Blazor.Server` |
+| Blazor WebAssembly (client) | `Volo.Abp.SettingManagement.Blazor.WebAssembly` |
+| Blazor WebAssembly host (the ASP.NET Core process that ships the WASM) | typically nothing — the host serves the WASM bundle; the settings module is only on the client side |
+| Hybrid (server-side + WASM) | both `.Server` and `.WebAssembly`, each in its respective project |
+
+A common mistake is referencing `Volo.Abp.SettingManagement.Blazor` directly from a Blazor Server host. That works, but the layout is broken: the framework's server-side theming integration is *not* in the dependency graph, so `<PageHeader>` falls back to a no-op render. Always use the hosting-specific wrapper.
+
+## Differences from `Volo.Abp.SettingManagement.Blazor.WebAssembly`
+
+The WebAssembly wrapper (analogous to this one but for the client) has a similar `[DependsOn(typeof(AbpAspNetCoreComponentsWebAssemblyThemingModule))]`. The two modules are not interchangeable:
+
+* The WebAssembly wrapper additionally configures `IHttpClientFactory`-named clients with `BrowserHttpHandler` and OIDC token interceptors.
+* The Server wrapper relies on the host's existing ASP.NET Core pipeline — no client-side HTTP handlers are needed because the Blazor Server process is the same as the API process.
+
+In a Blazor Server deployment, `IEmailSettingsAppService` resolves to the *local* `EmailSettingsAppService` from `Volo.Abp.SettingManagement.Application`. In a WebAssembly deployment, the same interface resolves to `EmailSettingsClientProxy` from `Volo.Abp.SettingManagement.HttpApi.Client`. The Blazor module itself is host-agnostic.
+
+## Compose into a host
+
+A typical `BlazorServerModule` for an ABP application:
+
+```csharp
+[DependsOn(
+    typeof(MyAppApplicationModule),
+    typeof(MyAppHttpApiModule),
+    typeof(AbpAspNetCoreMvcUiLeptonXThemeModule),
+    typeof(AbpSettingManagementBlazorServerModule),  // <-- here
+    typeof(AbpIdentityBlazorServerModule),
+    typeof(AbpTenantManagementBlazorServerModule),
+    typeof(AbpFeatureManagementBlazorServerModule))]
+public class MyAppBlazorServerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        // ...
+    }
+}
+```
+
+No additional `Configure<SettingManagementComponentOptions>` call is needed — the inner `AbpSettingManagementBlazorModule` already registers the default contributors. To customize:
+
+```csharp
+Configure<SettingManagementComponentOptions>(options =>
+{
+    options.Contributors.Add(new MyCustomPageContributor());
+});
+```
+
+The customization works identically whether the host is Blazor Server or WebAssembly.
+
+## SignalR and circuit lifetime considerations
+
+Because Blazor Server hosts the UI on the server with a persistent SignalR circuit, the `EmailSettingGroupViewComponent` instance lives for the duration of the user's session on that tab. A few side effects:
+
+* **`OnInitializedAsync` runs once per tab activation.** With `TabsRenderMode.LazyReload`, switching away from the tab disposes the component, so re-activating triggers another `GetAsync` call. That's a server-side hop, not a network round-trip, so it's cheap.
+* **`SendTestEmailModal` keeps its state across tab switches** only if the parent tab is *not* lazy-reloaded. Default behavior loses the modal state — usually fine, since the modal is meant to be ephemeral.
+* **Circuit failures invalidate the value cache.** When the SignalR circuit drops, Blazor Server restarts the component tree on reconnection. The settings cache is unaffected (it's a server-process distributed cache), so the user sees a brief loading state and then their data.
+
+## Authentication and authorization
+
+The page is gated by `[Authorize]` and `[RequiresFeature(SettingManagementFeatures.Enable)]` declared in `SettingManagement.razor`. In Blazor Server, the cookie auth ticket is available on every connection, so the gates evaluate per render — there's no separate token refresh.
+
+In WebAssembly, the same attributes apply, but the auth check goes through the static client's bearer token. If the token expires mid-page, the app service call returns 401 and the page surfaces a generic error.
+
+## Gotchas
+
+* **Don't reference the base `Blazor` module directly in a Blazor Server host.** Layout will silently break.
+* **Hot Reload sees this module as empty.** Changes to `AbpSettingManagementBlazorServerModule.cs` are rare. Most hot-reload activity happens in `Volo.Abp.SettingManagement.Blazor`'s Razor files — make sure your project includes that assembly in the Hot Reload watch list, not this wrapper.
+* **The dependency graph excludes `AbpSettingManagementHttpApi`** — Blazor Server hosts use the in-process app service implementation, so there's no need to host the controllers. But many real applications *do* expose the HTTP API for external clients; in that case, reference `AbpSettingManagementHttpApiModule` from the API host project, not the Blazor Server module.
+* **`AbpSettingManagementApplicationModule` *is* transitively required** for Blazor Server because the app service implementation must resolve. Make sure your host references it directly (the Blazor.Server module deliberately does not — it doesn't assume you want the application layer in the same process).
+
+## A reference dependency graph
+
+For a Blazor Server-hosted application, the typical setting-management dependency chain is:
+
+```
+MyApp.Blazor.csproj
+  ├── Volo.Abp.SettingManagement.Blazor.Server   (this package)
+  │   ├── Volo.Abp.SettingManagement.Blazor
+  │   │   ├── Volo.Abp.SettingManagement.Application.Contracts
+  │   │   │   └── Volo.Abp.SettingManagement.Domain.Shared
+  │   │   ├── Volo.Abp.AutoMapper
+  │   │   └── Volo.Abp.AspNetCore.Components.Web.Theming
+  │   └── Volo.Abp.AspNetCore.Components.Server.Theming
+  └── Volo.Abp.SettingManagement.Application       (must be added explicitly)
+      ├── Volo.Abp.SettingManagement.Domain
+      │   └── Volo.Abp.SettingManagement.Domain.Shared
+      ├── Volo.Abp.Emailing
+      └── Volo.Abp.Timing
+```
+
+The `.Application` dependency is *not* transitive — the wrapper deliberately leaves that to the host. In ABP solutions generated by the ABP CLI, the standard pattern is to reference `.Application` from a separate `MyApp.Application.csproj` and have the Blazor project depend on that project; the application layer comes in transitively that way.
+
+You also typically want one of the EF Core or MongoDB persistence packages added to the same host, otherwise `ISettingRepository` and `ISettingDefinitionRecordRepository` won't resolve and the Domain layer will throw on first access.
+
+## Coexistence with `Volo.Abp.SettingManagement.Web`
+
+Some Blazor Server hosts continue to expose a parallel MVC UI (e.g. for emergency admin access via the legacy Razor Pages). When both `AbpSettingManagementWebModule` and `AbpSettingManagementBlazorServerModule` are loaded:
+
+1. The MVC main-menu contributor adds a menu item under `Administration → Settings` pointing at `~/SettingManagement`.
+2. The Blazor menu contributor runs *next* — its `TryRemoveMenuItem(SettingManagementMenus.GroupName)` strips the MVC entry, then adds its own pointing at `~/setting-management`.
+3. The MVC contributor's *check* on line 22 of `SettingManagementMainMenuContributor.cs` (`if (context.Menu.FindMenuItem(...) != null) return;`) prevents re-adding the MVC entry on a second pass.
+
+The end result is a single, Blazor-routed menu item. Both pages remain reachable by URL — only the menu reflects one of them.
+
+## Gotchas
+
+* **Don't reference the base `Blazor` module directly in a Blazor Server host.** Layout will silently break.
+* **Hot Reload sees this module as empty.** Changes to `AbpSettingManagementBlazorServerModule.cs` are rare. Most hot-reload activity happens in `Volo.Abp.SettingManagement.Blazor`'s Razor files — make sure your project includes that assembly in the Hot Reload watch list, not this wrapper.
+* **The dependency graph excludes `AbpSettingManagementHttpApi`** — Blazor Server hosts use the in-process app service implementation, so there's no need to host the controllers. But many real applications *do* expose the HTTP API for external clients; in that case, reference `AbpSettingManagementHttpApiModule` from the API host project, not the Blazor Server module.
+* **`AbpSettingManagementApplicationModule` *is* transitively required** for Blazor Server because the app service implementation must resolve. Make sure your host references it directly (the Blazor.Server module deliberately does not — it doesn't assume you want the application layer in the same process).
+* **Circuit disposal cancels pending HTTP calls.** When a Blazor Server circuit terminates (e.g. browser refresh), any in-flight `EmailSettingsAppService.GetAsync` is cancelled. Make sure custom contributors are cancellation-friendly — propagate the framework's `ICancellationTokenProvider.Token` into long-running reads.
+
+## Cross-links
+
+* For the actual UI page, contributors, view components, and code-behinds, see [Blazor](/modules/setting-management/blazor).
+* For the Application module that Blazor Server resolves at runtime, see [Application](/modules/setting-management/application).
+* For an architectural overview of how the layers stack together, see [Overview](/modules/setting-management/overview).

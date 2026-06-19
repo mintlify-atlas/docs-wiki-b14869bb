@@ -1,0 +1,243 @@
+---
+title: "Volo.Abp.Quartz — Quartz.NET host integration module"
+sidebarTitle: "Quartz"
+description: "AbpQuartzModule wraps services.AddQuartz, exposes an AbpQuartzOptions configurator and resolves a singleton IScheduler started at app init."
+---
+
+`Volo.Abp.Quartz` is the host-side integration for [Quartz.NET](https://www.quartz-scheduler.net). It calls `services.AddQuartz`, makes the resulting `IScheduler` resolvable as a singleton, and starts/stops it from ABP's `OnApplicationInitializationAsync` / `OnApplicationShutdownAsync` hooks. The package is the foundation for `Volo.Abp.BackgroundJobs.Quartz` and `Volo.Abp.BackgroundWorkers.Quartz` but is also useful directly if you want a configured `IScheduler` injected into your services.
+
+The package has just two source files plus `csproj` glue. The interesting code is in `AbpQuartzModule` — every Quartz feature you can configure (job store, thread pool, plugins, scoped job factory) is reachable through `AbpQuartzOptions`.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/Quartz/AbpQuartzModule.cs` | Module class. Calls `services.AddQuartz`, registers an `IScheduler` singleton, starts/stops the scheduler in app init/shutdown. |
+| `Volo/Abp/Quartz/AbpQuartzOptions.cs` | Options bag — `Properties`, `Configurator`, `StartDelay`, `StartSchedulerFactory`. |
+
+## Key abstractions
+
+| Symbol | Role |
+| --- | --- |
+| `AbpQuartzModule` | `AbpModule` subclass. Builds the Quartz service collection and owns the `IScheduler` life cycle. |
+| `AbpQuartzOptions` | Holds the Quartz `Properties` `NameValueCollection`, a `Configurator` delegate run against `IServiceCollectionQuartzConfigurator`, a `StartDelay`, and a `StartSchedulerFactory` for custom startup. |
+| `IScheduler` | Quartz's primary scheduling surface. Registered as singleton via `ISchedulerFactory.GetScheduler()`. |
+| `IServiceCollectionQuartzConfigurator` | Quartz.NET's builder; surfaced through `AbpQuartzOptions.Configurator`. |
+
+## The module
+
+```csharp
+public class AbpQuartzModule : AbpModule
+{
+    private IScheduler _scheduler = default!;
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var options = context.Services.ExecutePreConfiguredActions<AbpQuartzOptions>();
+
+        context.Services.AddQuartz(options.Properties, build =>
+        {
+            // these are the defaults
+            if (options.Properties[StdSchedulerFactory.PropertySchedulerJobFactoryType] == null)
+                build.UseMicrosoftDependencyInjectionScopedJobFactory();
+
+            if (options.Properties[StdSchedulerFactory.PropertySchedulerTypeLoadHelperType] == null)
+                build.UseSimpleTypeLoader();
+
+            if (options.Properties[StdSchedulerFactory.PropertyJobStoreType] == null)
+                build.UseInMemoryStore();
+
+            if (options.Properties[StdSchedulerFactory.PropertyThreadPoolType] == null)
+                build.UseDefaultThreadPool(tp => { tp.MaxConcurrency = 10; });
+
+            if (options.Properties["quartz.plugin.timeZoneConverter.type"] == null)
+                build.UseTimeZoneConverter();
+
+            options.Configurator?.Invoke(build);
+        });
+
+        context.Services.AddSingleton(serviceProvider =>
+        {
+            return AsyncHelper.RunSync(() =>
+                serviceProvider.GetRequiredService<ISchedulerFactory>().GetScheduler());
+        });
+
+        Configure<AbpQuartzOptions>(quartzOptions =>
+        {
+            quartzOptions.Properties = options.Properties;
+            quartzOptions.StartDelay = options.StartDelay;
+        });
+    }
+
+    public async override Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+    {
+        var options = context.ServiceProvider.GetRequiredService<IOptions<AbpQuartzOptions>>().Value;
+        _scheduler = context.ServiceProvider.GetRequiredService<IScheduler>();
+        await options.StartSchedulerFactory.Invoke(_scheduler);
+    }
+
+    public async override Task OnApplicationShutdownAsync(ApplicationShutdownContext context)
+    {
+        if (_scheduler.IsStarted) await _scheduler.Shutdown();
+    }
+}
+```
+
+The module gives Quartz five defaults — each guarded by a check on `options.Properties` so a downstream module's `PreConfigure<AbpQuartzOptions>(o => o.Properties[...] = ...)` overrides the default cleanly:
+
+1. **DI scoped job factory.** `UseMicrosoftDependencyInjectionScopedJobFactory()` creates a new `IServiceScope` per job execution. That is the closest analogue to "DI scope per Hangfire job activator" — scoped services (DbContexts, `ICurrentTenant`, `IUnitOfWorkManager`) work as expected without manual scoping.
+2. **Simple type loader.** Avoids assembly-qualified-name churn when serialising jobs to the store.
+3. **In-memory store.** Sensible default for dev/test. Override with `Properties` or `Configurator` for AdoJobStore.
+4. **10-thread thread pool.** A pragmatic concurrency cap; raise with `Properties[StdSchedulerFactory.PropertyThreadPoolThreadCount] = "20"` or via `Configurator.UseDefaultThreadPool`.
+5. **TimeZoneConverter plugin.** Bridges Windows/IANA time-zone ids, so cron expressions like `"0 0 9 * * ? Europe/Istanbul"` work cross-platform.
+
+## Startup flow
+
+```mermaid
+sequenceDiagram
+  participant Host as Host
+  participant Mod as AbpQuartzModule
+  participant Opt as AbpQuartzOptions
+  participant Fact as ISchedulerFactory
+  participant Sched as IScheduler
+
+  Host->>Mod: ConfigureServices
+  Mod->>Mod: ExecutePreConfiguredActions<AbpQuartzOptions>()
+  Mod->>Mod: services.AddQuartz(properties, build)
+  Mod->>Mod: AddSingleton<IScheduler>(sp -> factory.GetScheduler())
+  Host->>Mod: OnApplicationInitializationAsync
+  Mod->>Sched: ServiceProvider.GetRequiredService<IScheduler>
+  Mod->>Opt: StartSchedulerFactory.Invoke(_scheduler)
+  alt StartDelay > 0
+    Opt->>Sched: StartDelayed(StartDelay)
+  else
+    Opt->>Sched: Start()
+  end
+  Host->>Mod: OnApplicationShutdownAsync
+  Mod->>Sched: Shutdown()
+```
+
+`StartSchedulerFactory` is the seam to override startup. The default implementation chooses `Start()` vs `StartDelayed(StartDelay)`:
+
+```csharp
+private async Task StartSchedulerAsync(IScheduler scheduler)
+{
+    if (StartDelay.Ticks > 0)
+        await scheduler.StartDelayed(StartDelay);
+    else
+        await scheduler.Start();
+}
+```
+
+A downstream module can substitute `StartSchedulerFactory = _ => Task.CompletedTask` to disable scheduler startup entirely — which is exactly what `Volo.Abp.BackgroundWorkers.Quartz` does when `AbpBackgroundWorkerOptions.IsEnabled` is `false`.
+
+## The options class
+
+```csharp
+public class AbpQuartzOptions
+{
+    public NameValueCollection Properties { get; set; }
+    public Action<IServiceCollectionQuartzConfigurator>? Configurator { get; set; }
+    public TimeSpan StartDelay { get; set; }
+
+    [NotNull]
+    public Func<IScheduler, Task> StartSchedulerFactory { get; set; }
+
+    public AbpQuartzOptions()
+    {
+        Properties = new NameValueCollection();
+        StartDelay = TimeSpan.Zero;
+        StartSchedulerFactory = StartSchedulerAsync;
+    }
+}
+```
+
+Two configuration channels exist by design:
+
+- **`Properties`** is for canonical Quartz.NET configuration keys (`quartz.scheduler.instanceName`, `quartz.jobStore.type`, `quartz.dataSource.default.connectionString`, ...). They go straight into `StdSchedulerFactory`. Use this when you want behaviour matching a `quartz.config` text file.
+- **`Configurator`** is the fluent builder. Use it when the configuration is awkward to express as flat strings — e.g. `UsePersistentStore(s => { s.UseSqlServer(connStr); s.UseSystemTextJsonSerializer(); })`.
+
+## Wiring a SQL Server AdoJobStore
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<AbpQuartzOptions>(opts =>
+    {
+        opts.Properties["quartz.scheduler.instanceName"] = "BookStoreScheduler";
+        opts.Configurator = build =>
+        {
+            build.UsePersistentStore(store =>
+            {
+                store.UseProperties = true;
+                store.UseClustering();
+                store.UseSqlServer(context.Services.GetConfiguration().GetConnectionString("Default"));
+                store.UseNewtonsoftJsonSerializer();
+            });
+        };
+    });
+}
+```
+
+`UseClustering()` makes multiple replicas of your host coordinate ownership of triggers — important so a job doesn't fire twice at 03:00 because you scaled the deployment to three pods.
+
+## Resolving `IScheduler` in your code
+
+```csharp
+public class TriggerOnDemandAppService : ApplicationService
+{
+    private readonly IScheduler _scheduler;
+
+    public TriggerOnDemandAppService(IScheduler scheduler) { _scheduler = scheduler; }
+
+    public async Task RunNowAsync(string jobName)
+    {
+        await _scheduler.TriggerJob(new JobKey(jobName));
+    }
+}
+```
+
+Because the scheduler is a singleton, the same instance is shared by every service in the host. Workers, jobs and ad-hoc triggers all manipulate one scheduler.
+
+## Options reference
+
+| Option | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `AbpQuartzOptions.Properties` | `NameValueCollection` | empty | Flat Quartz.NET configuration. Keys come from `StdSchedulerFactory.Property*`. |
+| `AbpQuartzOptions.Configurator` | `Action<IServiceCollectionQuartzConfigurator>?` | `null` | Fluent builder. Runs after the defaults so it can override them. |
+| `AbpQuartzOptions.StartDelay` | `TimeSpan` | `Zero` | When > 0, the default `StartSchedulerFactory` uses `StartDelayed(delay)` instead of `Start()`. |
+| `AbpQuartzOptions.StartSchedulerFactory` | `Func<IScheduler, Task>` | `StartSchedulerAsync` | Replace to suppress startup or to add bespoke pre-start logic. |
+
+Quartz's own defaults that ABP applies when `Properties` is empty:
+
+| Quartz facet | ABP default |
+| --- | --- |
+| Job factory | `UseMicrosoftDependencyInjectionScopedJobFactory()` |
+| Type loader | `UseSimpleTypeLoader()` |
+| Job store | `UseInMemoryStore()` |
+| Thread pool | `UseDefaultThreadPool(tp => tp.MaxConcurrency = 10)` |
+| Plugins | `UseTimeZoneConverter()` |
+
+## Gotchas
+
+- **`AsyncHelper.RunSync` at registration.** The `IScheduler` singleton factory calls `ISchedulerFactory.GetScheduler()` synchronously via `AsyncHelper.RunSync`. This is safe at the registration site (no synchronization context) but means resolving the scheduler the **very first time** can block briefly while Quartz initialises.
+- **No `IHostedService` for the scheduler.** ABP starts the scheduler in `OnApplicationInitializationAsync`, not via the generic-host `IHostedService` pipeline. If you also call `AddQuartzHostedService` yourself, you will start it twice — leave that out of your `ConfigureServices`.
+- **In-memory store loses everything on restart.** Suitable for dev only. Use `UsePersistentStore` in production.
+- **Tenant context is not flowed automatically.** Quartz jobs run on background threads — `ICurrentTenant` is not set unless you do it yourself. The Background Workers package solves this for workers by wrapping `Execute`; for ad-hoc `IJob` implementations you must call `using (_currentTenant.Change(...))`.
+- **`Configurator` runs after defaults.** That is by design (so you can override) but a `Configurator` that re-applies `UseInMemoryStore()` will quietly discard the persistent store you set via `Properties`. Don't double-configure.
+- **Listener registration.** ABP does **not** wire up `ITriggerListener` / `IJobListener` instances from DI by default. Register them inside `Configurator` (`build.AddJobListener<MyListener>(GroupMatcher<JobKey>.AnyGroup())`).
+
+<CardGroup cols={2}>
+  <Card title="Workers · Quartz" icon="conveyor-belt" href="/framework/background/background-workers-quartz">
+    Recurring `IBackgroundWorker` instances scheduled on this `IScheduler`.
+  </Card>
+  <Card title="Background jobs · Quartz" icon="briefcase" href="/framework/background/background-jobs-quartz">
+    One-off `IBackgroundJobManager` enqueue routed through Quartz.
+  </Card>
+  <Card title="Hangfire module" icon="repeat" href="/framework/background/hangfire">
+    The Hangfire-based alternative with its own dashboard.
+  </Card>
+  <Card title="Background workers" icon="screwdriver-wrench" href="/framework/background/background-workers">
+    The base `IBackgroundWorker` model that Quartz workers extend.
+  </Card>
+</CardGroup>

@@ -1,0 +1,350 @@
+---
+title: "Volo.Abp.SettingManagement.Domain"
+description: "The Setting aggregate, SettingDefinitionRecord, the five ISettingManagementProvider implementations, SettingManager, SettingManagementStore, and the dynamic-definition store."
+---
+
+The Domain layer is the heart of the module. It declares the persistent `Setting` aggregate, the five providers that mirror the framework's `ISettingValueProvider`s, the read/write/cache choreography in `SettingManagementStore`, and the optional dynamic-definition store. Higher layers (Application, EF Core, MongoDB, UI) only ever depend on the interfaces declared here.
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingsModule),
+    typeof(AbpDddDomainModule),
+    typeof(AbpSettingManagementDomainSharedModule),
+    typeof(AbpCachingModule))]
+public class AbpSettingManagementDomainModule : AbpModule { ... }
+```
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.Domain/Volo/Abp/SettingManagement/
+├── AbpSettingManagementDbProperties.cs
+├── AbpSettingManagementDomainModule.cs
+├── ConfigurationSettingManagementProvider.cs
+├── ConfigurationValueSettingManagerExtensions.cs
+├── DefaultValueSettingManagementProvider.cs
+├── DefaultValueSettingManagerExtensions.cs
+├── DynamicSettingDefinitionStore.cs
+├── DynamicSettingDefinitionStoreInMemoryCache.cs
+├── GlobalSettingManagementProvider.cs
+├── GlobalSettingManagerExtensions.cs
+├── IDynamicSettingDefinitionStoreInMemoryCache.cs
+├── ISettingDefinitionRecordRepository.cs
+├── ISettingDefinitionSerializer.cs
+├── ISettingManagementProvider.cs
+├── ISettingManagementStore.cs
+├── ISettingManager.cs
+├── ISettingRepository.cs
+├── IStaticSettingSaver.cs
+├── Setting.cs
+├── SettingCacheItem.cs
+├── SettingCacheItemInvalidator.cs
+├── SettingDefinitionRecord.cs
+├── SettingDefinitionSerializer.cs
+├── SettingManagementOptions.cs
+├── SettingManagementProvider.cs
+├── SettingManagementStore.cs
+├── SettingManager.cs
+├── SettingStore.cs
+├── StaticSettingSaver.cs
+├── TenantSettingManagementProvider.cs
+├── TenantSettingManagerExtensions.cs
+├── UserSettingManagementProvider.cs
+└── UserSettingManagerExtensions.cs
+```
+
+## `Setting` — the aggregate root
+
+```csharp
+public class Setting : Entity<Guid>, IAggregateRoot<Guid>
+{
+    [NotNull] public virtual string Name { get; protected set; }
+    [NotNull] public virtual string Value { get; internal set; }
+    [CanBeNull] public virtual string ProviderName { get; protected set; }
+    [CanBeNull] public virtual string ProviderKey { get; protected set; }
+
+    protected Setting() { }
+
+    public Setting(
+        Guid id,
+        [NotNull] string name,
+        [NotNull] string value,
+        [CanBeNull] string providerName = null,
+        [CanBeNull] string providerKey = null)
+    {
+        Check.NotNull(name, nameof(name));
+        Check.NotNull(value, nameof(value));
+        Id = id; Name = name; Value = value;
+        ProviderName = providerName; ProviderKey = providerKey;
+    }
+}
+```
+
+Three things to note:
+
+* **`Value` has an `internal` setter.** `SettingManagementStore` mutates it after the entity is loaded. Outside the module, treat values as immutable — re-create the row instead of editing it.
+* **`ProviderName`/`ProviderKey` are optional** because the same table also stores rows for the global provider (`providerKey == null`).
+* **Uniqueness is on `(Name, ProviderName, ProviderKey)`.** The EF Core model enforces `b.HasIndex(x => new { x.Name, x.ProviderName, x.ProviderKey }).IsUnique(true)`.
+
+`Setting` does not implement any auditing interface — it's not soft-deleted, and `CreationTime` is not tracked. Updates are in-place and rely on the `EntityChangedEventData<Setting>` distributed event for cache invalidation.
+
+## `SettingDefinitionRecord` — for the dynamic store
+
+This is the *durable, editable* form of `SettingDefinition`. It only matters when `SettingManagementOptions.IsDynamicSettingStoreEnabled = true`.
+
+```csharp
+public class SettingDefinitionRecord : BasicAggregateRoot<Guid>, IHasExtraProperties
+{
+    [NotNull] public string Name { get; set; }
+    [NotNull] public string DisplayName { get; set; }
+    [CanBeNull] public string Description { get; set; }
+    [CanBeNull] public string DefaultValue { get; set; }
+    public bool IsVisibleToClients { get; set; }
+    public string Providers { get; set; } // comma-separated provider names
+    public bool IsInherited { get; set; }
+    public bool IsEncrypted { get; set; }
+    public ExtraPropertyDictionary ExtraProperties { get; protected set; }
+
+    public bool HasSameData(SettingDefinitionRecord otherRecord) { ... }
+    public void Patch(SettingDefinitionRecord otherRecord) { ... }
+}
+```
+
+`HasSameData` and `Patch` are used by `StaticSettingSaver` to reconcile in-memory definitions with rows in the database without trashing primary keys.
+
+`DisplayName`/`Description` are stored as serialized `LocalizableString`s (JSON), not plain strings — `SettingDefinitionSerializer` calls `LocalizableStringSerializer.Serialize(...)` on the way in and `Deserialize(...)` on the way out.
+
+## `ISettingManagementStore` — the persistence façade
+
+```csharp
+public interface ISettingManagementStore
+{
+    Task<string> GetOrNullAsync(string name, string providerName, string providerKey);
+    Task<List<SettingValue>> GetListAsync(string providerName, string providerKey);
+    Task<List<SettingValue>> GetListAsync(string[] names, string providerName, string providerKey);
+    Task SetAsync(string name, string value, string providerName, string providerKey);
+    Task DeleteAsync(string name, string providerName, string providerKey);
+}
+```
+
+Implementation: `SettingManagementStore`. It composes `ISettingRepository`, `ISettingDefinitionManager` (framework), and `IDistributedCache<SettingCacheItem>`. All methods marked `[UnitOfWork]`.
+
+### Read path — `GetOrNullAsync`
+
+```csharp
+[UnitOfWork]
+public virtual async Task<string> GetOrNullAsync(string name, string providerName, string providerKey)
+{
+    return (await GetCacheItemAsync(name, providerName, providerKey)).Value;
+}
+```
+
+On cache miss, `GetCacheItemAsync` doesn't load just the requested row — it loads **every setting for the (provider, key) tuple** via `SettingRepository.GetListAsync(providerName, providerKey)`, then bulk-warms the cache with `Cache.SetManyAsync(...)`. This is a deliberate trade-off: reading a single setting touches a few extra rows once, but subsequent reads for sibling settings in the same scope are cache hits.
+
+### Write path — `SetAsync`
+
+```csharp
+[UnitOfWork]
+public virtual async Task SetAsync(string name, string value, string providerName, string providerKey)
+{
+    var setting = await SettingRepository.FindAsync(name, providerName, providerKey);
+    if (setting == null)
+    {
+        setting = new Setting(GuidGenerator.Create(), name, value, providerName, providerKey);
+        await SettingRepository.InsertAsync(setting);
+    }
+    else
+    {
+        setting.Value = value;
+        await SettingRepository.UpdateAsync(setting);
+    }
+
+    await Cache.SetAsync(CalculateCacheKey(name, providerName, providerKey),
+        new SettingCacheItem(setting?.Value), considerUow: true);
+}
+```
+
+`considerUow: true` is the key flag — the cache entry is staged on the current unit of work and only flushed when the transaction commits. If the transaction rolls back, the cache is *not* polluted with the would-be value.
+
+### Cache key format
+
+`SettingCacheItem.CalculateCacheKey` produces strings shaped `pn:{providerName},pk:{providerKey},n:{name}`. The `GetSettingNameFormCacheKeyOrNull` helper parses them back using `FormattedStringValueExtracter` — useful in `GetCacheItemsAsync` where the store re-projects keys back into `SettingValue.Name`s.
+
+`SettingCacheItem` itself is `[Serializable]` *and* `[IgnoreMultiTenancy]`. The `IgnoreMultiTenancy` keeps the distributed cache key from being prefixed per tenant — provider keys already encode tenancy.
+
+### Bulk reads — `GetListAsync(string[], …)`
+
+When you ask for several settings, the store first does a bulk `Cache.GetManyAsync`. If every entry is hit, it returns immediately. Otherwise it computes the missing keys, calls the repository's three-arg `GetListAsync(string[], string, string)` overload, materializes a `SettingCacheItem` per definition, and writes them all back with `Cache.SetManyAsync(..., considerUow: true)`. Missing names produce `SettingValue(name, null)` so callers see a stable shape.
+
+### Invalidation
+
+`SettingCacheItemInvalidator` is a `ILocalEventHandler<EntityChangedEventData<Setting>>` that calls `Cache.RemoveAsync(cacheKey, considerUow: true)` whenever a `Setting` row changes. The framework's outbox/inbox plus the `EntityChangedEvent` integration means this fires on every successful commit, including ones that happen via raw EF Core (bypassing the management store).
+
+## The five providers
+
+All five live in the same namespace and implement `ISettingManagementProvider`:
+
+```csharp
+public interface ISettingManagementProvider
+{
+    string Name { get; }
+    Task<string> GetOrNullAsync([NotNull] SettingDefinition setting, [CanBeNull] string providerKey);
+    Task SetAsync([NotNull] SettingDefinition setting, [NotNull] string value, [CanBeNull] string providerKey);
+    Task ClearAsync([NotNull] SettingDefinition setting, [CanBeNull] string providerKey);
+}
+```
+
+`SettingManagementProvider` is an abstract base that delegates to `ISettingManagementStore`:
+
+```csharp
+public abstract class SettingManagementProvider : ISettingManagementProvider
+{
+    protected ISettingManagementStore SettingManagementStore { get; }
+
+    public virtual async Task<string> GetOrNullAsync(SettingDefinition setting, string providerKey)
+        => await SettingManagementStore.GetOrNullAsync(setting.Name, Name, NormalizeProviderKey(providerKey));
+
+    public virtual async Task SetAsync(SettingDefinition setting, string value, string providerKey)
+        => await SettingManagementStore.SetAsync(setting.Name, value, Name, NormalizeProviderKey(providerKey));
+
+    public virtual async Task ClearAsync(SettingDefinition setting, string providerKey)
+        => await SettingManagementStore.DeleteAsync(setting.Name, Name, NormalizeProviderKey(providerKey));
+
+    protected virtual string NormalizeProviderKey(string providerKey) => providerKey;
+}
+```
+
+| Provider | `Name` | `NormalizeProviderKey` | Backing store | Notes |
+| --- | --- | --- | --- | --- |
+| `DefaultValueSettingManagementProvider` | `D` | n/a | `setting.DefaultValue` | `SetAsync`/`ClearAsync` throw. `ISingletonDependency`. |
+| `ConfigurationSettingManagementProvider` | `C` | n/a | `IConfiguration["Settings:{name}"]` | `SetAsync`/`ClearAsync` throw. `ITransientDependency`. |
+| `GlobalSettingManagementProvider` | `G` | always returns `null` | `ISettingManagementStore` | Overrides to discard any provider key — host-wide values only. |
+| `TenantSettingManagementProvider` | `T` | falls back to `ICurrentTenant.Id?.ToString()` | `ISettingManagementStore` | Per-tenant; respects the ambient tenant. |
+| `UserSettingManagementProvider` | `U` | falls back to `ICurrentUser.Id?.ToString()` | `ISettingManagementStore` | Per-user. |
+
+The two read-only providers exist to keep the `ISettingManager.GetAllAsync` enumeration consistent — the manager walks providers in reverse, and you want defaults and configuration values to appear even when no row is in the database.
+
+### Extension methods per scope
+
+Each provider has a matching extension class so you don't have to remember its provider-name constant:
+
+* `GlobalSettingManagerExtensions` — `GetOrNullGlobalAsync`, `GetAllGlobalAsync`, `SetGlobalAsync`.
+* `TenantSettingManagerExtensions` — `GetOrNullForTenantAsync`, `SetForTenantAsync`, `SetForCurrentTenantAsync`, `SetForTenantOrGlobalAsync` (writes to tenant when an ID is supplied, global otherwise — used heavily by the email app service).
+* `UserSettingManagerExtensions` — `GetOrNullForUserAsync`, `SetForUserAsync`, `SetForCurrentUserAsync`.
+* `ConfigurationValueSettingManagerExtensions` and `DefaultValueSettingManagerExtensions` — only `GetOrNullXxxAsync` (no setters).
+
+## `ISettingManager` and `SettingManager`
+
+```csharp
+public interface ISettingManager
+{
+    Task<string> GetOrNullAsync(string name, string providerName, string providerKey, bool fallback = true);
+    Task<List<SettingValue>> GetAllAsync(string providerName, string providerKey, bool fallback = true);
+    Task SetAsync(string name, string value, string providerName, string providerKey, bool forceToSet = false);
+}
+```
+
+`SettingManager` registers as `ISingletonDependency` and lazy-resolves its provider list once per process. The semantics it implements are subtle:
+
+### `GetOrNullAsync(name, providerName, providerKey, fallback)`
+
+1. Walks providers in **reverse** registration order (so `User` first).
+2. `SkipWhile(c => c.Name != providerName)` — drops scopes *above* the requested one.
+3. If `!fallback || !setting.IsInherited` it also `TakeWhile(c => c.Name == providerName)` — disables fallthrough entirely.
+4. For each remaining provider, calls `GetOrNullAsync(setting, provider.Name == providerName ? providerKey : null)`. The key is only forwarded to the *requested* provider; lower-priority providers receive `null` (e.g. when falling back from `T` to `G` for the same setting, the tenant key isn't passed to the global provider).
+5. Returns the first non-null value, then decrypts via `ISettingEncryptionService` if `setting.IsEncrypted`.
+
+### `SetAsync(...)`
+
+```csharp
+if (providers.Count > 1 && !forceToSet && setting.IsInherited && value != null)
+{
+    var fallbackValue = await GetOrNullInternalAsync(name, providers[1].Name, null);
+    if (fallbackValue == value)
+    {
+        value = null; // Clear the value if it's same as it's fallback value
+    }
+}
+```
+
+Setting a value that equals the fallback value **deletes the row** unless you pass `forceToSet: true`. This keeps the table small but can be surprising — be explicit when migration tooling needs to write a row that happens to match the parent scope.
+
+### `GetAllAsync(...)`
+
+Returns one `SettingValue` per definition. For inherited settings it walks every provider from the bottom (default) up to the requested provider and overwrites the value as it climbs, so the final list contains the *effective* value at the requested scope. Encrypted settings are decrypted before being returned.
+
+## The dynamic-definition store
+
+When `SettingManagementOptions.IsDynamicSettingStoreEnabled` is true, `DynamicSettingDefinitionStore` (registered as `IDynamicSettingDefinitionStore` via `[Dependency(ReplaceServices = true)]`) returns definitions from the database rather than the static catalogue.
+
+The implementation has three moving parts:
+
+1. **`ISettingDefinitionRecordRepository`** — basic `IBasicRepository<SettingDefinitionRecord, Guid>` plus `FindByNameAsync`.
+2. **`IDynamicSettingDefinitionStoreInMemoryCache`** — a process-wide singleton dictionary protected by a `SemaphoreSlim`. Implements `FillAsync(List<SettingDefinitionRecord>)`, `GetSettingOrNull(string)`, `GetSettings()`.
+3. **A distributed cache "stamp"** — a Guid kept under `{KeyPrefix}_AbpInMemorySettingCacheStamp` that every node compares against `StoreCache.CacheStamp`.
+
+```csharp
+protected virtual async Task EnsureCacheIsUptoDateAsync()
+{
+    if (StoreCache.LastCheckTime.HasValue &&
+        DateTime.Now.Subtract(StoreCache.LastCheckTime.Value).TotalSeconds < 30)
+    {
+        return;
+    }
+
+    var stampInDistributedCache = await GetOrSetStampInDistributedCache();
+    if (stampInDistributedCache == StoreCache.CacheStamp)
+    {
+        StoreCache.LastCheckTime = DateTime.Now;
+        return;
+    }
+
+    await UpdateInMemoryStoreCache();
+    StoreCache.CacheStamp = stampInDistributedCache;
+    StoreCache.LastCheckTime = DateTime.Now;
+}
+```
+
+So the worst case is a 30-second window of staleness between nodes after a definition change. Writers that need immediate propagation should call `Cache.SetStringAsync(stampKey, Guid.NewGuid().ToString(), ...)` — which is exactly what `StaticSettingSaver` does after a successful save.
+
+`GetOrSetStampInDistributedCache` acquires an `IAbpDistributedLock` named `{KeyPrefix}_Common_AbpSettingUpdateLock` with a 2-minute timeout. If the lock can't be acquired, the request fails fast with an `AbpException` — no silent degradation.
+
+## `StaticSettingSaver`
+
+`IStaticSettingSaver.SaveAsync` is what `AbpSettingManagementDomainModule.OnApplicationInitializationAsync` calls (with Polly retries) to project the in-code `SettingDefinition`s into `SettingDefinitionRecord` rows. The flow:
+
+1. Acquire the application-level `IAbpDistributedLock`. If another instance has it, return — only one node performs the save.
+2. Hash the current definitions + the `AbpSettingOptions.DeletedSettings` list. Compare against `GetApplicationHashCacheKey()`. If unchanged, skip.
+3. Otherwise acquire the *common* lock, open a transactional UoW, run `UpdateChangedSettingsAsync(...)` which diffs records with `HasSameData` and applies `Patch(...)`.
+4. If anything changed, refresh the stamp key under `GetCommonStampCacheKey()`. This invalidates every node's in-memory cache.
+
+The retry policy in the module wraps this entire `SaveAsync` call:
+
+```csharp
+await Policy
+    .Handle<Exception>()
+    .WaitAndRetryAsync(8, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt) * 10))
+    .ExecuteAsync(...);
+```
+
+That's 20s, 40s, 80s, 160s, 320s, 640s, 1280s, 2560s — total ~85 minutes. Long-tail, by design, so a stuck distributed lock during startup doesn't crash the process.
+
+## `ISettingRepository` and `SettingStore`
+
+`ISettingRepository` is a `IBasicRepository<Setting, Guid>` plus three `FindAsync`/`GetListAsync` overloads. EF Core and MongoDB implementations are in the persistence packages.
+
+`SettingStore : ISettingStore` is a thin adapter that re-exposes `ISettingManagementStore` under the framework interface `ISettingStore`. It's how `framework/cross/settings`-defined providers reach the database — `GlobalSettingValueProvider`, `TenantSettingValueProvider`, and `UserSettingValueProvider` all call `ISettingStore.GetOrNullAsync` under the hood.
+
+## Gotchas
+
+* **`SetAsync(forceToSet = false)` can silently delete rows.** When the value matches the fallback, the row goes away. Pass `forceToSet: true` from data-seed code if you need a literal row.
+* **`SettingManagementProvider.SetAsync` ignores the encryption flag.** `SettingManager.SetAsync` calls `SettingEncryptionService.Encrypt(setting, value)` *before* delegating. Don't call the providers directly with plaintext for encrypted settings.
+* **The dynamic store returns `Array.Empty<SettingDefinition>()` when disabled.** It's not `null`. So `IDynamicSettingDefinitionStore.GetAllAsync()` is always safe to call; the framework's `ISettingDefinitionManager` quietly merges the result with static definitions.
+* **Be careful with `OnApplicationInitialization` ordering.** The module runs `Task.Run(...)` to do the save off the startup thread. If your module relies on having all `SettingDefinitionRecord`s present at startup, await `AbpSettingManagementDomainModule.GetInitializeDynamicSettingsTask()` from a hosted service.
+* **Data migrations skip everything.** `IsDataMigrationEnvironment()` forces both option flags off. If you have a migration tool that *needs* to seed `Setting` rows, do it explicitly via `ISettingRepository`, not via `ISettingManager`.
+
+## Cross-links
+
+* The five-provider read pipeline matches the one documented in `framework/cross/settings`; this module adds writes.
+* For DTOs and app-service contracts that consume `ISettingManager`, see [Application.Contracts](/modules/setting-management/application-contracts).
+* For the EF Core table mapping (`AbpSettings`, `AbpSettingDefinitions`), see [EF Core](/modules/setting-management/efcore).

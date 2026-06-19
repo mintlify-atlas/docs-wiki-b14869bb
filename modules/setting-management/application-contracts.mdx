@@ -1,0 +1,252 @@
+---
+title: "Volo.Abp.SettingManagement.Application.Contracts"
+description: "Application-service contracts (IEmailSettingsAppService, ITimeZoneSettingsAppService), DTOs, permission definitions, remote-service constants, and the feature-driven permission state checker."
+---
+
+`Application.Contracts` is the *public API surface* of the module. Anything that consumes the setting-management module remotely — Blazor WebAssembly UIs, MAUI clients, the HTTP API client proxies — references this package only. It contains no logic, just contracts, DTOs, permission definitions, and a single `ISimpleStateChecker`.
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingManagementDomainSharedModule),
+    typeof(AbpDddApplicationContractsModule),
+    typeof(AbpAuthorizationAbstractionsModule))]
+public class AbpSettingManagementApplicationContractsModule : AbpModule
+{
+}
+```
+
+The dependency on `AbpAuthorizationAbstractionsModule` (rather than the full authorization module) is what keeps this package thin enough to use from Blazor WebAssembly without dragging in Microsoft.AspNetCore.Authorization.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.Application.Contracts/Volo/Abp/SettingManagement/
+├── AbpSettingManagementApplicationContractsModule.cs
+├── AllowChangingEmailSettingsFeatureSimpleStateChecker.cs
+├── EmailSettingsDto.cs
+├── IEmailSettingsAppService.cs
+├── ITimeZoneSettingsAppService.cs
+├── SendTestEmailInput.cs
+├── SettingManagementPermissionDefinitionProvider.cs
+├── SettingManagementPermissions.cs
+├── SettingManagementRemoteServiceConsts.cs
+└── UpdateEmailSettingsDto.cs
+```
+
+## Service contracts
+
+The module ships two application services. Both are deliberately *narrow* — they expose only the email and timezone settings, even though the underlying `ISettingManager` could theoretically expose every defined setting. The decision to keep the HTTP surface narrow is intentional: dynamic settings carry encrypted SMTP passwords and other secrets that shouldn't be addressable by name from the outside world.
+
+### `IEmailSettingsAppService`
+
+```csharp
+public interface IEmailSettingsAppService : IApplicationService
+{
+    Task<EmailSettingsDto> GetAsync();
+    Task UpdateAsync(UpdateEmailSettingsDto input);
+    Task SendTestEmailAsync(SendTestEmailInput input);
+}
+```
+
+`GetAsync` returns the *effective* email settings for the current scope. The implementation (in the Application layer) reads global values via `ISettingProvider` and *overrides* tenant-specific fields from `SettingManager.GetOrNullForTenantAsync(..., fallback: false)` — so the DTO shows you a mix of inherited and overridden values that match what would actually be used at send time.
+
+`UpdateAsync` writes to either the tenant or the global scope via `SetForTenantOrGlobalAsync` — the host updates global rows, tenants update tenant rows. There is no method to *clear* a tenant override on this surface; pass empty strings to overwrite, or call `ISettingManager` directly server-side.
+
+`SendTestEmailAsync` is guarded by an additional permission (`SettingManagementPermissions.EmailingTest`) and uses `IEmailSender.SendAsync` directly — it does not persist anything.
+
+### `ITimeZoneSettingsAppService`
+
+```csharp
+public interface ITimeZoneSettingsAppService : IApplicationService
+{
+    Task<string> GetAsync();
+    Task<List<NameValue>> GetTimezonesAsync();
+    Task UpdateAsync(string timezone);
+}
+```
+
+`GetAsync` reads either the global or current-tenant value based on `ICurrentTenant.GetMultiTenancySide()`. `GetTimezonesAsync` returns a `List<NameValue>` of valid IANA timezone IDs, sourced from `ITimezoneProvider.GetWindowsTimezones()` — note the Windows naming despite cross-platform support (the framework's `TimeZoneHelper` normalizes them).
+
+`UpdateAsync` takes a bare `string` parameter — there is no DTO. The Blazor and MVC UIs send the value via form-data; the HTTP API client wraps it as a method argument.
+
+## DTOs
+
+### `EmailSettingsDto`
+
+```csharp
+public class EmailSettingsDto
+{
+    public string SmtpHost { get; set; }
+    public int SmtpPort { get; set; }
+    public string SmtpUserName { get; set; }
+    public string SmtpPassword { get; set; }
+    public string SmtpDomain { get; set; }
+    public bool SmtpEnableSsl { get; set; }
+    public bool SmtpUseDefaultCredentials { get; set; }
+    public string DefaultFromAddress { get; set; }
+    public string DefaultFromDisplayName { get; set; }
+}
+```
+
+Mirrors the framework's `EmailSettingNames.Smtp.*` static constants almost one-to-one. Three subtle points:
+
+* **`SmtpPassword` is returned in clear text** when the caller has the permission. The underlying setting is `EmailSettingNames.Smtp.Password`, which is defined with `isEncrypted: true` in `Volo.Abp.Emailing` — the `ISettingEncryptionService` decrypts it inside `ISettingProvider.GetOrNullAsync`. If you front this DTO with custom code, treat the field as a secret.
+* **`SmtpPort` is `int`, not `int?`.** The DTO never returns `null`; if the underlying setting is null/empty, `Convert.ToInt32(null)` returns `0`, which the UI shows as port zero. Watch for that edge case if you serve customers fresh tenant installs.
+* **There is no `Id`/`Version` field.** Email settings are a singleton — concurrent updates race on `(name, providerName, providerKey)` uniqueness, but there's no ETag check.
+
+### `UpdateEmailSettingsDto`
+
+```csharp
+public class UpdateEmailSettingsDto
+{
+    [MaxLength(256)] public string SmtpHost { get; set; }
+    [Range(1, 65535)] public int SmtpPort { get; set; }
+    [MaxLength(1024)] public string SmtpUserName { get; set; }
+    [MaxLength(1024)]
+    [DataType(DataType.Password)]
+    [DisableAuditing]
+    public string SmtpPassword { get; set; }
+    [MaxLength(1024)] public string SmtpDomain { get; set; }
+    public bool SmtpEnableSsl { get; set; }
+    public bool SmtpUseDefaultCredentials { get; set; }
+    [MaxLength(1024)] [Required] public string DefaultFromAddress { get; set; }
+    [MaxLength(1024)] [Required] public string DefaultFromDisplayName { get; set; }
+}
+```
+
+The validation attributes are evaluated by ABP's `ObjectExtensionManager` and by the auto-generated MVC controller. Three callouts:
+
+* **`[DisableAuditing]`** keeps the password out of the audit log payload. This works only when the audit infrastructure inspects DTOs via reflection; if you intercept HTTP traffic upstream, the password is still on the wire.
+* **`[Required]` on `DefaultFromAddress` and `DefaultFromDisplayName`** is the only mandatory pair. Tenants that don't override these will fall back to the global defaults — but you cannot save an empty value.
+* **`SmtpPort` accepts the full 1–65535 range**, including ports the OS reserves. There is no separate "0 means unset" path; clear the row server-side if you need that semantic.
+
+### `SendTestEmailInput`
+
+```csharp
+public class SendTestEmailInput
+{
+    [Required] public string SenderEmailAddress { get; set; }
+    [Required] public string TargetEmailAddress { get; set; }
+    [Required] public string Subject { get; set; }
+    public string Body { get; set; } // optional
+}
+```
+
+No format validation on the addresses — the underlying `IEmailSender` enforces SMTP-level validity. The `Body` is plain text in the default `IEmailSender` implementation; HTML requires customizing the sender.
+
+## Permissions
+
+### `SettingManagementPermissions`
+
+```csharp
+public class SettingManagementPermissions
+{
+    public const string GroupName = "SettingManagement";
+    public const string Emailing = GroupName + ".Emailing";
+    public const string EmailingTest = Emailing + ".Test";
+    public const string TimeZone = GroupName + ".TimeZone";
+
+    public static string[] GetAll() =>
+        ReflectionHelper.GetPublicConstantsRecursively(typeof(SettingManagementPermissions));
+}
+```
+
+`GetAll()` is used by `appsettings.json`-driven seeding tools that want to grant every permission in the module to a role.
+
+### `SettingManagementPermissionDefinitionProvider`
+
+```csharp
+public override void Define(IPermissionDefinitionContext context)
+{
+    var moduleGroup = context.AddGroup(SettingManagementPermissions.GroupName, L("Permission:SettingManagement"));
+
+    var emailPermission = moduleGroup.AddPermission(SettingManagementPermissions.Emailing, L("Permission:Emailing"));
+    emailPermission.StateCheckers.Add(new AllowChangingEmailSettingsFeatureSimpleStateChecker());
+
+    emailPermission.AddChild(SettingManagementPermissions.EmailingTest, L("Permission:EmailingTest"));
+
+    moduleGroup.AddPermission(SettingManagementPermissions.TimeZone, L("Permission:TimeZone"));
+}
+```
+
+The notable piece is `emailPermission.StateCheckers.Add(new AllowChangingEmailSettingsFeatureSimpleStateChecker())`. This couples the *permission's availability* to a *feature*:
+
+```csharp
+public class AllowChangingEmailSettingsFeatureSimpleStateChecker : ISimpleStateChecker<PermissionDefinition>
+{
+    public async Task<bool> IsEnabledAsync(SimpleStateCheckerContext<PermissionDefinition> context)
+    {
+        var currentTenant = context.ServiceProvider.GetRequiredService<ICurrentTenant>();
+        if (!currentTenant.IsAvailable) return true; // hosts always pass
+
+        var featureChecker = context.ServiceProvider.GetRequiredService<IFeatureChecker>();
+        return await featureChecker.IsEnabledAsync(SettingManagementFeatures.AllowChangingEmailSettings);
+    }
+}
+```
+
+The effect: even if a tenant role is granted `SettingManagement.Emailing`, the permission *evaluates as false* whenever the feature is off. This drives every downstream surface — the permission management UI hides the row, `[Authorize(SettingManagementPermissions.Emailing)]` rejects calls, and the menu/permission-aware page contributors skip the email tab. The host bypass (`!currentTenant.IsAvailable -> true`) keeps the host's editing path open regardless of feature configuration.
+
+`EmailingTest` is a *child* of `Emailing`. Children inherit their parent's state checkers, so when `AllowChangingEmailSettings` is off, both permissions disappear together.
+
+`TimeZone` has no state checker — it depends purely on the `Enable` feature, which the controllers/UI enforce via `[RequiresFeature]`.
+
+## Remote service constants
+
+```csharp
+public class SettingManagementRemoteServiceConsts
+{
+    public const string RemoteServiceName = "SettingManagement";
+    public const string ModuleName = "settingManagement";
+}
+```
+
+* **`RemoteServiceName`** is used by `[RemoteService(Name = …)]` on both controllers and by `AbpHttpClientModule.AddStaticHttpClientProxies(…, RemoteServiceName)`. It selects the right `RemoteServices:SettingManagement` configuration block from `appsettings.json`.
+* **`ModuleName`** is the segment used by `[Area(...)]` on the controllers and by `DynamicJavaScriptProxyOptions.DisableModule(...)` in the Web module — the MVC UI disables the dynamic JS proxy generator for this module because it ships its own static proxies via the Web module's `client-proxies/settingManagement-proxy.js`.
+
+## Gotchas
+
+* **`EmailSettingsDto.SmtpPassword` is a clear-text round-trip field.** If you serialize the DTO to a logging sink, scrub it explicitly. The framework's audit logger is told via `[DisableAuditing]` on the *input* DTO, but the output DTO has no such attribute (the read is permissioned).
+* **`SmtpPort = 0` is the default of `int`.** A fresh tenant calling `GetAsync` before any save returns `SmtpPort: 0`. Initialize the UI with a sensible default (587) before the first save.
+* **Don't grant `SettingManagement.Emailing` to a host-side role and assume tenants can edit.** The state checker pattern means tenants need the *feature* irrespective of role grants. The host can hand out the feature via the Feature Management UI or by seeding `FeatureValue` rows.
+* **`AbpAuthorizationAbstractionsModule` ≠ `AbpAuthorizationModule`.** The contracts module references *abstractions*; the application layer (which actually runs `[Authorize]`) brings in the full authorization module. Don't widen this dependency or you'll break Blazor WebAssembly builds.
+* **`SendTestEmailInput.Body` defaults to `null`.** `IEmailSender.SendAsync` accepts null bodies on some transports but not all. The MVC and Blazor UIs pre-fill it with `L["TestEmailBody"]`.
+
+## Putting the state checker, the permission, and the feature together
+
+A single user-visible interaction — *Can a tenant role edit SMTP?* — depends on three orthogonal checks that this package wires together:
+
+1. **Permission grant** — `SettingManagement.Emailing` granted to the role.
+2. **Feature enabled** — `SettingManagement.AllowChangingEmailSettings = true` for the tenant.
+3. **The state checker linking the two** — `AllowChangingEmailSettingsFeatureSimpleStateChecker` evaluated whenever the permission is checked.
+
+The runtime decision matrix:
+
+| Granted? | Feature on? | `IPermissionChecker.IsGrantedAsync(Emailing)` | Effect |
+| --- | --- | --- | --- |
+| No | n/a | false | Tab hidden, controller returns 403. |
+| Yes | No | false (state checker returns false for tenants) | Tab hidden, controller returns 403, permission row hidden in the role editor. |
+| Yes | Yes | true | Tab visible, edits allowed. |
+| Yes | n/a (host) | true (state checker bypass) | Host always sees the tab. |
+
+The reason this is wired through a state checker rather than two separate `[Authorize] + [RequiresFeature]` decorations: state checkers also affect the *permission management UI*. When a host operator manages a tenant's roles, the `Emailing` permission row is hidden from the grid for tenants that lack the feature — they can't accidentally grant a permission that would be silently disabled. `[RequiresFeature]` alone wouldn't achieve this.
+
+The flip side: if you remove the state checker (e.g. in a fork), you must also remove the `CheckFeatureAsync` call inside `EmailSettingsAppService` or the surface becomes inconsistent — the permission row appears in the role editor, but actual calls still 403.
+
+## Module dependency rationale
+
+```
+AbpSettingManagementApplicationContractsModule
+  ├── AbpSettingManagementDomainSharedModule        (constants, features, localization)
+  ├── AbpDddApplicationContractsModule              (IApplicationService, DTOs, paged result)
+  └── AbpAuthorizationAbstractionsModule            (PermissionDefinition, IPermissionChecker contract)
+```
+
+The deliberate exclusion of `AbpAuthorizationModule` (note: *abstractions*, not the full module) keeps the package WASM-friendly. The full authorization module references `Microsoft.AspNetCore.Authorization`, which doesn't run cleanly in Blazor WebAssembly because some of its policy handlers depend on `HttpContext`. The abstractions package supplies only the types needed to *describe* permissions and to *call* an `IPermissionChecker` if one is available — actual enforcement happens elsewhere.
+
+## Cross-links
+
+* For the implementation of these contracts (and how the email service swaps tenant vs. global settings on read), see [Application](/modules/setting-management/application).
+* For the HTTP shape and controller routing, see [HTTP API](/modules/setting-management/http-api).
+* For how the constants in `SettingManagementRemoteServiceConsts` plug into the static client proxies, see [HTTP API client](/modules/setting-management/http-api-client).
+* For the `SettingDefinition`/`EmailSettingNames` constants that these DTOs map onto, see `framework/cross/settings`.

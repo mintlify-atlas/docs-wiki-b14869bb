@@ -1,0 +1,277 @@
+---
+title: "Volo.Abp.SettingManagement.MongoDB"
+description: "MongoDB persistence for the Setting aggregate and SettingDefinitionRecord — collection naming, repositories, and the differences from the EF Core implementation."
+---
+
+The MongoDB persistence package is the document-store equivalent of [`Volo.Abp.SettingManagement.EntityFrameworkCore`](/modules/setting-management/efcore). It registers a `SettingManagementMongoDbContext`, declares two collections (`AbpSettings` and `AbpSettingDefinitions`), and ships two repositories that implement the Domain layer's `ISettingRepository` and `ISettingDefinitionRecordRepository`.
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingManagementDomainModule),
+    typeof(AbpMongoDbModule))]
+public class AbpSettingManagementMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<SettingManagementMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories<ISettingManagementMongoDbContext>();
+            options.AddRepository<Setting, MongoSettingRepository>();
+            options.AddRepository<SettingDefinitionRecord, MongoSettingDefinitionRecordRepository>();
+        });
+    }
+}
+```
+
+The Domain layer registers `ISettingManagementStore` as a transient and binds it to `SettingManagementStore`, which only depends on `ISettingRepository`. The MongoDB module's job is simply to supply that interface and the corresponding `SettingDefinitionRecordRepository` — everything else (`SettingManager`, providers, caching, dynamic store) is identical between EF Core and MongoDB deployments.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.MongoDB/Volo/Abp/SettingManagement/MongoDB/
+├── AbpSettingManagementMongoDbModule.cs
+├── ISettingManagementMongoDbContext.cs
+├── MongoSettingDefinitionRecordRepository.cs
+├── MongoSettingRepository.cs
+├── SettingManagementMongoDbContext.cs
+└── SettingManagementMongoDbContextExtensions.cs
+```
+
+## `ISettingManagementMongoDbContext`
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public interface ISettingManagementMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<Setting> Settings { get; }
+    IMongoCollection<SettingDefinitionRecord> SettingDefinitionRecords { get; }
+}
+```
+
+* **`[IgnoreMultiTenancy]`** mirrors the EF Core decision — the collections live in the host database only. Tenant scoping is encoded in `Setting.ProviderKey`.
+* **`[ConnectionStringName("AbpSettingManagement")]`** — same logical connection name as the EF Core context, so a single `ConnectionStrings:AbpSettingManagement` entry covers both deployments if your application moves between them.
+
+The interface decouples the collections from the concrete `SettingManagementMongoDbContext`, allowing applications to compose their own aggregate context.
+
+## `SettingManagementMongoDbContext`
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpSettingManagementDbProperties.ConnectionStringName)]
+public class SettingManagementMongoDbContext : AbpMongoDbContext, ISettingManagementMongoDbContext
+{
+    public IMongoCollection<Setting> Settings => Collection<Setting>();
+    public IMongoCollection<SettingDefinitionRecord> SettingDefinitionRecords => Collection<SettingDefinitionRecord>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureSettingManagement();
+    }
+}
+```
+
+`Collection<T>()` is provided by `AbpMongoDbContext` — it routes to whichever collection name was registered in `CreateModel`. The override calls `ConfigureSettingManagement()` which sets the collection names; without it, MongoDB would use the type name (`Setting`, `SettingDefinitionRecord`).
+
+## `ConfigureSettingManagement`
+
+```csharp
+public static class SettingManagementMongoDbContextExtensions
+{
+    public static void ConfigureSettingManagement(this IMongoModelBuilder builder)
+    {
+        Check.NotNull(builder, nameof(builder));
+
+        builder.Entity<Setting>(b =>
+        {
+            b.CollectionName = AbpSettingManagementDbProperties.DbTablePrefix + "Settings";
+        });
+
+        builder.Entity<SettingDefinitionRecord>(b =>
+        {
+            b.CollectionName = AbpSettingManagementDbProperties.DbTablePrefix + "SettingDefinitions";
+        });
+    }
+}
+```
+
+Only the collection names are configured. There is **no** equivalent to EF Core's `HasIndex(...).IsUnique(true)` — uniqueness on `(Name, ProviderName, ProviderKey)` is enforced *in application code* by `SettingManagementStore.SetAsync`, which always reads with `FindAsync(name, providerName, providerKey)` before inserting.
+
+If you want database-level uniqueness in MongoDB, create it manually after deployment:
+
+```javascript
+db.AbpSettings.createIndex(
+    { Name: 1, ProviderName: 1, ProviderKey: 1 },
+    { unique: true, name: "ux_Setting_Name_Provider" }
+);
+
+db.AbpSettingDefinitions.createIndex(
+    { Name: 1 },
+    { unique: true, name: "ux_SettingDefinition_Name" }
+);
+```
+
+The module does not create these indexes for you because ABP's MongoDB integration purposefully avoids implicit schema mutations.
+
+## `MongoSettingRepository`
+
+```csharp
+public class MongoSettingRepository : MongoDbRepository<ISettingManagementMongoDbContext, Setting, Guid>, ISettingRepository
+{
+    public MongoSettingRepository(IMongoDbContextProvider<ISettingManagementMongoDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<Setting> FindAsync(string name, string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(
+                s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey,
+                GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Setting>> GetListAsync(string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<Setting>> GetListAsync(string[] names, string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .Where(s => names.Contains(s.Name) && s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+The shape mirrors `EfCoreSettingRepository` precisely so that any caller (chiefly `SettingManagementStore`) sees identical semantics. Three implementation details:
+
+* **`GetMongoQueryableAsync`** returns an `IMongoQueryable<Setting>`. The `OrderBy(x => x.Id)` clause is preserved by the LINQ provider and produces a `$sort` stage.
+* **`names.Contains(s.Name)`** lowers to a `$in` filter. Mongo's matching is O(n) without an index — create a `{ Name: 1 }` index if you query large datasets.
+* **No transaction enrolment.** MongoDB's transaction support exists but ABP doesn't automatically wrap repository calls in one. If you need atomic multi-document writes, open an explicit session and pass it via `IUnitOfWork` extensions.
+
+## `MongoSettingDefinitionRecordRepository`
+
+```csharp
+public class MongoSettingDefinitionRecordRepository :
+    MongoDbRepository<ISettingManagementMongoDbContext, SettingDefinitionRecord, Guid>,
+    ISettingDefinitionRecordRepository
+{
+    public MongoSettingDefinitionRecordRepository(IMongoDbContextProvider<ISettingManagementMongoDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<SettingDefinitionRecord> FindByNameAsync(string name, CancellationToken cancellationToken = default)
+    {
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(s => s.Name == name, GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+Same shape as `EfCoreSettingDefinitionRecordRepository.FindByNameAsync`.
+
+## Serialization specifics
+
+`Setting` and `SettingDefinitionRecord` are serialized by the default `AbpMongoDbContext` BSON conventions:
+
+* **`Setting.Value`** is serialized as a BSON string — no document conversion. Long values consume one document slot up to MongoDB's 16 MB document limit, far above the `SettingConsts.MaxValueLength` of 2048.
+* **`SettingDefinitionRecord.ExtraProperties`** is serialized as a nested BSON document because `ExtraPropertyDictionary` implements `IDictionary<string, object>`. The framework's `BsonClassMap` registers extra-property handling globally; you don't need a custom serializer.
+* **`SettingDefinitionRecord.DisplayName` and `Description`** are serialized JSON strings — they're produced by `LocalizableStringSerializer.Serialize(...)` in the Domain layer before they reach the repository, so MongoDB stores opaque text.
+* **Discriminator metadata** is *not* emitted because the entities have no derived types in the module — the `[BsonIgnoreExtraElements]` convention is unnecessary.
+
+## Composing into an application context
+
+```csharp
+[ConnectionStringName("Default")]
+public class MyAppMongoDbContext : AbpMongoDbContext, ISettingManagementMongoDbContext, IIdentityProMongoDbContext
+{
+    public IMongoCollection<Setting> Settings => Collection<Setting>();
+    public IMongoCollection<SettingDefinitionRecord> SettingDefinitionRecords => Collection<SettingDefinitionRecord>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureSettingManagement();
+        // ...
+    }
+}
+```
+
+In the application's MongoDB module:
+
+```csharp
+context.Services.AddMongoDbContext<MyAppMongoDbContext>(options =>
+{
+    options.ReplaceDbContext<ISettingManagementMongoDbContext>();
+    // ...
+});
+```
+
+`ReplaceDbContext<ISettingManagementMongoDbContext>()` routes every `IMongoDbContextProvider<ISettingManagementMongoDbContext>` resolution to the application context, and the module's repositories continue working unchanged.
+
+## When to prefer MongoDB
+
+* **Schemaless extras.** If many tenants extend `Setting.ExtraProperties` with bespoke fields, MongoDB stores them without migration steps.
+* **Heavy read fanout.** When the value cache misses, the repository pulls every setting for a given (provider, key) tuple. MongoDB's `$in` queries scale linearly with key count — fine for thousands of tenants, less so for millions.
+* **Geo-distributed deployments.** Mongo replica-set reads with eventual consistency are fine for setting values, because the cache stamp pattern (see [Domain](/modules/setting-management/domain)) provides a coarse-grained refresh signal across nodes.
+
+## When EF Core is the safer pick
+
+* **Uniqueness guarantees.** EF Core enforces `(Name, ProviderName, ProviderKey)` uniqueness at the storage layer. With MongoDB you must add the index yourself.
+* **Transactional saves.** `SettingManagementStore.SetAsync` is `[UnitOfWork]`. EF Core honors the unit-of-work boundary as a database transaction; MongoDB requires explicit sessions to do the same.
+* **Audit history.** ABP's auditing infrastructure has tighter EF Core integration; entity-change events still fire under MongoDB but the saved-changes interceptors are EF-specific.
+
+## Gotchas
+
+* **Race on first insert.** Without a unique index, two parallel `SetAsync` calls for the same `(name, provider, key)` can produce duplicate documents. The cache will then show whichever was written last. Either create the unique index or wrap `SetAsync` in a tenant-scoped distributed lock.
+* **`names.Contains(...)` and large arrays.** MongoDB caps `$in` arrays at server-configured limits. The default 16 MB document limit applies to the *query* document, which in practice caps the array at tens of thousands. Not a concern for setting management's typical scale, but watch for it if you embed setting reads in batch jobs.
+* **`GetMongoQueryableAsync(cancellationToken)`** must be awaited *before* further LINQ composition. The asynchronous resolution is needed because the underlying session may be lazily opened. The pattern `(await GetMongoQueryableAsync(ct)).Where(...)` is mandatory.
+* **No multi-tenant database split.** Unlike EF Core (which has `IsTenantOnlyDatabase` guards in the model builder), the MongoDB module does not check `IsTenantOnlyDatabase`. If you implement database-per-tenant on Mongo, exclude this module from tenant contexts manually.
+
+## Document examples
+
+A typical `AbpSettings` document after the email tab is saved by a tenant:
+
+```json
+{
+  "_id": "0193f3a0-2a3e-7d2c-9e7d-4c19e5a2b1f3",
+  "Name": "Abp.Mailing.Smtp.Host",
+  "Value": "smtp.contoso.com",
+  "ProviderName": "T",
+  "ProviderKey": "1f8f4c2d-2b3e-4a1c-8c2a-7d09e1c6c1b1",
+  "ExtraProperties": {},
+  "ConcurrencyStamp": "37ad6c1d…"
+}
+```
+
+The corresponding `AbpSettingDefinitions` document (only present when `IsDynamicSettingStoreEnabled = true`):
+
+```json
+{
+  "_id": "0193f3a0-9d3a-71b2-bf01-3c2e8c7a6d11",
+  "Name": "Abp.Mailing.Smtp.Host",
+  "DisplayName": "{\"Name\":\"DisplayName:Abp.Mailing.Smtp.Host\",\"ResourceName\":\"AbpEmailing\"}",
+  "Description": null,
+  "DefaultValue": "127.0.0.1",
+  "IsVisibleToClients": false,
+  "Providers": "G,T,U",
+  "IsInherited": true,
+  "IsEncrypted": false,
+  "ExtraProperties": {},
+  "ConcurrencyStamp": "1abb…"
+}
+```
+
+* `DisplayName` is a JSON-encoded `LocalizableString` — produced by `LocalizableStringSerializer.Serialize` in `SettingDefinitionSerializer`. Deserializing it lazily resolves the resource string at runtime, so the column doesn't carry locale-specific text.
+* `Providers` lists the provider *names* (`G`, `T`, `U`) that this setting can be stored against. The list comes from the original `SettingDefinition.Providers` collection joined with commas — settings without an explicit list get `null` here, meaning "any provider".
+* `ConcurrencyStamp` is added by `BasicAggregateRoot<TKey>` (the base type of `SettingDefinitionRecord`) for optimistic concurrency. The framework's MongoDB repository handles incrementing it on update.
+
+## Cross-links
+
+* For the EF Core counterpart with full mapping details (indexes, table prefixes, Oracle workaround), see [EF Core](/modules/setting-management/efcore).
+* For how the repository is consumed by the cache-aware store, see [Domain](/modules/setting-management/domain).
+* For an explanation of `ProviderKey` semantics across providers, see `framework/cross/settings`.

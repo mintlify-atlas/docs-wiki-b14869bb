@@ -1,0 +1,271 @@
+---
+title: "Account Module Overview"
+description: "Self-service authentication UI and account management endpoints layered on top of ABP Identity."
+---
+
+The Account module is the **user-facing front door** of an ABP application. It packages the Razor Pages,
+view components, Blazor screens, REST endpoints, emailers, settings, and toolbar contributions that turn
+the headless [Identity module](/modules/identity/overview) into a working sign-in experience. Account
+itself owns no aggregates and no database schema: it depends on `Volo.Abp.Identity` for `IdentityUser`,
+`IdentityUserManager`, and `SignInManager<IdentityUser>`, and delegates token issuance to whichever
+OIDC provider you plug in ([OpenIddict](/modules/openiddict/overview) or
+[IdentityServer](/modules/identityserver/overview)).
+
+This page is the entry point for the eight deep-dive pages that follow. It explains how the packages
+fit together, which package you ship in which host, and which features come from each layer.
+
+## Source layout
+
+```
+modules/account/src/
+├── Volo.Abp.Account.Application.Contracts/   DTOs, IAccountAppService, IProfileAppService, settings
+├── Volo.Abp.Account.Application/             AccountAppService, ProfileAppService, AccountEmailer
+├── Volo.Abp.Account.HttpApi/                 AccountController, ProfileController
+├── Volo.Abp.Account.HttpApi.Client/          Static client proxies for non-MVC hosts
+├── Volo.Abp.Account.Web/                     Razor Pages (Login/Register/Manage/…), toolbar, menu
+├── Volo.Abp.Account.Web.IdentityServer/      Hook for IdentityServer interaction service
+├── Volo.Abp.Account.Web.OpenIddict/          OpenIddictSupportedLoginModel + Windows auth path
+└── Volo.Abp.Account.Blazor/                  AccountManage component for Blazor WASM/Server
+```
+
+The package naming follows the standard
+[ABP module layering](/overview/layered-architecture): `Application.Contracts` is the only DTO/interface
+contract everybody can reference, `Application` is the implementation, `HttpApi` exposes REST,
+`HttpApi.Client` consumes REST from a non-host process, `Web` is the MVC/Razor UI, the two `Web.*`
+flavours adapt the Web project to an authorization server, and `Blazor` re-implements the profile
+screen for component-based hosts.
+
+## What each page covers
+
+| Page | Focus |
+| --- | --- |
+| [application-contracts](/modules/account/application-contracts) | `IAccountAppService`, `IProfileAppService`, DTOs (`RegisterDto`, `UpdateProfileDto`, `ResetPasswordDto`), settings constants, module dependencies. |
+| [application](/modules/account/application) | `AccountAppService.RegisterAsync`/`ResetPasswordAsync`, `ProfileAppService.UpdateAsync`/`ChangePasswordAsync`, `AccountEmailer`, AutoMapper profile. |
+| [http-api](/modules/account/http-api) | `AccountController` / `ProfileController` route table, `AbpAccountHttpApiModule`. |
+| [http-api-client](/modules/account/http-api-client) | Static client proxies (`AccountClientProxy`, `ProfileClientProxy`) and how to wire them into a Blazor WASM / console host. |
+| [web](/modules/account/web) | Razor Pages pipeline: `Login.cshtml.cs`, `Register.cshtml.cs`, `ForgotPassword`, `ResetPassword`, `Manage`, toolbar + user menu contributors. |
+| [web-openiddict](/modules/account/web-openiddict) | `OpenIddictSupportedLoginModel` — how the standard Login page hooks into the OpenIddict authorization endpoint and Windows auth. |
+| [blazor](/modules/account/blazor) | `AbpAccountBlazorModule`, `AccountManage.razor`, AutoMapper for `PersonalInfoModel`, user-menu contributor. |
+| [blazor-server](/modules/account/blazor-server) | Hosting the Blazor profile component in a Blazor Server host that already runs the Razor Pages login flow. |
+
+## High-level dependency graph
+
+`AbpAccountApplicationContractsModule` depends on `AbpIdentityApplicationContractsModule`. The
+contracts module exists so a Blazor WASM client can compile DTOs without referencing the application
+implementation:
+
+```csharp
+// Volo/Abp/Account/AbpAccountApplicationContractsModule.cs
+[DependsOn(
+    typeof(AbpIdentityApplicationContractsModule)
+)]
+public class AbpAccountApplicationContractsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Add<AccountResource>("en")
+                .AddBaseTypes(typeof(AbpValidationResource))
+                .AddVirtualJson("/Volo/Abp/Account/Localization/Resources");
+        });
+
+        Configure<AbpExceptionLocalizationOptions>(options =>
+        {
+            options.MapCodeNamespace("Volo.Account", typeof(AccountResource));
+        });
+    }
+}
+```
+
+The application implementation pulls in Identity's application module, navigation, and emailing:
+
+```csharp
+// Volo/Abp/Account/AbpAccountApplicationModule.cs
+[DependsOn(
+    typeof(AbpAccountApplicationContractsModule),
+    typeof(AbpIdentityApplicationModule),
+    typeof(AbpUiNavigationModule),
+    typeof(AbpEmailingModule)
+)]
+public class AbpAccountApplicationModule : AbpModule { ... }
+```
+
+Higher layers (`HttpApi`, `Web`, the OpenIddict/IdentityServer variants, `Blazor`) all chain back to
+the contracts module, so any host can compose them à-la-carte. See
+[Module System](/overview/module-system) for how `[DependsOn]` discovery works.
+
+## Where each feature lives
+
+**Self-registration.** Implemented in `AccountAppService.RegisterAsync` — checked against the
+`Abp.Account.IsSelfRegistrationEnabled` setting, called both from the REST endpoint
+(`POST /api/account/register`) and from `Register.cshtml.cs` in the Web project.
+
+**Password reset.** Three-step protocol — `SendPasswordResetCodeAsync` generates a token and dispatches
+an email via `AccountEmailer.SendPasswordResetLinkAsync`; the user clicks the link and lands on
+`ResetPassword.cshtml`, which first calls `VerifyPasswordResetTokenAsync` to validate the token
+on `OnGet` and then `ResetPasswordAsync` on `OnPost`.
+
+**Profile management.** `Account/Manage.cshtml` is the Razor host that loads
+`ProfileManagementPageOptions.Contributors` view components (password + personal info). Blazor hosts
+get the same screen via `AccountManage.razor` at `/account/manage-profile`, which uses
+`IProfileAppService.GetAsync`/`UpdateAsync`/`ChangePasswordAsync`.
+
+**External / social login.** The Razor `LoginModel.OnGetExternalLoginCallbackAsync` consumes
+`SignInManager.GetExternalLoginInfoAsync`, creates a local `IdentityUser` if needed, and signs the
+user in. Provider registration itself happens in `IServiceCollection.AddAuthentication()` in the host —
+the module just discovers configured schemes through `IAuthenticationSchemeProvider`.
+
+**OpenID Connect authorization flow.** The OpenIddict variant of the Login page reads the original
+authorize request from the return URL via `AbpOpenIddictRequestHelper.GetFromReturnUrlAsync`, extracts
+`login_hint` and the tenant key, and supports a "Cancel" button that issues
+`Forbid(OpenIddictServerAspNetCoreDefaults.AuthenticationScheme)`. See
+[web-openiddict](/modules/account/web-openiddict) for the full sequence.
+
+## Settings
+
+Two settings live in `Volo.Abp.Account.Settings.AccountSettingNames`:
+
+```csharp
+public class AccountSettingNames
+{
+    public const string IsSelfRegistrationEnabled = "Abp.Account.IsSelfRegistrationEnabled";
+    public const string EnableLocalLogin          = "Abp.Account.EnableLocalLogin";
+}
+```
+
+Both default to `"true"` and are marked `isVisibleToClients: true` in
+`AccountSettingDefinitionProvider`, which means a SPA can read them through
+`/api/abp/application-configuration` to hide the Register button or the local login form. Disabling
+`EnableLocalLogin` while leaving one external provider configured triggers an automatic challenge —
+`LoginModel.IsExternalLoginOnly` becomes `true` and `OnGetAsync` redirects straight to the provider.
+
+## Cross-cutting concerns
+
+- **Localization.** `AccountResource` is the canonical resource, declared in the contracts module and
+  reused by every page through `LocalizationResource = typeof(AccountResource)` in
+  `AccountPageModel` / `AbpAccountComponentBase`.
+- **Auditing & security log.** Every login attempt, logout, password reset and password change is
+  persisted by `IdentitySecurityLogManager.SaveAsync` — see
+  [Identity application](/modules/identity/application) for the underlying log entity.
+- **Object extensions.** Both the Razor `Manage` page and the Blazor `AccountManage.razor` honor
+  `ObjectExtensionManager.Instance.GetProperties<...>()` configured via
+  `ApplyEntityConfigurationToUi(IdentityModuleExtensionConsts.ModuleName, EntityNames.User, ...)` in
+  `AbpAccountWebModule.PostConfigureServices`.
+- **AppUrlProvider.** The application module registers the password reset URL pattern at startup so
+  emails can build a deep link without hard-coding hosts:
+  `options.Applications["MVC"].Urls[AccountUrlNames.PasswordReset] = "Account/ResetPassword";`.
+
+## Composition recipes
+
+**MVC monolith with cookie auth.** Reference `Volo.Abp.Account.Web` plus
+`Volo.Abp.Account.Application`. You get full Razor Pages, profile management, password reset emails.
+
+**OpenIddict authorization server.** Replace `Volo.Abp.Account.Web` with
+`Volo.Abp.Account.Web.OpenIddict`. The login page automatically becomes
+`OpenIddictSupportedLoginModel`, which is registered with
+`[ExposeServices(typeof(LoginModel))]` so MVC resolves the OpenIddict subclass.
+
+**Blazor WebAssembly.** Reference `Volo.Abp.Account.HttpApi.Client` and `Volo.Abp.Account.Blazor`.
+The WASM host calls `IAccountAppService` and `IProfileAppService` through `AccountClientProxy` /
+`ProfileClientProxy`. The login flow itself happens on the API host's Razor Pages (this is the
+"separate-server" topology) — your WASM app redirects to the OIDC `/connect/authorize` endpoint and
+the API host shows `OpenIddictSupportedLoginModel`.
+
+**Blazor Server.** Reference `Volo.Abp.Account.Web` AND `Volo.Abp.Account.Blazor` in the same host;
+Razor Pages handle the cookie-based authentication, and the Blazor circuit reuses the same
+authenticated user to render `AccountManage.razor`.
+
+## Common gotchas
+
+1. **`AppName` is mandatory on `RegisterDto` and `SendPasswordResetCodeDto`.** It selects which entry
+   in `AppUrlOptions.Applications` is used to build links — set it to `"MVC"` (the default the Razor
+   pages send) unless you've added other applications.
+2. **Don't ship `Volo.Abp.Account.Web.OpenIddict` AND `Volo.Abp.Account.Web.IdentityServer` together.**
+   Both replace `LoginModel`; only one can win.
+3. **Email confirmation is `Identity`'s job, not Account's.** Account triggers the reset email; the
+   confirm-email link in `Identity` uses a different token provider.
+4. **`ProfileAppService.UpdateAsync` honors username/email update settings.** If
+   `IdentitySettingNames.User.IsUserNameUpdateEnabled` is `false`, the change is silently ignored.
+   This is by design — see [Identity application](/modules/identity/application) for the setting
+   provider that owns those names.
+5. **`EnableLocalLogin = false` + zero external providers** locks every user out. The check in
+   `LoginModel.CheckLocalLoginAsync` throws `UserFriendlyException("LocalLoginDisabledMessage")` on
+   every POST.
+
+## How the eight packages talk to each other
+
+```
+┌────────────────────────────────────────┐
+│ Volo.Abp.Account.Application.Contracts │  ← every package below depends on this
+│   DTOs, IAccountAppService,            │
+│   IProfileAppService, settings names   │
+└─────────────────────┬──────────────────┘
+                      │
+        ┌─────────────┼─────────────┬─────────────────────┐
+        ▼             ▼             ▼                     ▼
+   Application    HttpApi       HttpApi.Client       Blazor
+   (server-side)  (REST host)   (WASM/console)       (UI component)
+        │              │              │                    │
+        │              ▼              │                    │
+        │          Web (Razor Pages)  │                    │
+        │              │              │                    │
+        │     ┌────────┴────────┐     │                    │
+        │     ▼                 ▼     │                    │
+        │   Web.OpenIddict   Web.IdentityServer            │
+        │   (replaces        (replaces                     │
+        │    LoginModel)      LoginModel)                  │
+        ▼                                                  ▼
+   Identity application                       Blazor host server/WASM
+```
+
+`HttpApi.Client` and `Application` never both register `IAccountAppService` in the same process — DI
+order is *last writer wins*, and a misconfigured host that pulls both will silently send HTTP
+requests to itself.
+
+## Sequence: typical first-time sign-up
+
+The combined flow across packages, when a brand-new visitor lands on an MVC monolith and clicks
+"Register":
+
+```
+Browser → /Account/Register                                   (Web)
+RegisterModel.OnGetAsync
+  → CheckSelfRegistrationAsync (Web)
+  → IsSelfRegistrationEnabled  (Application: ISettingProvider)
+  → renders Register.cshtml
+Browser submits → /Account/Register POST
+RegisterModel.OnPostAsync
+  → CheckSelfRegistrationAsync (Web — both settings)
+  → AccountAppService.RegisterAsync(RegisterDto { AppName="MVC" })   (Application)
+       → SettingProvider.IsTrueAsync(IsSelfRegistrationEnabled)
+       → IdentityOptions.SetAsync()                                  (Identity)
+       → new IdentityUser(... CurrentTenant.Id)                      (Identity domain)
+       → UserManager.CreateAsync(user, password)                     (Identity AspNetCore)
+       → UserManager.AddDefaultRolesAsync(user)
+       → ObjectMapper.Map<IdentityUser, IdentityUserDto>
+  → SignInManager.SignInAsync(user, isPersistent: true)              (Identity AspNetCore)
+  → Redirect(ReturnUrl ?? "~/")
+```
+
+Steps in **Web** rely on `Volo.Abp.Account.Application.Contracts` for the `RegisterDto` shape, on
+`Volo.Abp.Account.Application` for the implementation, and on `Volo.Abp.Identity` for the actual
+user store. This is the standard ABP onion: the page is a thin coordinator.
+
+## Customization entry points (by package)
+
+| Concern | Type / extension point | Package |
+| --- | --- | --- |
+| Block self-registration based on a Captcha | override `AccountAppService.CheckSelfRegistrationAsync` | application |
+| Custom password reset email template | replace `AccountEmailTemplates.PasswordResetLink` definition | application |
+| Add an extra tab to the Manage page | implement `IProfileManagementPageContributor` | web |
+| Wrap the entire Login page with a Captcha | subclass `LoginModel` / `OpenIddictSupportedLoginModel` | web / web-openiddict |
+| Inline the Login UI in a SPA host | call `AccountController.Login` via the static proxy | http-api-client |
+| Cache the profile DTO in WASM | extend the `ProfileClientProxy` partial | http-api-client |
+| Add tenant-specific extra properties to register form | `ObjectExtensionManager.Instance.AddOrUpdate<IdentityUser>(...)` | identity |
+| Disable the user-menu "My account" entry | remove the contributor from `AbpNavigationOptions.MenuContributors` | web (or blazor) |
+
+Continue with [application-contracts](/modules/account/application-contracts) for the DTO and
+interface reference, or skip to [web](/modules/account/web) if you want to follow the request flow
+through a real browser.

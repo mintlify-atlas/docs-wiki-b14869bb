@@ -1,0 +1,339 @@
+---
+title: "Volo.Abp.FeatureManagement.HttpApi: FeaturesController and the dynamic-JS-proxy opt-out"
+sidebarTitle: "HTTP API"
+description: "The FeaturesController route map, why this module disables the dynamic JavaScript proxy, and the System.Text.Json converter registration that lets IStringValueType round-trip over MVC."
+---
+
+`Volo.Abp.FeatureManagement.HttpApi` is the ASP.NET Core Web API surface. It contains exactly one controller — `FeaturesController` — that maps `IFeatureAppService` to three REST endpoints under `/api/feature-management/features`.
+
+Module class:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcModule))]
+public class AbpFeatureManagementHttpApiModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpFeatureManagementHttpApiModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AbpFeatureManagementResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+
+        var valueValidatorFactoryOptions =
+            context.Services.ExecutePreConfiguredActions<ValueValidatorFactoryOptions>();
+        Configure<JsonOptions>(options =>
+        {
+            options.JsonSerializerOptions.Converters.AddIfNotContains(
+                new StringValueTypeJsonConverter(valueValidatorFactoryOptions));
+        });
+    }
+}
+```
+
+Three things happen:
+
+1. The assembly is added to MVC's application parts so the framework discovers `FeaturesController`. `AddApplicationPartIfNotExists` is idempotent.
+2. `AbpFeatureManagementResource` adopts `AbpUiResource` as a base type. That gives the resource keys like `"Cancel"`, `"Save"`, `"AreYouSure"` — the UI strings the modal uses without redefining them.
+3. The `StringValueTypeJsonConverter` is added to ASP.NET Core MVC's `JsonOptions` (System.Text.Json). Without this, MVC cannot serialize `FeatureDto.ValueType` — the polymorphic `IStringValueType` field. This duplicates what `AbpFeatureManagementDomainSharedModule` already did for the framework-wide `IJsonSerializer`; both must be configured because MVC keeps an independent `JsonSerializerOptions`.
+
+Note the application-contracts module is depended on rather than the application module itself — the HTTP API surface only needs the *contract*. The application implementation may live in a separate process (microservice gateway pattern).
+
+## File inventory
+
+| Path under `Volo/Abp/FeatureManagement/` | Role |
+| --- | --- |
+| `AbpFeatureManagementHttpApiModule.cs` | Module class — application part, JSON converter, localization base type. |
+| `FeaturesController.cs` | The single controller, implements `IFeatureAppService`. |
+
+## `FeaturesController`
+
+```csharp
+[RemoteService(Name = FeatureManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(FeatureManagementRemoteServiceConsts.ModuleName)]
+[Route("api/feature-management/features")]
+public class FeaturesController : AbpControllerBase, IFeatureAppService
+{
+    protected IFeatureAppService FeatureAppService { get; }
+
+    public FeaturesController(IFeatureAppService featureAppService)
+    {
+        FeatureAppService = featureAppService;
+    }
+
+    [HttpGet]
+    public virtual Task<GetFeatureListResultDto> GetAsync(string providerName, string providerKey)
+        => FeatureAppService.GetAsync(providerName, providerKey);
+
+    [HttpPut]
+    public virtual Task UpdateAsync(string providerName, string providerKey, UpdateFeaturesDto input)
+        => FeatureAppService.UpdateAsync(providerName, providerKey, input);
+
+    [HttpDelete]
+    public virtual Task DeleteAsync(string providerName, string providerKey)
+        => FeatureAppService.DeleteAsync(providerName, providerKey);
+}
+```
+
+### Attributes
+
+- `[RemoteService(Name = "AbpFeatureManagement")]` — flags the controller as a remote service named `AbpFeatureManagement`. The dynamic proxy generator (server-side discovery) uses this name; the client-side HTTP proxy module also uses the same name to find the base URL via `AbpRemoteServiceOptions.RemoteServices["AbpFeatureManagement"]`.
+- `[Area("featureManagement")]` — the MVC area. Combined with the convention-based route from `AbpAspNetCoreMvcModule`, this is what makes Swagger group endpoints under "FeatureManagement".
+- `[Route("api/feature-management/features")]` — the explicit base route. Without it, the convention would build the route from the area and class name; the explicit route gives a stable URL even if class names change.
+
+### Endpoints
+
+| Verb | Path | Method | Body | Returns |
+| --- | --- | --- | --- | --- |
+| `GET` | `/api/feature-management/features?providerName={p}&providerKey={k}` | `GetAsync` | — | `GetFeatureListResultDto` |
+| `PUT` | `/api/feature-management/features?providerName={p}&providerKey={k}` | `UpdateAsync` | `UpdateFeaturesDto` | 204 No Content |
+| `DELETE` | `/api/feature-management/features?providerName={p}&providerKey={k}` | `DeleteAsync` | — | 204 No Content |
+
+Both `providerName` and `providerKey` are query-string. `providerName` is required (the `IFeatureAppService` contract has `[NotNull]` on it); `providerKey` is optional — `null` means "host default for that provider" or "tenant defaults for the current tenant".
+
+### Authorization
+
+The controller itself carries no `[Authorize]` attribute. Authentication is enforced by the `[Authorize]` on `FeatureAppService` (the class-level attribute applies because the controller delegates), and per-call authorization (`ManageHostFeatures` or `AbpTenantManagement.Tenants.ManageFeatures`) is enforced inside `FeatureAppService.CheckProviderPolicy`.
+
+### Verb choice
+
+- `PUT` for update is an explicit design decision — the body replaces the *named subset* of features in `input.Features`, not the entire feature set. Strict REST would call this `PATCH`, but the framework convention treats batch state mutations as `PUT`. There's no `If-Match` ETag — concurrent edits last-writer-wins.
+- `DELETE` clears every override for a `(providerName, providerKey)` pair. There is no per-feature delete endpoint — to "delete" a single feature override, call `UpdateAsync` with `Value = null`.
+
+## Why the dynamic JavaScript proxy is disabled
+
+`AbpFeatureManagementWebModule` (the MVC UI module) calls:
+
+```csharp
+Configure<DynamicJavaScriptProxyOptions>(options =>
+{
+    options.DisableModule(FeatureManagementRemoteServiceConsts.ModuleName);
+});
+```
+
+That is, the dynamic JS proxy script generator (`/abp/api-definition` driven `abp.appPath.featureManagement.features.get(...)` accessors) is **disabled** for this module. Reasons:
+
+1. The MVC UI ships hand-written JavaScript that calls the controller directly; the dynamic proxy would just duplicate it.
+2. The MVC UI consumes `IStringValueType` via the C# Razor model (`Model.FeatureListResultDto.Groups[i].Features[j].ValueType`) and not via a JSON deserializer on the browser side — the dynamic JS proxy would need a TypeScript-equivalent of the polymorphic converter, which it doesn't have.
+
+So the dynamic proxy is silenced. The Blazor and HTTP client packages do **not** use the dynamic JS proxy — they use the static-typed `FeaturesClientProxy` (see [http-api-client](/modules/feature-management/http-api-client)).
+
+## OpenAPI / Swagger surface
+
+`FeaturesController` participates in Swagger generation automatically (the framework wires `AddSwagger` in the host module). The resulting OpenAPI document carries:
+
+- `paths./api/feature-management/features` with the three operations.
+- `components.schemas` for `GetFeatureListResultDto`, `FeatureGroupDto`, `FeatureDto`, `FeatureProviderDto`, `UpdateFeaturesDto`, `UpdateFeatureDto`.
+- A `IStringValueType` schema marked with `discriminator: { propertyName: "name", mapping: { ToggleStringValueType, FreeTextStringValueType, SelectionStringValueType } }`. The discriminator support is automatic via `SchemaFilter` in `AbpAspNetCoreMvcUiSwashbuckleModule` if you reference the Swashbuckle module — otherwise the schema appears as a base type only and consumers must do their own polymorphic deserialization client-side.
+
+## ApiVersioning
+
+The controller has no `[ApiVersion]` attribute. The framework's `AbpAspNetCoreMvcOptions.ConventionalControllers` collection picks it up and applies the global API versioning convention if the host configured one. Microservice gateways routinely fold the Feature Management API under a versioned path like `/v1/feature-management/features`.
+
+## Localization
+
+The HTTP API module **adds** `AbpUiResource` as a base type of `AbpFeatureManagementResource`. That means localization keys like `"Cancel"`, `"Save"`, `"DisplayName:Features"` resolve through this resource at the HTTP boundary. Exception localization (the `Volo.Abp.FeatureManagement:InvalidFeatureValue` code) was already mapped in the Domain.Shared module.
+
+## Composition with API Gateways (Ocelot, YARP, ABP gateway)
+
+A microservice gateway typically:
+
+- References `AbpFeatureManagementHttpApiModule` directly when running an MVC API host.
+- References `AbpFeatureManagementHttpApiClientModule` when running a Blazor / MAUI / gateway-as-client host.
+- Never references both in the same process — the static client proxy `[ExposeServices(typeof(IFeatureAppService), ReplaceServices = true)]` would replace the in-proc `FeatureAppService`.
+
+In the AbpFramework's microservice templates the Auth Server, the Administration service (which hosts `FeaturesController`), and the Web Gateway all reference different combinations.
+
+## Verifying the wire shape
+
+A sample `GET` request and response:
+
+```http
+GET /api/feature-management/features?providerName=T&providerKey=5a47abc1-...
+Authorization: Bearer eyJhbG...
+
+200 OK
+Content-Type: application/json
+
+{
+  "groups": [
+    {
+      "name": "MyApp.Reporting",
+      "displayName": "Reporting",
+      "features": [
+        {
+          "name": "MyApp.Reporting.AllowPdfExport",
+          "displayName": "Allow PDF export",
+          "value": "True",
+          "provider": { "name": "T", "key": "5a47abc1-..." },
+          "description": "...",
+          "valueType": {
+            "name": "ToggleStringValueType",
+            "validator": { "name": "BOOLEAN" }
+          },
+          "depth": 0,
+          "parentName": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+A typical `PUT` request:
+
+```http
+PUT /api/feature-management/features?providerName=T&providerKey=5a47abc1-...
+Content-Type: application/json
+Authorization: Bearer eyJhbG...
+
+{
+  "features": [
+    { "name": "MyApp.Reporting.AllowPdfExport", "value": "False" }
+  ]
+}
+
+204 No Content
+```
+
+The `provider` field in the response includes only the *granting* provider, not the requested provider. If you request `(providerName: "T", providerKey: someTenantId)` and the value actually came from the edition, you'll see `provider.name = "E"` and `provider.key = editionId`. UIs use this to disable input controls for inherited values.
+
+## Error responses
+
+| Error | Status | Body shape |
+| --- | --- | --- |
+| Unauthenticated | 401 | OAuth challenge headers + empty body. |
+| Authorization policy fails | 403 | `{ "error": { "code": "Volo.Authorization:...", "message": "..." } }` |
+| `FeatureValueInvalidException` | 403 (default `AbpBusinessExceptionStatusCode`) | `{ "error": { "code": "Volo.Abp.FeatureManagement:InvalidFeatureValue", "message": "MyFeature feature value is not valid!" } }` |
+| Provider has no mapped policy (`AbpException`) | 500 | `{ "error": { "message": "No policy defined to get/set permissions for the provider 'X'..." } }` |
+
+The default exception filter localizes the `code` via `AbpExceptionLocalizationOptions`. Because the Domain.Shared module maps the `Volo.Abp.FeatureManagement` code namespace to `AbpFeatureManagementResource`, the message is automatically localized to the current culture.
+
+## Gotchas
+
+- **Do not register both the HttpApi and the HttpApi.Client in the same host process.** The client proxy replaces `IFeatureAppService`, so the controller would dispatch through the proxy → HTTP loopback → controller, infinitely.
+- **`DELETE` is unauthenticated relative to `CheckProviderPolicy`.** As noted in the [Application](/modules/feature-management/application) page, `FeatureAppService.DeleteAsync` does not call `CheckProviderPolicy`. The controller's `[Authorize]` only enforces authentication. For custom providers add the check in a derived class.
+- **The JSON converter must match the framework converter.** `AbpFeatureManagementHttpApiModule` reads `ValueValidatorFactoryOptions` via `ExecutePreConfiguredActions` and creates a `StringValueTypeJsonConverter` against the same options object. Custom `IValueValidatorFactory` registrations made in `PreConfigureServices` apply consistently across the framework and MVC layers. Factories registered in `ConfigureServices` (after pre-configure) would miss the MVC side.
+- **`AddIfNotContains` is reference-equality-based.** If something registered a *different instance* of `StringValueTypeJsonConverter` earlier, both end up in the list. System.Text.Json's converter resolution picks the first match by type, so the duplicate is harmless — but it does inflate the converter list.
+- **Routing collisions with custom controllers.** If your host registers a controller mapped at the same `/api/feature-management/features` route, MVC routing throws `AmbiguousMatchException`. Use the static `FeatureManagementRemoteServiceConsts.RemoteServiceName` constant in your tests rather than hard-coded URLs to catch this earlier.
+- For the polymorphic converter, the validator factory pattern, and the `IStringValueType` shape, see [modules/feature-management/domain-shared](/modules/feature-management/domain-shared). For the upstream `IFeatureChecker` contract, see [framework/cross/features](/framework/cross/features).
+
+## Reverse-proxying with YARP
+
+A common gateway configuration places `/api/feature-management/{**catch-all}` on a gateway and routes it to the Administration service. Sample YARP route:
+
+```json
+{
+  "Routes": {
+    "feature-management": {
+      "ClusterId": "admin",
+      "Match": { "Path": "/api/feature-management/{**catch-all}" }
+    }
+  }
+}
+```
+
+The static client proxy from `Volo.Abp.FeatureManagement.HttpApi.Client` sends requests to the gateway base URL (`AbpRemoteServiceOptions.RemoteServices["AbpFeatureManagement"].BaseUrl`), and YARP forwards them transparently. Authentication is carried via the `Authorization` header — no token translation needed if the gateway and the Administration service share the same `Authority`.
+
+## API description
+
+The controller's metadata participates in the framework's `IApiDescriptionFinder` cache. The cache is exposed at `/api/abp/api-definition` and consumed by:
+
+- The static client proxy generator (`abp generate-proxy -t csharp -m featureManagement`).
+- The dynamic client proxy (`Volo.Abp.Http.Client.DynamicProxying`).
+- Swagger / OpenAPI document generation.
+
+Because the dynamic JS proxy is disabled for this module, browser SPAs that build on dynamic proxies for other modules won't see `volo.abp.featureManagement.*` accessors. That's intentional — the Web module ships its own jQuery client.
+
+## Testing the controller in isolation
+
+A minimal xUnit test that posts a feature update via the `TestServer`:
+
+```csharp
+public class FeaturesController_Tests : MyAppHttpApiHostTestBase
+{
+    [Fact]
+    public async Task Should_Update_Feature()
+    {
+        var input = new UpdateFeaturesDto
+        {
+            Features = new List<UpdateFeatureDto>
+            {
+                new() { Name = "MyApp.Reports", Value = "True" }
+            }
+        };
+
+        var response = await GetRequiredService<IFeatureAppService>()
+            .UpdateAsync(TenantFeatureValueProvider.ProviderName, null, input);
+
+        // OR via the controller through HttpClient:
+        var json = JsonSerializer.Serialize(input, GetRequiredService<IJsonSerializer>());
+        var http = GetRequiredService<HttpClient>();
+        var resp = await http.PutAsync($"/api/feature-management/features?providerName=T", new StringContent(json, Encoding.UTF8, "application/json"));
+        resp.EnsureSuccessStatusCode();
+    }
+}
+```
+
+The first form bypasses HTTP — useful for round-trip semantics; the second form exercises the full pipeline including JSON converters.
+
+## Controller-level extension points
+
+The controller is `virtual` end-to-end, so a host can subclass it to add custom behaviour:
+
+```csharp
+[Route("api/feature-management/features")]
+public class MyFeaturesController : FeaturesController
+{
+    public MyFeaturesController(IFeatureAppService featureAppService) : base(featureAppService) {}
+
+    public override async Task UpdateAsync(string providerName, string providerKey, UpdateFeaturesDto input)
+    {
+        Logger.LogInformation("Feature batch update by {User} on {Provider}/{Key}: {Names}",
+            CurrentUser.UserName, providerName, providerKey,
+            string.Join(",", input.Features.Select(f => f.Name)));
+
+        await base.UpdateAsync(providerName, providerKey, input);
+    }
+}
+```
+
+Register the subclass and remove the base controller from MVC's application parts to avoid route collision:
+
+```csharp
+PreConfigure<IMvcBuilder>(mvcBuilder =>
+{
+    // Don't add the upstream assembly's controllers — your subclass replaces them.
+});
+```
+
+A simpler approach is to install a custom `IFeatureAppService` and leave the controller alone — the controller just forwards calls.
+
+## Localization base type inheritance
+
+`AbpFeatureManagementHttpApiModule` adds `AbpUiResource` as a base type of `AbpFeatureManagementResource`. The MVC and Blazor UI modules rely on this for strings like `"Save"`, `"Cancel"`, `"Close"`. If you reference the HttpApi module without the application module (e.g. a gateway), the base-type addition still happens, so other host modules picking up `AbpFeatureManagementResource` get the UI base type too.
+
+## OpenAPI security
+
+The framework's Swashbuckle integration emits the standard `bearerAuth` security scheme on every endpoint by default. The Feature Management endpoints inherit it — no extra configuration. If your host customises Swagger with `RequireAuthorizationOnAll` policies, the Feature Management controller is automatically covered because of its `[Authorize]` (from `FeatureAppService`).
+
+## Forwarded headers
+
+When the API host sits behind a reverse proxy, three headers matter:
+
+- `X-Forwarded-Proto: https` — for `Url.Action` to generate HTTPS URLs in error bodies.
+- `X-Forwarded-For: <client-ip>` — for audit log capture.
+- `__tenant: <tenantId>` (the framework's tenant header) — for tenant resolution.
+
+The Feature Management controller doesn't read any of these directly — but `FeatureAppService.CheckProviderPolicy` does call `CurrentTenant.Id` which depends on `ICurrentTenantAccessor.Current`. If the proxy strips `__tenant`, the framework falls back to other tenant-resolution strategies (claim, subdomain, …).

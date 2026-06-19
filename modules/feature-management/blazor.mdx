@@ -1,0 +1,391 @@
+---
+title: "Volo.Abp.FeatureManagement.Blazor: FeatureManagementModal component and ICurrentApplicationConfigurationCacheResetService"
+sidebarTitle: "Blazor"
+description: "The Blazorise-based FeatureManagementModal, the FeatureSettingManagementComponent, parent-child toggle cascade, validator-driven feedback, and the shared component base."
+---
+
+`Volo.Abp.FeatureManagement.Blazor` is the Blazor UI module shared by Blazor Server and Blazor WebAssembly. It contains:
+
+- `FeatureManagementModal` — the Blazorise modal component with toggle/free-text/selection rendering.
+- `FeatureSettingManagementComponent` — a "Manage Host Features" button consumed by the Setting Management page.
+- A `ISettingComponentContributor` that registers the button under the Setting Management page.
+
+Module class:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebThemingModule),
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpFeaturesModule),
+    typeof(AbpSettingManagementBlazorModule))]
+public class AbpFeatureManagementBlazorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<SettingManagementComponentOptions>(options =>
+        {
+            options.Contributors.Add(new FeatureSettingManagementComponentContributor());
+        });
+
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AbpFeatureManagementResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+`AbpFeaturesModule` is depended on directly — the Blazor module uses `TenantFeatureValueProvider.ProviderName` and `DefaultValueFeatureValueProvider.ProviderName` constants from the framework. `AbpSettingManagementBlazorModule` provides the `SettingComponentGroup` and `ISettingComponentContributor` types.
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `AbpFeatureManagementBlazorModule.cs` | Module class. |
+| `AbpFeatureManagementComponentBase.cs` | Abstract base — sets `LocalizationResource = typeof(AbpFeatureManagementResource)`. |
+| `Components/FeatureManagementModal.razor` | The modal markup (Blazorise). |
+| `Components/FeatureManagementModal.razor.cs` | `partial class FeatureManagementModal` — `OpenAsync`, `SaveAsync`, `DeleteAsync`, toggle cascade. |
+| `Components/FeatureSettingGroup/FeatureSettingManagementComponent.razor` | Button view. |
+| `Components/FeatureSettingGroup/FeatureSettingManagementComponent.razor.cs` | Code-behind — `OnInitializedAsync` permission check + `OnManageHostFeaturesClicked`. |
+| `Components/FeatureSettingGroup/FeatureSettingViewModel.cs` | Trivial DTO: `bool HasManageHostFeaturesPermission`. |
+| `Settings/FeatureSettingManagementComponentContributor.cs` | Plugs `FeatureSettingManagementComponent` into the Setting Management page. |
+
+## Component base
+
+```csharp
+public abstract class AbpFeatureManagementComponentBase : AbpComponentBase
+{
+    protected AbpFeatureManagementComponentBase()
+    {
+        LocalizationResource = typeof(AbpFeatureManagementResource);
+    }
+}
+```
+
+The base sets the localization resource so `L["..."]` inside derived components resolves through `AbpFeatureManagementResource` (which inherits from `AbpUiResource` and `AbpValidationResource`).
+
+## `FeatureManagementModal`
+
+```csharp
+public partial class FeatureManagementModal
+{
+    [Inject] protected IFeatureAppService FeatureAppService { get; set; }
+    [Inject] protected IUiMessageService UiMessageService { get; set; }
+    [Inject] protected IStringLocalizerFactory HtmlLocalizerFactory { get; set; }
+    [Inject] protected IOptions<AbpLocalizationOptions> LocalizationOptions { get; set; }
+    [Inject] protected ICurrentApplicationConfigurationCacheResetService
+        CurrentApplicationConfigurationCacheResetService { get; set; }
+
+    protected Modal Modal;
+
+    protected string ProviderName;
+    protected string ProviderKey;
+    protected string SelectedTabName;
+
+    protected List<FeatureGroupDto> Groups { get; set; }
+    protected Dictionary<string, bool> ToggleValues;
+    protected Dictionary<string, string> SelectionStringValues;
+    // ...
+}
+```
+
+### `OpenAsync`
+
+```csharp
+public virtual async Task OpenAsync([NotNull] string providerName, string providerKey = null)
+{
+    try
+    {
+        ProviderName = providerName;
+        ProviderKey = providerKey;
+        ToggleValues = new Dictionary<string, bool>();
+        SelectionStringValues = new Dictionary<string, string>();
+
+        var result = await FeatureAppService.GetAsync(ProviderName, ProviderKey);
+        Groups = result?.Groups ?? new List<FeatureGroupDto>();
+
+        if (Groups.Any())
+            SelectedTabName = GetNormalizedGroupName(Groups.First().Name);
+
+        foreach (var featureGroupDto in Groups)
+        foreach (var featureDto in featureGroupDto.Features)
+        {
+            if (featureDto.ValueType is ToggleStringValueType)
+                ToggleValues.Add(featureDto.Name, bool.Parse(featureDto.Value));
+            if (featureDto.ValueType is SelectionStringValueType)
+                SelectionStringValues.Add(featureDto.Name, featureDto.Value);
+        }
+
+        await InvokeAsync(Modal.Show);
+    }
+    catch (Exception ex) { await HandleErrorAsync(ex); }
+}
+```
+
+Notable:
+
+- The component splits feature values into typed scratch dictionaries (`ToggleValues : Dictionary<string,bool>`, `SelectionStringValues : Dictionary<string,string>`). Free-text values are mutated directly on `FeatureDto.Value` via `OnFeatureValueChangedAsync`.
+- `bool.Parse(featureDto.Value)` will throw `FormatException` on `null` — the modal assumes toggle features always have a value. That's safe because `DefaultValueFeatureManagementProvider` always answers with the static default for toggle features (the default is "True" or "False" — never null in a well-formed `IFeatureDefinitionProvider`).
+- `SelectedTabName = GetNormalizedGroupName(Groups.First().Name)` initialises Blazorise's `Tabs` component on the first group.
+
+### `GetNormalizedGroupName`
+
+```csharp
+protected virtual string GetNormalizedGroupName(string name)
+    => "FeatureGroup_" + name.Replace(".", "_");
+```
+
+Same pattern as the MVC view — feature group names may contain dots, and tab IDs may not.
+
+### `SaveAsync`
+
+```csharp
+protected virtual async Task SaveAsync()
+{
+    try
+    {
+        var features = new UpdateFeaturesDto
+        {
+            Features = Groups.SelectMany(g => g.Features).Select(f => new UpdateFeatureDto
+            {
+                Name = f.Name,
+                Value = f.ValueType is ToggleStringValueType ? ToggleValues[f.Name].ToString() :
+                        f.ValueType is SelectionStringValueType ? SelectionStringValues[f.Name] :
+                        f.Value
+            }).ToList()
+        };
+
+        await FeatureAppService.UpdateAsync(ProviderName, ProviderKey, features);
+        await CurrentApplicationConfigurationCacheResetService.ResetAsync();
+        await InvokeAsync(Modal.Hide);
+    }
+    catch (Exception ex) { await HandleErrorAsync(ex); }
+}
+```
+
+- The save converts the scratch dictionaries back into a single `UpdateFeaturesDto`.
+- After the round-trip, `ICurrentApplicationConfigurationCacheResetService.ResetAsync()` invalidates the *Blazor application-configuration cache* — a server-side cache feeding `/api/abp/application-configuration`. Without this, the Blazor admin UI keeps showing old feature flags until the next hard refresh.
+- Exceptions are funneled through `HandleErrorAsync` (inherited from `AbpComponentBase`), which translates `AbpAuthorizationException` to a permission warning toast and other exceptions to a generic error toast via `IUiMessageService`.
+
+### `DeleteAsync`
+
+```csharp
+public virtual async Task DeleteAsync([NotNull] string providerName, string providerKey = null)
+{
+    try
+    {
+        if (!await Message.Confirm(L["AreYouSureToResetToDefault"])) return;
+        await FeatureAppService.DeleteAsync(ProviderName, ProviderKey);
+        await Message.Success(L["ResetedToDefault"]);
+        await CloseModal();
+    }
+    catch (Exception ex) { await HandleErrorAsync(ex); }
+}
+```
+
+Note `ProviderName`/`ProviderKey` come from the *currently-open* modal, not the method parameters — the public parameters exist for the contract but the body uses the captured field state. The user gets a confirmation prompt (resource `AreYouSureToResetToDefault`) before any destructive action.
+
+### `IsDisabled`
+
+```csharp
+protected virtual bool IsDisabled(string providerName)
+    => providerName != ProviderName && providerName != DefaultValueFeatureValueProvider.ProviderName;
+```
+
+Same logic as the MVC modal — disable the input when the granting provider is neither the current request scope nor the default scope.
+
+### `OnFeatureValueChangedAsync`
+
+```csharp
+protected virtual async Task OnFeatureValueChangedAsync(string value, FeatureDto feature)
+{
+    if (feature?.ValueType?.Validator.IsValid(value) == true)
+    {
+        feature.Value = value;
+    }
+    else
+    {
+        await UiMessageService.Warn(
+            L["Volo.Abp.FeatureManagement:InvalidFeatureValue", feature.DisplayName]);
+    }
+}
+```
+
+The validator is invoked *client-side* for immediate feedback. This is the same `IValueValidator` instance used server-side — the polymorphic JSON converter (Domain.Shared) deserializes `feature.ValueType.Validator` into the right concrete (e.g. `NumericValueValidator` for a numeric feature). If the value fails validation, the change is rejected and the user sees a warning.
+
+Server-side validation in `FeatureManager.SetAsync` is the safety net — even if a misbehaving client skips this method, the server still throws `FeatureValueInvalidException`.
+
+### Parent-child toggle cascade
+
+```csharp
+protected virtual Task OnSelectedValueChangedAsync(bool value, FeatureDto feature)
+{
+    ToggleValues[feature.Name] = value;
+    if (value) CheckParents(feature.ParentName);
+    else UncheckChildren(feature.Name);
+    return Task.CompletedTask;
+}
+
+protected virtual void CheckParents(string parentName)
+{
+    if (parentName.IsNullOrWhiteSpace()) return;
+    foreach (var featureGroupDto in Groups)
+    foreach (var featureDto in featureGroupDto.Features)
+    {
+        if (featureDto.Name == parentName && ToggleValues.ContainsKey(featureDto.Name))
+        {
+            ToggleValues[featureDto.Name] = true;
+            CheckParents(featureDto.ParentName);
+        }
+    }
+}
+
+protected virtual void UncheckChildren(string featureName)
+{
+    foreach (var featureGroupDto in Groups)
+    foreach (var featureDto in featureGroupDto.Features)
+    {
+        if (featureDto.ParentName == featureName && ToggleValues.ContainsKey(featureDto.Name))
+        {
+            ToggleValues[featureDto.Name] = false;
+            UncheckChildren(featureDto.Name);
+        }
+    }
+}
+```
+
+Behaviour:
+
+- Checking a child toggle automatically enables all ancestors. This matches the semantic of `FeatureDefinition.Parent` — a child feature is meaningful only when its parents are enabled.
+- Unchecking a parent toggle automatically disables all descendants. The reverse implication — disabled parent means disabled children.
+- Both walks are O(features × depth) — fine for the typical 10-100 features per group, slow for thousands.
+- The cascade only operates on the in-memory `ToggleValues` dictionary. Free-text and selection children are not auto-cleared.
+
+### `ClosingModal`
+
+```csharp
+protected virtual Task ClosingModal(ModalClosingEventArgs eventArgs)
+{
+    eventArgs.Cancel = eventArgs.CloseReason == CloseReason.FocusLostClosing;
+    return Task.CompletedTask;
+}
+```
+
+Blocks closing the modal by clicking outside it — the user must explicitly click "Save" or "Cancel". This prevents accidental loss of edits.
+
+### `CreateStringLocalizer`
+
+```csharp
+protected virtual IStringLocalizer CreateStringLocalizer(string resourceName)
+    => StringLocalizerFactory.CreateByResourceNameOrNull(resourceName)
+       ?? StringLocalizerFactory.CreateDefaultOrNull();
+```
+
+Each feature is localized via the resource that the framework's `FeatureDefinition.DisplayName` was registered against. The modal uses `LocalizationOptions.GetResourcesByBaseType()` to figure out which resource to use per group and per feature — the Razor view-side detail.
+
+## `FeatureSettingManagementComponent`
+
+```csharp
+public partial class FeatureSettingManagementComponent : AbpComponentBase
+{
+    [Inject] protected PermissionChecker PermissionChecker { get; set; }
+    protected FeatureManagementModal FeatureManagementModal;
+    protected FeatureSettingViewModel Settings;
+
+    public FeatureSettingManagementComponent()
+    {
+        LocalizationResource = typeof(AbpFeatureManagementResource);
+    }
+
+    protected async override Task OnInitializedAsync()
+    {
+        Settings = new FeatureSettingViewModel
+        {
+            HasManageHostFeaturesPermission =
+                await AuthorizationService.IsGrantedAsync(FeatureManagementPermissions.ManageHostFeatures)
+        };
+    }
+
+    protected virtual async Task OnManageHostFeaturesClicked()
+    {
+        await FeatureManagementModal.OpenAsync(TenantFeatureValueProvider.ProviderName);
+    }
+}
+```
+
+This is the "Manage Host Features" button you see on the Settings page. `OpenAsync(TenantFeatureValueProvider.ProviderName)` with no `providerKey` opens the modal in host-defaults mode (server-side `FeatureAppService` picks `ManageHostFeatures`).
+
+The component instantiates a `FeatureManagementModal` as a child — Blazorise modals are component instances captured via `@ref`.
+
+## `FeatureSettingManagementComponentContributor`
+
+```csharp
+public class FeatureSettingManagementComponentContributor : ISettingComponentContributor
+{
+    public virtual async Task ConfigureAsync(SettingComponentCreationContext context)
+    {
+        if (!await CheckPermissionsInternalAsync(context)) return;
+
+        var l = context.ServiceProvider
+            .GetRequiredService<IStringLocalizer<AbpFeatureManagementResource>>();
+        context.Groups.Add(
+            new SettingComponentGroup(
+                "Volo.Abp.Feature",
+                l["Permission:FeatureManagement"],
+                typeof(FeatureSettingManagementComponent)
+            )
+        );
+    }
+
+    public virtual async Task<bool> CheckPermissionsAsync(SettingComponentCreationContext context)
+        => await CheckPermissionsInternalAsync(context);
+
+    protected virtual async Task<bool> CheckPermissionsInternalAsync(SettingComponentCreationContext context)
+    {
+        var authorizationService = context.ServiceProvider.GetRequiredService<IAuthorizationService>();
+        return await authorizationService.IsGrantedAsync(FeatureManagementPermissions.ManageHostFeatures);
+    }
+}
+```
+
+Differences from the MVC contributor:
+
+- The MVC `SettingPageContributorBase` uses a string-array `RequiredPermissions(...)` set once at construction. The Blazor `ISettingComponentContributor` checks permissions at component-creation time per context, so it is async.
+- The group name `"Volo.Abp.Feature"` (without the trailing "Management") is intentional — it differs from the MVC group name `"Volo.Abp.FeatureManagement"`. Don't expect cross-flavour identity.
+
+## Triggering the modal from outside
+
+Other modules (e.g. Tenant Management Blazor) capture the `FeatureManagementModal` via `@ref` and call `OpenAsync(TenantFeatureValueProvider.ProviderName, tenantId.ToString())`:
+
+```razor
+<FeatureManagementModal @ref="_featureModal" />
+
+@code {
+    private FeatureManagementModal _featureModal;
+
+    private async Task OnManageFeaturesForTenant(Guid tenantId)
+    {
+        await _featureModal.OpenAsync(TenantFeatureValueProvider.ProviderName, tenantId.ToString());
+    }
+}
+```
+
+The `OpenAsync` signature with default `providerKey = null` covers both host-default and per-tenant flows.
+
+## `ICurrentApplicationConfigurationCacheResetService`
+
+Injected from `Volo.Abp.AspNetCore.Components.Web.Configuration`, the reset service tells the framework to invalidate the cached `ApplicationConfigurationDto` for the current user. The Blazor app re-fetches it on the next request — picking up the updated feature flags.
+
+In Blazor Server this is an in-memory cache; in Blazor WebAssembly it's a `localStorage`-backed cache. Both honour the reset call.
+
+## Gotchas
+
+- **`bool.Parse` on a `null` toggle value throws.** Don't ship toggle features without a `DefaultValue` of `"True"` or `"False"` in the `IFeatureDefinitionProvider` — the modal will crash on open.
+- **Free-text values are mutated directly on `FeatureDto.Value`.** That makes `OnFeatureValueChangedAsync` simpler but means the validator must reject bad values *before* the change. If you remove the validator check, the bad value is staged for save.
+- **The Blazor contributor group name diverges from MVC.** If you have automation reading the Settings tabs, don't assume identity.
+- **`ClosingModal` blocks outside-click close.** Custom themes that change `Modal`'s default behaviour might bypass this — verify the new theme still respects `ModalClosingEventArgs.Cancel`.
+- **Parent-child cascade is for toggles only.** Free-text or selection children of a disabled toggle parent are not cleared. Define your features with mostly-toggle parents to make the cascade meaningful.
+- **`FeatureManagementModal` keeps `Groups` and dictionaries in component state.** Re-opening for a different tenant re-uses the same component instance — the previous tenant's values are repopulated from the new `GetAsync` response. Don't be surprised if a slow API call shows stale data briefly.
+- For the upstream `IFeatureChecker`, `IStringValueType`, `ToggleStringValueType`/`FreeTextStringValueType`/`SelectionStringValueType`, see [framework/cross/features](/framework/cross/features). The Blazor modal's per-type render branches mirror those abstractions.

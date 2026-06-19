@@ -1,0 +1,205 @@
+---
+title: "Setting Management Module Overview"
+description: "End-to-end tour of the Volo.Abp.SettingManagement.* packages — the persistent, per-tenant, per-user value store that sits on top of the framework's static SettingDefinition system."
+---
+
+The **Setting Management module** turns the in-memory `SettingDefinition` catalogue exposed by `framework/cross/settings` into a *queryable, writable, multi-scope value store*. The framework alone gives you a way to declare settings and read them from configuration, classes, or static defaults; this module adds a database-backed `Setting` aggregate, an admin UI, an HTTP API for email/timezone settings, and pluggable per-tenant / per-user / per-global value providers.
+
+Every package in this section ships under `modules/setting-management/src/Volo.Abp.SettingManagement.*` in the [abpframework/abp](https://github.com/abpframework/abp) repository. The module is split along the standard ABP DDD layering so applications can pull in just the layers they need — for example a Blazor WebAssembly app references `HttpApi.Client` + `Blazor`, while a monolithic MVC host references everything from `Domain` through `Web`.
+
+## Package map
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.SettingManagement.Domain.Shared` | Constants, localization resources, the `SettingManagementFeatures` feature group, validation. Safe to reference from any layer. |
+| `Volo.Abp.SettingManagement.Domain` | `Setting` aggregate, repositories, `ISettingManagementStore`, the five `ISettingManagementProvider` implementations, `SettingManager`, the dynamic-definition store, and `StaticSettingSaver`. |
+| `Volo.Abp.SettingManagement.Application.Contracts` | `IEmailSettingsAppService`, `ITimeZoneSettingsAppService`, DTOs, permission and remote-service constants. |
+| `Volo.Abp.SettingManagement.Application` | `EmailSettingsAppService`, `TimeZoneSettingsAppService` and the shared `SettingManagementAppServiceBase`. |
+| `Volo.Abp.SettingManagement.EntityFrameworkCore` | `SettingManagementDbContext`, `EfCoreSettingRepository`, `EfCoreSettingDefinitionRecordRepository`, model-builder extensions. |
+| `Volo.Abp.SettingManagement.MongoDB` | `SettingManagementMongoDbContext`, `MongoSettingRepository`, `MongoSettingDefinitionRecordRepository`. |
+| `Volo.Abp.SettingManagement.HttpApi` | `EmailSettingsController`, `TimeZoneSettingsController` (auto-API controllers in `/api/setting-management/*`). |
+| `Volo.Abp.SettingManagement.HttpApi.Client` | Generated static client proxies for the two app services. |
+| `Volo.Abp.SettingManagement.Web` | MVC Razor Pages UI (`/SettingManagement`), tab-based dynamic page contributors, view components. |
+| `Volo.Abp.SettingManagement.Blazor` | Blazorise-based UI (`/setting-management`), `ISettingComponentContributor`. |
+| `Volo.Abp.SettingManagement.Blazor.Server` | Thin wrapper that pulls in `AbpAspNetCoreComponentsServerThemingModule`. |
+| `Volo.Abp.SettingManagement.Blazor.WebAssembly` | WebAssembly wrapper (analogous to Blazor.Server). |
+| `Volo.Abp.SettingManagement.Installer` | NuGet metapackage used by the ABP CLI. |
+
+The remainder of this page is a high-altitude tour. Each layer has its own deep-dive: [Domain.Shared](/modules/setting-management/domain-shared), [Domain](/modules/setting-management/domain), [Application.Contracts](/modules/setting-management/application-contracts), [Application](/modules/setting-management/application), [EF Core](/modules/setting-management/efcore), [MongoDB](/modules/setting-management/mongodb), [HTTP API](/modules/setting-management/http-api), [HTTP API client](/modules/setting-management/http-api-client), [Web (MVC)](/modules/setting-management/web), [Blazor](/modules/setting-management/blazor), and [Blazor.Server](/modules/setting-management/blazor-server).
+
+## The pipeline: from `SettingDefinition` to persisted row
+
+The framework's `ISettingProvider` (see `framework/cross/settings`) is a *read-only*, layered resolver that walks a list of `ISettingValueProvider`s (default → configuration → global → tenant → user). The setting-management module:
+
+1. **Exposes a writeable mirror** of that pipeline through `ISettingManager` and `ISettingManagementProvider`. Each value-provider gets a matching *management* provider that can also `SetAsync` and `ClearAsync`.
+2. **Backs the global/tenant/user providers with a database table** through `Setting` (`AbpSettings`) and `ISettingManagementStore`.
+3. **Optionally persists definitions themselves** through `SettingDefinitionRecord` (`AbpSettingDefinitions`) so you can edit setting metadata at runtime (the *dynamic setting store* — disabled by default).
+
+### Provider order
+
+`AbpSettingManagementDomainModule.ConfigureServices` registers exactly five providers, in this order:
+
+```csharp
+Configure<SettingManagementOptions>(options =>
+{
+    options.Providers.Add<DefaultValueSettingManagementProvider>();
+    options.Providers.Add<ConfigurationSettingManagementProvider>();
+    options.Providers.Add<GlobalSettingManagementProvider>();
+    options.Providers.Add<TenantSettingManagementProvider>();
+    options.Providers.Add<UserSettingManagementProvider>();
+});
+```
+
+`SettingManager` reads them in reverse, so `User` wins over `Tenant`, which wins over `Global`, which wins over `Configuration`, which wins over `Default`. Each provider's `Name` matches the corresponding `ISettingValueProvider.ProviderName` (`U`, `T`, `G`, `C`, `D`) defined in `Volo.Abp.Settings`, so the read pipeline and the write pipeline see the same scope identifiers.
+
+### Two stores, two responsibilities
+
+* **`ISettingManagementStore`** persists *values* keyed by `(name, providerName, providerKey)`. Implemented by `SettingManagementStore`, which delegates to `ISettingRepository` and a `IDistributedCache<SettingCacheItem>`.
+* **`ISettingDefinitionRecordRepository`** persists *definitions* (name, display name, default value, providers, encryption flag). Implemented by EF Core and MongoDB equivalents. `DynamicSettingDefinitionStore` lazy-loads them into an in-memory cache and uses a Redis-stamped invalidation token to coordinate refresh across nodes.
+
+## Read vs. write asymmetry
+
+A subtle but important distinction is that the framework's read pipeline and the management write pipeline use *different* value providers but the same provider names. The framework's `ISettingValueProvider` chain looks like:
+
+```
+DefaultValueSettingValueProvider     ("D")
+ConfigurationSettingValueProvider    ("C")
+GlobalSettingValueProvider           ("G")
+TenantSettingValueProvider           ("T")
+UserSettingValueProvider             ("U")
+```
+
+The setting-management chain mirrors it with `ISettingManagementProvider`:
+
+```
+DefaultValueSettingManagementProvider     ("D")  — read-only, throws on Set
+ConfigurationSettingManagementProvider    ("C")  — read-only, throws on Set
+GlobalSettingManagementProvider           ("G")  — writes to ISettingManagementStore
+TenantSettingManagementProvider           ("T")  — writes to ISettingManagementStore
+UserSettingManagementProvider             ("U")  — writes to ISettingManagementStore
+```
+
+Both chains agree on the order and on the provider names, so an `ISettingManagementProvider` written for the `G` provider name can be read back by the framework's `GlobalSettingValueProvider`. The framework's `ISettingStore` (single facade for all three write-backed providers) is implemented in this module by `SettingStore`, a thin adapter that delegates to `ISettingManagementStore`.
+
+## Multi-tenancy posture
+
+The module is **host-database only**:
+
+* Both `SettingManagementDbContext` and `ISettingManagementDbContext` are decorated with `[IgnoreMultiTenancy]`.
+* Tenant-scoped values are still stored in the host's `AbpSettings` row using `providerName = "T"` and `providerKey = tenantId`. The `TenantSettingManagementProvider` resolves the provider key from `ICurrentTenant` when none is passed.
+* `[IgnoreMultiTenancy]` also lives on `SettingCacheItem` so the cache keys aren't prefixed per tenant — they're shared across tenants because the provider key already encodes the tenant.
+
+The model builder extension `SettingManagementDbContextModelBuilderExtensions.ConfigureSettingManagement` short-circuits if `builder.IsTenantOnlyDatabase()` returns `true` — there are no tenant-DB tables for this module.
+
+## Feature gating
+
+The module ships its own `FeatureDefinitionProvider`:
+
+```csharp
+public class SettingManagementFeatureDefinitionProvider : FeatureDefinitionProvider
+{
+    public override void Define(IFeatureDefinitionContext context)
+    {
+        var group = context.AddGroup(SettingManagementFeatures.GroupName, L("Feature:SettingManagementGroup"));
+
+        var settingEnableFeature = group.AddFeature(
+            SettingManagementFeatures.Enable, "true", ..., new ToggleStringValueType(),
+            isAvailableToHost: false);
+
+        settingEnableFeature.CreateChild(
+            SettingManagementFeatures.AllowChangingEmailSettings, "false", ...,
+            new ToggleStringValueType(), isAvailableToHost: false);
+    }
+}
+```
+
+Both features are *tenant-only* (`isAvailableToHost: false`). The MVC Razor Page is decorated with `[RequiresFeature(SettingManagementFeatures.Enable)]`, the menu contributors call `RequireFeatures(...)`, and the application service guards its methods with `FeatureChecker.CheckEnabledAsync(...)`. See [Domain.Shared](/modules/setting-management/domain-shared) for the full table.
+
+## Permissions
+
+`SettingManagementPermissionDefinitionProvider` defines three permission keys under the `SettingManagement` group:
+
+* `SettingManagement.Emailing` — required to read or write SMTP settings.
+* `SettingManagement.Emailing.Test` — child of `Emailing`, required to send a test email.
+* `SettingManagement.TimeZone` — required to read or write the timezone setting.
+
+The `Emailing` permission has an attached `AllowChangingEmailSettingsFeatureSimpleStateChecker` that disables the permission entirely for tenants when the `AllowChangingEmailSettings` feature is off — so even an explicitly granted role won't surface the email tab to tenants whose host has not enabled it.
+
+## Caching and invalidation
+
+Two independent caches matter:
+
+1. **Value cache** — `IDistributedCache<SettingCacheItem>` keyed by `pn:{providerName},pk:{providerKey},n:{name}`. Written through `SettingManagementStore.SetAsync` and explicitly *evicted* by `SettingCacheItemInvalidator`, a local-event handler that listens for `EntityChangedEventData<Setting>` and respects the unit of work.
+2. **Dynamic-definition cache** — `DynamicSettingDefinitionStoreInMemoryCache`, refreshed at most every 30 seconds and gated by a distributed stamp stored under `{KeyPrefix}_AbpInMemorySettingCacheStamp`. Updates acquire an `IAbpDistributedLock` named `{KeyPrefix}_Common_AbpSettingUpdateLock` to avoid stampedes.
+
+The module also pre-loads both caches at application start via `AbpSettingManagementDomainModule.OnApplicationInitializationAsync`, using a Polly `WaitAndRetryAsync(8, 2^n*10s)` policy around `IStaticSettingSaver.SaveAsync()`. The initialization is *fire-and-forget*; you can await it via `GetInitializeDynamicSettingsTask()` if you need deterministic startup.
+
+## Dynamic settings: opt-in, not default
+
+`SettingManagementOptions` controls two switches:
+
+```csharp
+public class SettingManagementOptions
+{
+    public ITypeList<ISettingManagementProvider> Providers { get; }
+
+    /// <summary>Default: true.</summary>
+    public bool SaveStaticSettingsToDatabase { get; set; } = true;
+
+    /// <summary>Default: false.</summary>
+    public bool IsDynamicSettingStoreEnabled { get; set; }
+}
+```
+
+* `SaveStaticSettingsToDatabase` — when `true`, every `SettingDefinition` declared in code is serialized via `SettingDefinitionSerializer` into a `SettingDefinitionRecord` row and kept in sync with a content hash. Required for the dynamic store to work.
+* `IsDynamicSettingStoreEnabled` — when `true`, `DynamicSettingDefinitionStore` (registered via `[Dependency(ReplaceServices = true)]` on `IDynamicSettingDefinitionStore`) returns runtime definitions from the database. Otherwise it returns `Array.Empty<SettingDefinition>()` and the framework only sees the static definitions in code.
+
+Both flags are forced to `false` when `context.Services.IsDataMigrationEnvironment()` is true, so migrations don't trigger setting initialization.
+
+## REST surface and UI
+
+`AbpSettingManagementHttpApiModule` hosts two MVC controllers:
+
+* `EmailSettingsController` at `api/setting-management/emailing`
+* `TimeZoneSettingsController` at `api/setting-management/timezone`
+
+Both share the remote-service name `SettingManagement` (constant `SettingManagementRemoteServiceConsts.RemoteServiceName`). The HTTP API client module generates strongly-typed static proxies (`EmailSettingsClientProxy`, `TimeZoneSettingsClientProxy`).
+
+The UI is intentionally *generic*. The MVC page at `/SettingManagement/Index` and the Blazor page at `/setting-management` both render a left-hand vertical pill nav and a tab body, where each tab is contributed by an `ISettingPageContributor` (MVC) or `ISettingComponentContributor` (Blazor). The module ships two built-in contributors (`EmailingPageContributor`, `TimeZonePageContributor`) but applications can register more via `SettingManagementPageOptions.Contributors.Add(...)` or `SettingManagementComponentOptions.Contributors.Add(...)`.
+
+## End-to-end request walkthrough — reading a setting
+
+To make the moving parts concrete, follow what happens when a tenant user opens the *Settings → Email* tab in the MVC UI:
+
+1. The browser GETs `/SettingManagement/Index`. The `IndexModel.OnGetAsync` page handler instantiates `SettingPageContributorManager`, which calls `SettingManagementPageOptions.Contributors` (registered in `AbpSettingManagementWebModule`).
+2. Each contributor's required permissions and tenant-side features are batch-evaluated. The Email tab survives if `AllowChangingEmailSettings` is enabled for the tenant *and* the role has `SettingManagement.Emailing`.
+3. The page renders a pill nav. Client JS makes an AJAX call to `OnPostRenderViewAsync("Volo.Abp.EmailSetting")`, which invokes `EmailSettingGroupViewComponent`.
+4. The view component calls `IEmailSettingsAppService.GetAsync()`. The interceptor evaluates `[Authorize(SettingManagementPermissions.Emailing)]` and `FeatureChecker.CheckEnabledAsync(SettingManagementFeatures.Enable)` before forwarding.
+5. `EmailSettingsAppService.GetAsync` reads global values through `ISettingProvider` (framework read pipeline), then overrides four tenant-specific fields via `ISettingManager.GetOrNullForTenantAsync(..., fallback: false)`.
+6. Each read in step 5 traverses `SettingManager → ISettingManagementProvider → SettingManagementStore → IDistributedCache<SettingCacheItem>`. On cache miss, the store loads every row for the (`T`, `tenantId`) tuple and warms the cache.
+7. AutoMapper maps `EmailSettingsDto` to `UpdateEmailSettingsViewModel` (with form-bound `[Display]` labels) and the view renders.
+
+A subsequent `POST` to the same view component's underlying form follows the same chain in reverse — through `SettingManager.SetForTenantOrGlobalAsync`, into `SettingManagementStore.SetAsync` (which writes the row and then `Cache.SetAsync(..., considerUow: true)`), and finally back to `SendTestEmailAsync` if the user clicks the test button.
+
+## Comparison with the framework's read-only pipeline
+
+| Concern | Framework `Volo.Abp.Settings` | Setting Management module |
+| --- | --- | --- |
+| Read settings | `ISettingProvider.GetOrNullAsync(name)` | `ISettingManager.GetOrNullAsync(name, providerName, providerKey, fallback)` |
+| Write settings | not supported | `ISettingManager.SetAsync(...)` / extension methods |
+| Storage | none — pure in-memory `SettingDefinition` catalogue | `Setting` table + optional `SettingDefinitionRecord` table |
+| Per-tenant overrides | resolved at read time via `TenantSettingValueProvider` (which delegates to `ISettingStore`) | stored as rows with `ProviderName = "T"` |
+| Per-user overrides | resolved via `UserSettingValueProvider` | stored as rows with `ProviderName = "U"` |
+| Cache | the framework caches *definitions*; values are not cached at the framework layer | `IDistributedCache<SettingCacheItem>` keyed by `pn:{pn},pk:{pk},n:{name}` |
+| Encryption | `ISettingEncryptionService` applied on read | applied symmetrically on write through `SettingManager` |
+| Admin UI | none | MVC `/SettingManagement` and Blazor `/setting-management` |
+
+The two are designed to compose: the framework provides the read pipeline; this module supplies the writeable backing store for the global, tenant, and user providers via `SettingStore : ISettingStore` (Domain layer adapter).
+
+## Where to go next
+
+* For the constants, localization keys, and feature/permission definitions, jump to [Domain.Shared](/modules/setting-management/domain-shared).
+* For `Setting`, the providers, `SettingManager`, and the dynamic store, see [Domain](/modules/setting-management/domain).
+* For the email & timezone DTOs and app-service contracts, see [Application.Contracts](/modules/setting-management/application-contracts).
+* For the EF Core mapping (`AbpSettings`, `AbpSettingDefinitions`, unique indexes, Oracle quirks), see [EF Core](/modules/setting-management/efcore).
+* For the framework-level read pipeline that this module plugs into, cross-reference `framework/cross/settings`.

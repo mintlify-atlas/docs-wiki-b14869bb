@@ -1,0 +1,351 @@
+---
+title: "Volo.Abp.FeatureManagement.EntityFrameworkCore: DbContext and repositories"
+sidebarTitle: "EF Core"
+description: "FeatureManagementDbContext, the three EfCoreRepository implementations, fluent OnModelCreating with unique indexes on (Name, ProviderName, ProviderKey), and IgnoreMultiTenancy at the context level."
+---
+
+`Volo.Abp.FeatureManagement.EntityFrameworkCore` plugs the Domain module's three repository contracts (`IFeatureValueRepository`, `IFeatureDefinitionRecordRepository`, `IFeatureGroupDefinitionRecordRepository`) into Entity Framework Core. It is a thin layer — most of the work is the fluent model configuration.
+
+Module class:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementDomainModule),
+    typeof(AbpEntityFrameworkCoreModule))]
+public class AbpFeatureManagementEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<FeatureManagementDbContext>(options =>
+        {
+            options.AddRepository<FeatureGroupDefinitionRecord, EfCoreFeatureGroupDefinitionRecordRepository>();
+            options.AddRepository<FeatureDefinitionRecord, EfCoreFeatureDefinitionRecordRepository>();
+            options.AddDefaultRepositories<IFeatureManagementDbContext>();
+            options.AddRepository<FeatureValue, EfCoreFeatureValueRepository>();
+        });
+    }
+}
+```
+
+`AddDefaultRepositories<IFeatureManagementDbContext>()` registers `IRepository<FeatureValue>` etc. against the interface — that allows the host to swap `FeatureManagementDbContext` for a derived class (more on that below). The three explicit `AddRepository` calls register the **named** repositories that the Domain layer resolves by interface (`IFeatureValueRepository` etc).
+
+## File inventory
+
+| Path under `Volo/Abp/FeatureManagement/EntityFrameworkCore/` | Role |
+| --- | --- |
+| `AbpFeatureManagementEntityFrameworkCoreModule.cs` | Module class — wires `AddAbpDbContext` and the three custom repositories. |
+| `IFeatureManagementDbContext.cs` | Interface form of the context. Used as the generic argument to `EfCoreRepository` to allow user replacement. |
+| `FeatureManagementDbContext.cs` | Concrete `AbpDbContext<FeatureManagementDbContext>` — three `DbSet`s. |
+| `FeatureManagementDbContextModelCreatingExtensions.cs` | The `ConfigureFeatureManagement` extension method called from `OnModelCreating`. |
+| `EfCoreFeatureValueRepository.cs` | Implements `IFeatureValueRepository`. |
+| `EfCoreFeatureDefinitionRecordRepository.cs` | Implements `IFeatureDefinitionRecordRepository`. |
+| `EfCoreFeatureGroupDefinitionRecordRepository.cs` | Implements `IFeatureGroupDefinitionRecordRepository` — empty class, inherits the base CRUD. |
+
+## `FeatureManagementDbContext`
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public class FeatureManagementDbContext :
+    AbpDbContext<FeatureManagementDbContext>, IFeatureManagementDbContext
+{
+    public DbSet<FeatureGroupDefinitionRecord> FeatureGroups { get; set; }
+    public DbSet<FeatureDefinitionRecord> Features { get; set; }
+    public DbSet<FeatureValue> FeatureValues { get; set; }
+
+    public FeatureManagementDbContext(DbContextOptions<FeatureManagementDbContext> options)
+        : base(options) {}
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureFeatureManagement();
+    }
+}
+```
+
+Two attributes to note:
+
+- `[IgnoreMultiTenancy]` — the whole context is marked tenant-agnostic. Even when consuming code runs under a `TenantId` data-filter, queries against `FeatureValues` see all rows regardless of `TenantId` because the entities don't carry that column at all. The `ProviderKey` field is the tenant discriminator for the feature *value*, applied at the application layer, not at the EF Core filter.
+- `[ConnectionStringName("AbpFeatureManagement")]` — `IConnectionStringResolver` looks up `ConnectionStrings:AbpFeatureManagement` from `IConfiguration` and falls back to `ConnectionStrings:Default` if absent. Most apps consolidate this into the `Default` connection string.
+
+The interface form is what the repositories actually depend on:
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpFeatureManagementDbProperties.ConnectionStringName)]
+public interface IFeatureManagementDbContext : IEfCoreDbContext
+{
+    DbSet<FeatureGroupDefinitionRecord> FeatureGroups { get; }
+    DbSet<FeatureDefinitionRecord> Features { get; }
+    DbSet<FeatureValue> FeatureValues { get; }
+}
+```
+
+That indirection lets a host app replace `FeatureManagementDbContext` with a derived `MyAppFeatureManagementDbContext` and still have the module's repositories resolve correctly. Use:
+
+```csharp
+context.Services.AddAbpDbContext<MyAppFeatureManagementDbContext>(options =>
+{
+    options.ReplaceDbContext<IFeatureManagementDbContext>();
+    // ... your other DbSets
+});
+```
+
+## Model configuration
+
+`FeatureManagementDbContextModelCreatingExtensions.ConfigureFeatureManagement` is the canonical way to configure the entities — and the canonical way to *combine* them with your application's tables. If you want a single `MyAppDbContext` carrying every module's tables (the consolidated pattern), call `builder.ConfigureFeatureManagement()` from your `OnModelCreating`.
+
+```csharp
+public static void ConfigureFeatureManagement(this ModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    if (builder.IsTenantOnlyDatabase())
+    {
+        return;
+    }
+
+    builder.Entity<FeatureValue>(b =>
+    {
+        b.ToTable(AbpFeatureManagementDbProperties.DbTablePrefix + "FeatureValues",
+                  AbpFeatureManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.Name).HasMaxLength(FeatureValueConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.Value).HasMaxLength(FeatureValueConsts.MaxValueLength).IsRequired();
+        b.Property(x => x.ProviderName).HasMaxLength(FeatureValueConsts.MaxProviderNameLength);
+        b.Property(x => x.ProviderKey).HasMaxLength(FeatureValueConsts.MaxProviderKeyLength);
+
+        b.HasIndex(x => new { x.Name, x.ProviderName, x.ProviderKey }).IsUnique();
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<FeatureGroupDefinitionRecord>(b =>
+    {
+        b.ToTable(AbpFeatureManagementDbProperties.DbTablePrefix + "FeatureGroups",
+                  AbpFeatureManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+        b.Property(x => x.Name).HasMaxLength(FeatureGroupDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.DisplayName).HasMaxLength(FeatureGroupDefinitionRecordConsts.MaxDisplayNameLength).IsRequired();
+        b.HasIndex(x => new { x.Name }).IsUnique();
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.Entity<FeatureDefinitionRecord>(b =>
+    {
+        b.ToTable(AbpFeatureManagementDbProperties.DbTablePrefix + "Features",
+                  AbpFeatureManagementDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.GroupName).HasMaxLength(FeatureGroupDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.Name).HasMaxLength(FeatureDefinitionRecordConsts.MaxNameLength).IsRequired();
+        b.Property(x => x.ParentName).HasMaxLength(FeatureDefinitionRecordConsts.MaxNameLength);
+        b.Property(x => x.DisplayName).HasMaxLength(FeatureDefinitionRecordConsts.MaxDisplayNameLength).IsRequired();
+        b.Property(x => x.Description).HasMaxLength(FeatureDefinitionRecordConsts.MaxDescriptionLength);
+        b.Property(x => x.DefaultValue).HasMaxLength(FeatureDefinitionRecordConsts.MaxDefaultValueLength);
+        b.Property(x => x.AllowedProviders).HasMaxLength(FeatureDefinitionRecordConsts.MaxAllowedProvidersLength);
+        b.Property(x => x.ValueType).HasMaxLength(FeatureDefinitionRecordConsts.MaxValueTypeLength);
+
+        b.HasIndex(x => new { x.Name }).IsUnique();
+        b.HasIndex(x => new { x.GroupName });
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.TryConfigureObjectExtensions<FeatureManagementDbContext>();
+}
+```
+
+Tables and indexes:
+
+| Table | Default name (`AbpCommonDbProperties.DbTablePrefix = "Abp"`) | Indexes |
+| --- | --- | --- |
+| `FeatureValue` | `AbpFeatureValues` | Unique `(Name, ProviderName, ProviderKey)`. |
+| `FeatureGroupDefinitionRecord` | `AbpFeatureGroups` | Unique `(Name)`. |
+| `FeatureDefinitionRecord` | `AbpFeatures` | Unique `(Name)`, non-unique `(GroupName)`. |
+
+The unique index on `(Name, ProviderName, ProviderKey)` is the cornerstone of the storage contract: a single triple identifies one row. On SQL Server prior to 2022, two `NULL`s in a column count as duplicates for unique purposes — the framework sidesteps this by always querying with `s.ProviderKey == providerKey` (where `providerKey` may itself be `null`). The migration emits a regular nullable column; if you migrate to PostgreSQL the unique index treats `NULL`s as distinct by default, so two host-default rows for the same `(Name, ProviderName)` could coexist — that's a long-standing edge case the framework guards against in `IFeatureValueRepository.FindAsync` by `OrderBy(x => x.Id).FirstOrDefaultAsync`.
+
+The `IsTenantOnlyDatabase()` check at the top is for multi-database deployments where a separate tenant DB is provisioned. Because the Feature Management entities are `[IgnoreMultiTenancy]`, they belong in the host DB only — the configuration silently skips them when applied to a tenant-only DB.
+
+## Repositories
+
+### `EfCoreFeatureValueRepository`
+
+```csharp
+public class EfCoreFeatureValueRepository :
+    EfCoreRepository<IFeatureManagementDbContext, FeatureValue, Guid>,
+    IFeatureValueRepository
+{
+    public virtual async Task<FeatureValue> FindAsync(
+        string name, string providerName, string providerKey,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey,
+                                 GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> FindAllAsync(
+        string name, string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => s.Name == name && s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task<List<FeatureValue>> GetListAsync(
+        string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .Where(s => s.ProviderName == providerName && s.ProviderKey == providerKey)
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    public virtual async Task DeleteAsync(
+        string providerName, string providerKey, CancellationToken cancellationToken = default)
+    {
+        await DeleteAsync(s => s.ProviderName == providerName && s.ProviderKey == providerKey,
+                          cancellationToken: GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+Notable:
+
+- `FindAsync` has `OrderBy(x => x.Id).FirstOrDefaultAsync` — defensive against duplicates that *shouldn't* exist (the unique index prevents them) but might appear after a bad migration. Returns the lowest-Id row.
+- `FindAllAsync` is needed because `IFeatureManagementStore.DeleteAsync` iterates **all** rows with that triple. Despite the unique index that's always a 0/1-row list, but the API is plural for defensive parity.
+- `GetListAsync(providerName, providerKey)` is the fan-out warm read called by `FeatureManagementStore.SetCacheItemsAsync` — single round-trip to load every override for a tenant.
+- The `DeleteAsync(providerName, providerKey)` predicate-delete is delegated to the base `EfCoreRepository<,>.DeleteAsync(predicate, ...)` which (on modern EF Core) translates to a `DELETE FROM ... WHERE ...` statement.
+
+### `EfCoreFeatureDefinitionRecordRepository`
+
+```csharp
+public class EfCoreFeatureDefinitionRecordRepository :
+    EfCoreRepository<IFeatureManagementDbContext, FeatureDefinitionRecord, Guid>,
+    IFeatureDefinitionRecordRepository
+{
+    public virtual async Task<FeatureDefinitionRecord> FindByNameAsync(string name,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetDbSetAsync())
+            .OrderBy(x => x.Id)
+            .FirstOrDefaultAsync(r => r.Name == name, cancellationToken);
+    }
+}
+```
+
+The only extra method is `FindByNameAsync`, used by hosts that build custom diagnostics around dynamic features. The static saver and dynamic store both prefer `GetListAsync()` from the base repository to bulk-load all records.
+
+### `EfCoreFeatureGroupDefinitionRecordRepository`
+
+```csharp
+public class EfCoreFeatureGroupDefinitionRecordRepository :
+    EfCoreRepository<IFeatureManagementDbContext, FeatureGroupDefinitionRecord, Guid>,
+    IFeatureGroupDefinitionRecordRepository {}
+```
+
+Empty — the base `IBasicRepository<FeatureGroupDefinitionRecord, Guid>` is enough.
+
+## Migrations
+
+The module does **not** ship its own DbContext migration. The expectation is consolidation: the host application's main `DbContext` (usually `<AppName>DbContext`) calls `builder.ConfigureFeatureManagement()` from `OnModelCreating`, and the host's migration assembly captures these tables alongside Identity, Audit Logging, etc. The ABP startup templates include this call in the host `DbContext` by default.
+
+If you really do want a dedicated migration assembly for Feature Management, add this to the host module:
+
+```csharp
+context.Services.AddAbpDbContext<FeatureManagementDbContext>(options =>
+{
+    options.UseSqlServer(b => b.MigrationsAssembly("MyApp.FeatureManagement.Migrations"));
+});
+```
+
+and generate `dotnet ef migrations add InitialFeatureManagement` against `FeatureManagementDbContext`. But the standard templates do **not** do this — they consolidate.
+
+## Tenant-isolated databases
+
+The framework's `[IgnoreMultiTenancy]` attribute on `FeatureManagementDbContext` is what makes feature values land in the host's database even when tenants have their own DBs. This is desired: tenant-specific overrides identify the tenant via the `ProviderKey` Guid column, *not* the connection. If you had per-tenant databases each with their own `AbpFeatureValues` table, the host's "manage tenant features" UI would need to round-trip across connections — that's not how the module is designed.
+
+The `IsTenantOnlyDatabase()` guard in `ConfigureFeatureManagement` is the opposite case: if a host **also** runs the module against a tenant-only DB (rare, usually a misconfiguration), the configuration skips creating the tables there.
+
+## Replacing the DbContext
+
+A common customization is "I want feature values in a different schema". You have two options:
+
+1. Change `AbpFeatureManagementDbProperties.DbSchema = "features";` in `PreConfigureServices`. All three tables move.
+2. Replace `FeatureManagementDbContext` with a derived class that overrides only what you need, using `options.ReplaceDbContext<IFeatureManagementDbContext>();`. This is also how you'd inject column-level encryption via EF Core value converters.
+
+## Object extensions
+
+Each `Entity<>(b => { ... })` call ends with `b.ApplyObjectExtensionMappings();`, and the bottom of `ConfigureFeatureManagement` calls `builder.TryConfigureObjectExtensions<FeatureManagementDbContext>();`. That means you can add extra columns to `FeatureValue`, `FeatureGroupDefinitionRecord`, or `FeatureDefinitionRecord` via `ObjectExtensionManager` without subclassing — extra columns will participate in projections automatically. This is the same mechanism Identity uses to let you add `City` to `AbpUsers` without inheritance.
+
+## Gotchas
+
+- **Don't call `ConfigureFeatureManagement` from a context that already calls `base.OnModelCreating(builder)` first.** The extension is additive; calling it twice produces "entity already in model" errors.
+- **`OrderBy(x => x.Id)` queries cost more than you'd think on large `FeatureValue` tables.** The `Id` is a non-clustered Guid; the query plan may scan rather than seek. If you run thousands of `FindAsync` per second, consider a covering index `(Name, ProviderName, ProviderKey) INCLUDE (Id, Value)` — but only after measuring.
+- **Predicate `DeleteAsync` won't fire `EntityChangedEventData<FeatureValue>` events** on older versions of `Volo.Abp.EntityFrameworkCore`. The cache invalidator (`FeatureValueCacheItemInvalidator`) misses those. The application path (`FeatureManager.DeleteAsync`) loops over values via `FindAllAsync` + per-row `DeleteAsync`, so the standard codepath remains safe — but custom code calling `_repo.DeleteAsync(predicate, ...)` directly does not invalidate caches.
+- **`[IgnoreMultiTenancy]` is on the context, not the entities.** That means if you remap a `FeatureValue` into a different `DbContext` (e.g. for reporting), the attribute does not move with it; you'd inherit `IMultiTenant` semantics from the new context.
+- **Migrations on `Id`-only `OrderBy`.** The `EfCoreFeatureValueRepository.FindAsync` order-by ensures determinism but won't help you if you actually have duplicate `(Name, ProviderName, ProviderKey)` rows from a botched migration. Run `SELECT Name, ProviderName, ProviderKey, COUNT(*) FROM AbpFeatureValues GROUP BY Name, ProviderName, ProviderKey HAVING COUNT(*) > 1` after a major upgrade.
+- For the storage abstractions (`IFeatureStore`), the cache flow, and how the framework's `FeatureChecker` consumes this data, see [framework/cross/features](/framework/cross/features).
+
+## Working with extra columns
+
+A common customisation: add a `LastChangedByImpersonator` column to `FeatureValue` so you can audit feature-flag changes attributed to an impersonating admin separately from the normal `LastModifierId`.
+
+Step 1 — register the extension in `PreConfigureServices`:
+
+```csharp
+ObjectExtensionManager.Instance
+    .AddOrUpdateProperty<FeatureValue, Guid?>(
+        "LastChangedByImpersonator",
+        options =>
+        {
+            options.Attributes.Add(new DatabaseGeneratedAttribute(DatabaseGeneratedOption.None));
+        });
+```
+
+Step 2 — `ApplyObjectExtensionMappings` (already called in `ConfigureFeatureManagement`) picks up the registration and EF Core generates a nullable `Guid` column.
+
+Step 3 — emit a new migration. The column is added with no data loss.
+
+Step 4 — write to the extra property:
+
+```csharp
+featureValue.SetProperty("LastChangedByImpersonator", impersonatorId);
+```
+
+The extra-properties pattern keeps third-party customisations clean — the module's source isn't touched, the column lives alongside the module's own columns.
+
+## Performance tuning
+
+For very high-traffic feature checks, two optimisations help:
+
+1. **Increase the cache TTL.** `FeatureValueCacheItem` uses the default `AbpDistributedCacheOptions` settings (`KeyPrefix`, default sliding expiration). You can override per-type:
+
+   ```csharp
+   Configure<AbpDistributedCacheOptions>(options =>
+   {
+       options.CacheConfigurators.Add(t =>
+       {
+           if (t == typeof(FeatureValueCacheItem))
+               return new DistributedCacheEntryOptions
+               {
+                   SlidingExpiration = TimeSpan.FromMinutes(30)
+               };
+           return null;
+       });
+   });
+   ```
+
+2. **Move the cache to Redis with persistence.** The default `IDistributedCache` is in-memory in dev and Redis in production. With cluster-aware Redis the cache survives app restarts — the warm-up fan-out happens only on cold start.
+
+## Custom EF Core providers
+
+The mapping is generic enough to run on SQL Server, PostgreSQL, MySQL, SQLite, and Oracle. Two provider-specific behaviours to know:
+
+- **PostgreSQL** treats two `NULL`s in a unique-indexed column as distinct by default. That means you can accidentally create two host-default rows for the same `(Name, ProviderName)`. Add `WHERE ProviderKey IS NOT NULL` to the index or, better, use a filtered partial unique index.
+- **SQLite** does not enforce string length constraints. The `HasMaxLength` calls are documentation only.
+- **Oracle** truncates strings silently if `HasMaxLength` is exceeded and the data is bigger. Pick conservative lengths for `MaxValueLength` if you target Oracle.

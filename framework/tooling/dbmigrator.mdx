@@ -1,0 +1,521 @@
+---
+title: "DbMigrator Console Project"
+description: "The DbMigrator project shipped by every ABP application template — a console host that applies EF Core migrations, seeds host + tenant data and powers `abp create-migration-and-run-migrator`."
+---
+
+Every ABP application template generates a sibling project named
+`<Project>.DbMigrator`. It's a tiny console application whose only
+purpose is to:
+
+1. boot an ABP module graph (`<Project>DbMigratorModule`),
+2. apply EF Core (or Mongo) schema migrations to the host and every
+   tenant database,
+3. run the seed contributors (`IDataSeedContributor`).
+
+You run it locally before the first dev launch, on every deploy as a
+release step, and from the CLI via the
+`abp create-migration-and-run-migrator` shortcut.
+
+This page walks the canonical template at
+`templates/app/aspnet-core/src/MyCompanyName.MyProjectName.DbMigrator/`
+in the v7.4.0 source tree, plus the
+`MyProjectNameDbMigrationService` that ships in `…Domain/Data/`.
+
+## File inventory
+
+```text
+templates/app/aspnet-core/src/MyCompanyName.MyProjectName.DbMigrator/
+├── Program.cs                         # Main → Host.CreateDefaultBuilder
+├── DbMigratorHostedService.cs         # IHostedService — runs the migration
+├── MyProjectNameDbMigratorModule.cs   # AbpModule [DependsOn(…)]
+├── appsettings.json                   # ConnectionStrings + OpenIddict apps
+└── MyCompanyName.MyProjectName.DbMigrator.csproj
+
+templates/app/aspnet-core/src/MyCompanyName.MyProjectName.Domain/Data/
+├── IMyProjectNameDbSchemaMigrator.cs
+├── NullMyProjectNameDbSchemaMigrator.cs
+└── MyProjectNameDbMigrationService.cs # The orchestrator
+```
+
+In the EF Core flavour, an additional
+`EntityFrameworkCoreMyProjectNameDbSchemaMigrator` lives under
+`…EntityFrameworkCore/EntityFrameworkCore/`. In the Mongo flavour the
+counterpart is `…MongoDB/MongoDb/MongoDbMyProjectNameDbSchemaMigrator.cs`.
+At most one ships per template, picked by the template substitution
+engine.
+
+## Project file (`*.csproj`)
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="..\..\common.props" />
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net7.0</TargetFramework>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="appsettings.json">
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <!--APPSETTINGS-SECRETS-->
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Serilog.Extensions.Logging" Version="3.1.0" />
+    <PackageReference Include="Serilog.Sinks.Async"        Version="1.5.0" />
+    <PackageReference Include="Serilog.Sinks.File"         Version="5.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console"      Version="4.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="7.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="…\Volo.Abp.Autofac\Volo.Abp.Autofac.csproj" />
+    <ProjectReference Include="..\MyCompanyName.MyProjectName.Application.Contracts\…" />
+    <ProjectReference Include="..\MyCompanyName.MyProjectName.EntityFrameworkCore\…" />
+  </ItemGroup>
+</Project>
+```
+
+Key points:
+
+- **`OutputType=Exe`** — a regular console application.
+- It depends only on `Application.Contracts` (for the data-seed
+  contributors registered there) and `EntityFrameworkCore`. No
+  reference to `HttpApi`, `Web`, etc. — it never serves anything.
+- `Serilog.Sinks.Console/File` + `Microsoft.Extensions.Hosting` are the
+  only third-party deps; the rest comes through ABP.
+- `<!--APPSETTINGS-SECRETS-->` is a template marker for the optional
+  `appsettings.secrets.json` and is uncommented when you scaffold with
+  secrets enabled.
+
+## Program.cs — `Host.CreateDefaultBuilder().RunConsoleAsync()`
+
+```csharp
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.DbMigrator/Program.cs
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Information()
+            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+            .MinimumLevel.Override("Volo.Abp",  LogEventLevel.Warning)
+#if DEBUG
+            .MinimumLevel.Override("MyCompanyName.MyProjectName", LogEventLevel.Debug)
+#else
+            .MinimumLevel.Override("MyCompanyName.MyProjectName", LogEventLevel.Information)
+#endif
+            .Enrich.FromLogContext()
+            .WriteTo.Async(c => c.File("Logs/logs.txt"))
+            .WriteTo.Async(c => c.Console())
+            .CreateLogger();
+
+        await CreateHostBuilder(args).RunConsoleAsync();
+    }
+
+    public static IHostBuilder CreateHostBuilder(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            .AddAppSettingsSecretsJson()
+            .ConfigureLogging((context, logging) => logging.ClearProviders())
+            .ConfigureServices((hostContext, services) =>
+            {
+                services.AddHostedService<DbMigratorHostedService>();
+            });
+}
+```
+
+Notes:
+
+- `Host.CreateDefaultBuilder` reads `appsettings.json`,
+  `appsettings.<Environment>.json`, `appsettings.secrets.json` (via
+  `AddAppSettingsSecretsJson`) and `--key=value` command-line args.
+- `RunConsoleAsync()` blocks until the hosted service stops the host —
+  which it does explicitly via
+  `IHostApplicationLifetime.StopApplication()` after migrations
+  finish. That's why the process exits cleanly with code `0`.
+- All built-in providers are cleared in
+  `ConfigureLogging(... ClearProviders())` so Serilog is the only sink.
+
+## DbMigratorHostedService — boots the ABP application
+
+```csharp
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.DbMigrator/DbMigratorHostedService.cs
+public class DbMigratorHostedService : IHostedService
+{
+    private readonly IHostApplicationLifetime _hostApplicationLifetime;
+    private readonly IConfiguration _configuration;
+
+    public DbMigratorHostedService(
+        IHostApplicationLifetime hostApplicationLifetime,
+        IConfiguration configuration)
+    {
+        _hostApplicationLifetime = hostApplicationLifetime;
+        _configuration = configuration;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        using var application = await AbpApplicationFactory.CreateAsync<MyProjectNameDbMigratorModule>(options =>
+        {
+            options.Services.ReplaceConfiguration(_configuration);
+            options.UseAutofac();
+            options.Services.AddLogging(c => c.AddSerilog());
+            options.AddDataMigrationEnvironment();
+        });
+
+        await application.InitializeAsync();
+
+        await application
+            .ServiceProvider
+            .GetRequiredService<MyProjectNameDbMigrationService>()
+            .MigrateAsync();
+
+        await application.ShutdownAsync();
+
+        _hostApplicationLifetime.StopApplication();
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}
+```
+
+`AddDataMigrationEnvironment()` is the magic: it marks the
+`HostEnvironment.EnvironmentName` as `DataMigration`. Several ABP
+modules check that flag to disable background workers, suppress UI
+seeding (e.g. tenant management), or skip Redis cache cleanup. It is
+also what makes seed contributors run in a "fresh-host" mode rather
+than treating the migration run as a normal request.
+
+The `using` block guarantees `application.Dispose()` runs even when
+seeding throws, which prevents Autofac resource leaks.
+
+## DbMigratorModule
+
+```csharp
+// templates/app/aspnet-core/src/MyCompanyName.MyProjectName.DbMigrator/MyProjectNameDbMigratorModule.cs
+[DependsOn(
+    typeof(AbpAutofacModule),
+    typeof(AbpCachingStackExchangeRedisModule),     // tiered only
+    typeof(MyProjectNameEntityFrameworkCoreModule),
+    typeof(MyProjectNameApplicationContractsModule)
+)]
+public class MyProjectNameDbMigratorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        // tiered only
+        Configure<AbpDistributedCacheOptions>(o => { o.KeyPrefix = "MyProjectName:"; });
+    }
+}
+```
+
+What you get with this dependency closure:
+
+- `AbpAutofacModule` — Autofac container; required by ABP module
+  registration internals.
+- `…EntityFrameworkCore` — pulls in `MyProjectNameDbContext`,
+  `MyProjectNameDbContextFactory` (used by `dotnet ef`), all
+  EF-mapping configuration, and the
+  `EntityFrameworkCoreMyProjectNameDbSchemaMigrator`.
+- `…Application.Contracts` — pulls in every
+  `IDataSeedContributor` registered by your app modules
+  (`IdentitySeedContributor`, `OpenIddictDataSeedContributor`,
+  custom ones, …).
+- `AbpCachingStackExchangeRedisModule` — present only for tiered
+  templates, because the seeder may invalidate a distributed cache key
+  prefix.
+
+## DbMigrationService — the orchestrator
+
+`MyProjectNameDbMigrationService` lives in the **Domain** project so the
+DbMigrator can call it through DI. It's an `ITransientDependency`:
+
+```csharp
+public class MyProjectNameDbMigrationService : ITransientDependency
+{
+    private readonly IDataSeeder _dataSeeder;
+    private readonly IEnumerable<IMyProjectNameDbSchemaMigrator> _dbSchemaMigrators;
+    private readonly ITenantRepository _tenantRepository;
+    private readonly ICurrentTenant _currentTenant;
+
+    public async Task MigrateAsync()
+    {
+        var initialMigrationAdded = AddInitialMigrationIfNotExist();        // EF Core only
+        if (initialMigrationAdded) return;
+
+        Logger.LogInformation("Started database migrations...");
+
+        await MigrateDatabaseSchemaAsync();
+        await SeedDataAsync();
+
+        Logger.LogInformation("Successfully completed host database migrations.");
+
+        var tenants = await _tenantRepository.GetListAsync(includeDetails: true);
+        var migratedDatabaseSchemas = new HashSet<string>();
+
+        foreach (var tenant in tenants)
+        {
+            using (_currentTenant.Change(tenant.Id))
+            {
+                if (tenant.ConnectionStrings.Any())
+                {
+                    var tenantConnectionStrings = tenant.ConnectionStrings
+                                                       .Select(x => x.Value).ToList();
+
+                    if (!migratedDatabaseSchemas.IsSupersetOf(tenantConnectionStrings))
+                    {
+                        await MigrateDatabaseSchemaAsync(tenant);
+                        migratedDatabaseSchemas.AddIfNotContains(tenantConnectionStrings);
+                    }
+                }
+
+                await SeedDataAsync(tenant);
+            }
+
+            Logger.LogInformation($"Successfully completed {tenant.Name} tenant database migrations.");
+        }
+
+        Logger.LogInformation("Successfully completed all database migrations.");
+        Logger.LogInformation("You can safely end this process...");
+    }
+}
+```
+
+### Step 1: optional initial-migration creation (EF Core only)
+
+If the EntityFrameworkCore project has a `Migrations/` folder, nothing
+happens. If it doesn't, the orchestrator shells out to:
+
+```csharp
+$"abp create-migration-and-run-migrator \"{GetEntityFrameworkCoreProjectFolderPath()}\""
+```
+
+through `cmd /C` on Windows or `/bin/bash -c` on Linux/macOS. The
+`abp create-migration-and-run-migrator` verb (registered as
+`CreateMigrationAndRunMigratorCommand.Name` in the CLI) runs
+`dotnet ef migrations add Initial` and then re-runs the DbMigrator.
+That's why the first run on a fresh checkout sees the migrator log
+"Creating initial migration…" before doing anything else.
+
+### Step 2: schema migration
+
+```csharp
+private async Task MigrateDatabaseSchemaAsync(Tenant? tenant = null)
+{
+    Logger.LogInformation($"Migrating schema for " +
+                          $"{(tenant == null ? "host" : tenant.Name + " tenant")} database...");
+
+    foreach (var migrator in _dbSchemaMigrators)
+        await migrator.MigrateAsync();
+}
+```
+
+`IMyProjectNameDbSchemaMigrator` is the per-template abstraction:
+
+```csharp
+public interface IMyProjectNameDbSchemaMigrator
+{
+    Task MigrateAsync();
+}
+```
+
+EF Core implementation simply calls
+`DbContext.Database.MigrateAsync()`:
+
+```csharp
+public class EntityFrameworkCoreMyProjectNameDbSchemaMigrator
+    : IMyProjectNameDbSchemaMigrator, ITransientDependency
+{
+    private readonly IServiceProvider _serviceProvider;
+
+    public async Task MigrateAsync()
+    {
+        // Resolve from IServiceProvider (rather than ctor-inject) so the
+        // tenant connection-string resolver runs in the *current scope*.
+        await _serviceProvider
+            .GetRequiredService<MyProjectNameDbContext>()
+            .Database
+            .MigrateAsync();
+    }
+}
+```
+
+The MongoDB implementation enumerates every `IAbpMongoDbContext`,
+resolves the per-context connection string, opens a `MongoClient`, and
+calls `(dbContext as AbpMongoDbContext)?.InitializeCollections(db)` —
+which is the Mongo equivalent of running migrations.
+
+### Step 3: data seeding
+
+```csharp
+private async Task SeedDataAsync(Tenant? tenant = null)
+{
+    Logger.LogInformation($"Executing {(tenant == null ? "host" : tenant.Name + " tenant")} database seed...");
+
+    await _dataSeeder.SeedAsync(new DataSeedContext(tenant?.Id)
+        .WithProperty(IdentityDataSeedContributor.AdminEmailPropertyName,
+                      IdentityDataSeedContributor.AdminEmailDefaultValue)
+        .WithProperty(IdentityDataSeedContributor.AdminPasswordPropertyName,
+                      IdentityDataSeedContributor.AdminPasswordDefaultValue));
+}
+```
+
+`IDataSeeder` is provided by `Volo.Abp.Data`. It walks every registered
+`IDataSeedContributor` in dependency order. The two `WithProperty(...)`
+calls supply the initial admin credentials (`admin@abp.io` / `1q2w3E*`
+by default).
+
+### Step 4: tenant iteration
+
+After seeding the host, the orchestrator loads every tenant via
+`ITenantRepository.GetListAsync(includeDetails: true)`. For each tenant:
+
+- `ICurrentTenant.Change(tenant.Id)` switches the current ambient tenant
+  for the lifetime of the `using` block,
+- if the tenant has its own connection strings (multi-database
+  multi-tenancy), schema migration runs again with the resolver pointing
+  at the tenant's DB,
+- `migratedDatabaseSchemas` (a `HashSet<string>` of connection strings
+  already seen this run) prevents migrating the same DB twice when
+  multiple tenants share a database,
+- the seeder runs again with `DataSeedContext(tenant.Id)`.
+
+If the tenant has no `ConnectionStrings`, only the seed runs (because
+the tenant lives in the host DB).
+
+## Configuration
+
+`appsettings.json` declares the default connection string and the
+OpenIddict apps that the seed contributor will provision (`Web`,
+`Blazor`, `App`, `BlazorServerTiered`, `Swagger`). At runtime, the
+configuration is forwarded into the ABP application via
+`options.Services.ReplaceConfiguration(_configuration)` in the hosted
+service.
+
+Connection-string resolution honours per-tenant overrides via the
+standard ABP `IConnectionStringResolver`. That is how the tenant-loop
+"changes database" without instantiating a new `DbContext` directly.
+
+## CLI integration
+
+The CLI verb `abp create-migration-and-run-migrator` (the constant is
+`CreateMigrationAndRunMigratorCommand.Name`) reads the target
+EntityFrameworkCore project folder, runs:
+
+```bash
+dotnet ef migrations add Initial
+dotnet build
+dotnet run --project ../<Project>.DbMigrator
+```
+
+`NewCommand` calls this verb automatically for fresh EF Core templates,
+which is why running `abp new Acme.BookStore` creates and applies the
+initial migration without any manual `dotnet ef` invocation from the
+user. See [`abp new`](./cli-new-command).
+
+## Examples
+
+```bash
+# Normal flow — apply migrations + seed
+cd src/Acme.BookStore.DbMigrator
+dotnet run
+
+# Override the connection string from the command line
+dotnet run -- --ConnectionStrings:Default="Server=db;Database=BookStore;User Id=sa;Password=…"
+
+# Switch environment (e.g. to load appsettings.Production.json)
+dotnet run -- --environment Production
+
+# Use the CLI shortcut to also (re-)add an initial migration
+cd src/Acme.BookStore.EntityFrameworkCore
+abp create-migration-and-run-migrator
+```
+
+Typical CI step (after publish):
+
+```yaml
+- name: Run DbMigrator
+  working-directory: src/Acme.BookStore.DbMigrator
+  run: dotnet run --no-build -c Release
+  env:
+    ConnectionStrings__Default: ${{ secrets.SqlConnectionString }}
+```
+
+## Adding a custom seed contributor
+
+```csharp
+public class BookStoreCategoriesSeedContributor : IDataSeedContributor, ITransientDependency
+{
+    private readonly IRepository<Category, Guid> _categories;
+
+    public BookStoreCategoriesSeedContributor(IRepository<Category, Guid> categories)
+        => _categories = categories;
+
+    public async Task SeedAsync(DataSeedContext context)
+    {
+        if (await _categories.CountAsync() > 0) return;
+
+        await _categories.InsertManyAsync(new[]
+        {
+            new Category(Guid.NewGuid(), "Books"),
+            new Category(Guid.NewGuid(), "Music"),
+        });
+    }
+}
+```
+
+Register it in `…Application.Contracts` (it lives anywhere that
+`MyProjectNameDbMigratorModule` ends up referencing). The
+DbMigrator picks it up automatically because
+`IDataSeeder.SeedAsync` discovers every `IDataSeedContributor` from the
+DI container.
+
+## Gotchas
+
+- **`AddDataMigrationEnvironment()` matters.** Without it, host-side
+  modules that subscribe to `ApplicationInitializationContext` might
+  start background workers (e.g. recurring jobs) inside the migrator
+  process, which then leaks them.
+- **Don't move `DbMigratorHostedService` into a non-Console host.** The
+  `RunConsoleAsync()` lifetime is what makes
+  `IHostApplicationLifetime.StopApplication()` actually shut down the
+  process; in a web host you would terminate Kestrel mid-startup.
+- **Migrations only run if the schema migrator is registered.** The
+  `NullMyProjectNameDbSchemaMigrator` ships as a fallback when neither
+  EF Core nor Mongo are registered (e.g. testing scenarios). If you see
+  "Started database migrations" but no schema changes, you're hitting
+  the null implementation.
+- **Tenant migrations re-use the same `migratedDatabaseSchemas` set per
+  run.** It de-duplicates by connection-string value. If two tenants
+  share a connection string with different parameters (e.g. application
+  name), they will still cause a single migration.
+- **Resolving `MyProjectNameDbContext` from `IServiceProvider` (not via
+  constructor) is intentional.** It guarantees the resolver evaluates
+  inside the current tenant scope.
+- **Mongo `InitializeCollections` is idempotent**, but Mongo "seeding"
+  does not enforce schema — make sure your contributors are also
+  idempotent (use `CountAsync() > 0` checks).
+- **Logs/.** The csproj excludes `Logs/**` from compilation and copy
+  outputs, which is why the Serilog file sink (writing under `Logs/`)
+  doesn't accidentally end up in the published artifact.
+- **Initial migration creation requires the CLI on PATH.** If
+  `cmd /C "abp create-migration-and-run-migrator …"` cannot find
+  `abp`, the migrator throws `"Couldn't run ABP CLI..."`.
+
+## Cross-references
+
+- [CLI host](./cli) — `abp` tool installation and `~/.abp` state.
+- [Command registry](./cli-commands) — registration of
+  `create-migration-and-run-migrator`.
+- [`abp new`](./cli-new-command) — scaffolds the entire DbMigrator
+  project and runs it as part of project creation.
+- [`abp add-module`](./cli-add-package) — modules that bring their own
+  `IDataSeedContributor` are picked up automatically the next time
+  DbMigrator runs.
+- ABP Data Seeding docs:
+  [docs.abp.io/en/abp/latest/Data-Seeding](https://docs.abp.io/en/abp/latest/Data-Seeding).
+- Multi-tenancy docs:
+  [docs.abp.io/en/abp/latest/Multi-Tenancy](https://docs.abp.io/en/abp/latest/Multi-Tenancy).

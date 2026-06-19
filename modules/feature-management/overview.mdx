@@ -1,0 +1,316 @@
+---
+title: "Volo.Abp.FeatureManagement: module overview"
+sidebarTitle: "Overview"
+description: "How the Feature Management module persists tenant/edition feature values, surfaces the FeatureManagementModal UI, and plugs IFeatureStore into the framework's IFeatureChecker chain."
+---
+
+The `Volo.Abp.FeatureManagement` module is the **persistence and management UI** layer on top of `Volo.Abp.Features`. The framework package (`framework/cross/features`) defines *what* a feature is — a string-valued switch with a `ValueType`, a default value, and a provider chain (`Default → Edition → Tenant`). The framework ships **only** `NullFeatureStore` and `NullDynamicFeatureDefinitionStore`, so out of the box nothing is persisted: every `IFeatureChecker.IsEnabledAsync(...)` returns the static `DefaultValue` baked into the `IFeatureDefinitionProvider`.
+
+The Feature Management module fills that gap. It:
+
+1. Stores *values* — overrides per `(featureName, providerName, providerKey)` triple — in a `FeatureValue` aggregate, exposed through `IFeatureManagementStore` and consumed by `FeatureStore : IFeatureStore`.
+2. Stores *definitions* — for hot-reloaded dynamic features — in `FeatureDefinitionRecord` + `FeatureGroupDefinitionRecord`, fed into `IDynamicFeatureDefinitionStore` so the framework manager merges static and DB-backed definitions.
+3. Layers a per-provider write API (`IFeatureManager`) plus `IFeatureManagementProvider` adapters that resolve a `providerKey` from ambient context (`ICurrentTenant`, `ICurrentPrincipalAccessor`).
+4. Ships a thin application service (`IFeatureAppService`) protected by a per-provider policy lookup, an MVC controller, an HTTP client proxy, and both MVC and Blazor UI surfaces (`FeatureManagementModal`).
+
+The module deliberately mirrors the layered architecture of `Volo.Abp.PermissionManagement` and `Volo.Abp.SettingManagement` — same provider/store/manager triad, same `FeatureValueProviderInfo` granted-provider concept. If you understand one you understand all three.
+
+## Package map
+
+| Package | Layer | Purpose |
+| --- | --- | --- |
+| `Volo.Abp.FeatureManagement.Domain.Shared` | Shared constants / exceptions | Column lengths, `FeatureValueInvalidException`, `ValueValidatorFactoryOptions`, JSON converters for polymorphic `IStringValueType` / `IValueValidator`. |
+| `Volo.Abp.FeatureManagement.Domain` | Domain | `FeatureValue` aggregate, `FeatureDefinitionRecord`, `FeatureGroupDefinitionRecord`, `FeatureManagementStore`, the three `IFeatureManagementProvider`s (Default/Edition/Tenant), `IFeatureManager`, dynamic store, `StaticFeatureSaver`. |
+| `Volo.Abp.FeatureManagement.Application.Contracts` | Contracts | `IFeatureAppService`, `FeatureDto/FeatureGroupDto/UpdateFeaturesDto/...`, `FeatureManagementPermissions`, `FeatureManagementRemoteServiceConsts`. |
+| `Volo.Abp.FeatureManagement.Application` | Application | `FeatureAppService` — DTO assembly, per-provider policy check, depth calculation, delegation to `IFeatureManager`. |
+| `Volo.Abp.FeatureManagement.EntityFrameworkCore` | Infrastructure | `FeatureManagementDbContext`, three EF Core repositories, fluent mapping with unique indexes on `(Name, ProviderName, ProviderKey)`. |
+| `Volo.Abp.FeatureManagement.MongoDB` | Infrastructure | `FeatureManagementMongoDbContext`, three Mongo repositories. |
+| `Volo.Abp.FeatureManagement.HttpApi` | HTTP API | `FeaturesController` mapped at `api/feature-management/features`. |
+| `Volo.Abp.FeatureManagement.HttpApi.Client` | HTTP client | `FeaturesClientProxy` — static client proxy generated for `IFeatureAppService`. |
+| `Volo.Abp.FeatureManagement.Web` | MVC UI | `FeatureManagementModal` Razor Page, `FeatureSettingGroupViewComponent`, settings-page contributor. |
+| `Volo.Abp.FeatureManagement.Blazor` | Blazor (Common) | `FeatureManagementModal` Blazor component, `FeatureSettingManagementComponent`, settings-page contributor. |
+| `Volo.Abp.FeatureManagement.Blazor.Server` | Blazor Server | Shim — depends on `AbpAspNetCoreComponentsServerThemingModule`. |
+| `Volo.Abp.FeatureManagement.Blazor.WebAssembly` | Blazor WASM | Shim — depends on theming + `HttpApi.Client` for static proxies. |
+| `Volo.Abp.FeatureManagement.Installer` | Installer | NuGet meta-package, no code worth documenting. |
+
+## How values flow at runtime
+
+When application code calls `await FeatureChecker.IsEnabledAsync("MyApp.PremiumReports")`:
+
+1. `Volo.Abp.Features.FeatureChecker` iterates `AbpFeatureOptions.ValueProviders` in **reverse** order — by convention `Default → Edition → Tenant`, reversed to `Tenant → Edition → Default`.
+2. Each `IFeatureValueProvider` (`TenantFeatureValueProvider`, `EditionFeatureValueProvider`, `DefaultValueFeatureValueProvider` — all in the framework) resolves its `providerKey` from ambient state and calls `IFeatureStore.GetOrNullAsync(name, providerName, providerKey)`.
+3. The Feature Management module replaces `NullFeatureStore` with `FeatureStore : IFeatureStore`, which delegates to `IFeatureManagementStore` → `FeatureManagementStore`.
+4. `FeatureManagementStore` consults `IDistributedCache<FeatureValueCacheItem>` first; on a miss it pre-warms every feature for that `(providerName, providerKey)` in a single round-trip via `IFeatureValueRepository.GetListAsync`.
+5. The first non-null result wins. If all three providers return null, the framework `FeatureChecker` returns the `FeatureDefinition.DefaultValue` literal that was registered in the `IFeatureDefinitionProvider`.
+
+The write path is symmetric, but it travels through `IFeatureManager`. `FeatureManager.SetAsync` runs the providers in **reverse**, skips up to the matching `providerName`, then walks forward writing through every provider with that name. Before writing it inspects the *next* provider in the chain — if the value you're trying to save equals the fallback the chain would produce anyway, the value is cleared instead of stored. That keeps the `FeatureValues` table free of redundant rows.
+
+## Provider model
+
+| Provider (this module) | Inherits | `Name` | `providerKey` source |
+| --- | --- | --- | --- |
+| `DefaultValueFeatureManagementProvider` | `IFeatureManagementProvider` directly | `"D"` | n/a — always reads `feature.DefaultValue`. `SetAsync`/`ClearAsync` throw `AbpException`. |
+| `EditionFeatureManagementProvider` | `FeatureManagementProvider` | `"E"` | Falls back to `ICurrentPrincipalAccessor.Principal?.FindEditionId()?.ToString("N")`. |
+| `TenantFeatureManagementProvider` | `FeatureManagementProvider` | `"T"` | Falls back to `ICurrentTenant.Id?.ToString()`; `HandleContextAsync` calls `CurrentTenant.Change(tenantId)` when an explicit `providerKey` Guid is supplied. |
+
+These are *write-side* providers — used by `IFeatureManager` and exposed by `FeatureAppService.UpdateAsync`. The read side is still driven by the framework's `IFeatureValueProvider` chain; both sets share the same provider-name discriminator (`"D"`, `"E"`, `"T"`).
+
+## Authorization at the app-service boundary
+
+`FeatureAppService.CheckProviderPolicy(providerName, providerKey)` is the single authorization hook:
+
+```csharp
+if (providerName == TenantFeatureValueProvider.ProviderName &&
+    CurrentTenant.Id == null && providerKey == null)
+{
+    policyName = FeatureManagementPermissions.ManageHostFeatures;
+}
+else
+{
+    policyName = Options.ProviderPolicies.GetOrDefault(providerName);
+    if (policyName.IsNullOrEmpty())
+    {
+        throw new AbpException($"No policy defined to get/set permissions for the provider '{providerName}'. Use {nameof(FeatureManagementOptions)} to map the policy.");
+    }
+}
+await AuthorizationService.CheckAsync(policyName);
+```
+
+The domain module pre-wires one mapping in `AbpFeatureManagementDomainModule`:
+
+```csharp
+options.ProviderPolicies[TenantFeatureValueProvider.ProviderName] =
+    "AbpTenantManagement.Tenants.ManageFeatures";
+```
+
+So a host user manages "default tenant features" via `FeatureManagement.ManageHostFeatures`; a host admin managing a specific tenant's overrides needs the tenant-management permission `AbpTenantManagement.Tenants.ManageFeatures`. If you add a new `IFeatureManagementProvider`, you **must** also add an entry in `FeatureManagementOptions.ProviderPolicies` or every `Get/UpdateAsync` call for it will throw. See `modules/feature-management/application` for the full flow.
+
+## Configuration knobs
+
+`FeatureManagementOptions` (in `Volo.Abp.FeatureManagement.Domain`):
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `Providers` (`ITypeList<IFeatureManagementProvider>`) | `[Default, Edition, Tenant]` | Write-side provider order. Same convention as `AbpFeatureOptions.ValueProviders`. |
+| `ProviderPolicies` (`Dictionary<string,string>`) | `{ "T" → "AbpTenantManagement.Tenants.ManageFeatures" }` | Policy name to invoke per provider. The host-default branch (`"T"` with no tenant + no key) bypasses this and uses `ManageHostFeatures` directly. |
+| `SaveStaticFeaturesToDatabase` | `true` | If true, `AbpFeatureManagementDomainModule.OnApplicationInitializationAsync` schedules `StaticFeatureSaver.SaveAsync` to mirror code-defined features into `FeatureDefinitionRecord`. |
+| `IsDynamicFeatureStoreEnabled` | `false` | If true, registers `DynamicFeatureDefinitionStore` (replacing `NullDynamicFeatureDefinitionStore`) so the framework's `FeatureDefinitionManager` merges DB records into `GetAllAsync()`. |
+
+The data-migration environment hint (`context.Services.IsDataMigrationEnvironment()`) flips both `SaveStaticFeaturesToDatabase` and `IsDynamicFeatureStoreEnabled` off — necessary because `dotnet ef migrations` runs `ConfigureServices` but you don't want it to schedule a Polly retry loop trying to write features.
+
+## Cache topology
+
+There are three distinct caches:
+
+| Cache | Type | Key shape | Invalidated by |
+| --- | --- | --- | --- |
+| Value cache | `IDistributedCache<FeatureValueCacheItem>` | `"pn:{providerName},pk:{providerKey},n:{name}"` | `FeatureValueCacheItemInvalidator` (a `ILocalEventHandler<EntityChangedEventData<FeatureValue>>`) and `FeatureManagementStore.SetAsync`/`DeleteAsync`. |
+| Dynamic-store stamp | `IDistributedCache<string>` | `"{KeyPrefix}_AbpInMemoryFeatureCacheStamp"` | Bumped to `Guid.NewGuid().ToString()` whenever `StaticFeatureSaver` writes definition changes. |
+| In-memory dynamic store | `IDynamicFeatureDefinitionStoreInMemoryCache` (singleton) | Whole feature set | Re-filled when `LastCheckTime` is more than 30 s old **and** the stamp changed. |
+
+The stamp is the cheapest cross-node sync primitive in the module: a single 36-byte string fetch per app instance every 30 s tells every node whether to reload definitions.
+
+## Database tables / collections
+
+| Logical table | Class | Notable indexes |
+| --- | --- | --- |
+| `AbpFeatureValues` | `FeatureValue` | unique `(Name, ProviderName, ProviderKey)`. |
+| `AbpFeatureGroups` | `FeatureGroupDefinitionRecord` | unique `(Name)`. |
+| `AbpFeatures` | `FeatureDefinitionRecord` | unique `(Name)`, non-unique `(GroupName)`. |
+
+The prefix and schema come from `AbpFeatureManagementDbProperties` (defaults to `AbpCommonDbProperties` — `"Abp"` and `null` respectively). All three entities carry `[IgnoreMultiTenancy]` at the `DbContext` level — feature data is intentionally host-scoped: the `ProviderKey` *is* the tenant discriminator.
+
+## REST surface
+
+| Method | Path | Handler | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/feature-management/features?providerName={p}&providerKey={k}` | `FeaturesController.GetAsync` | Returns `GetFeatureListResultDto` — every visible group with depth-stamped features. |
+| `PUT` | `/api/feature-management/features?providerName={p}&providerKey={k}` | `FeaturesController.UpdateAsync` | Body `UpdateFeaturesDto`. Loops through every feature, calls `IFeatureManager.SetAsync`. |
+| `DELETE` | `/api/feature-management/features?providerName={p}&providerKey={k}` | `FeaturesController.DeleteAsync` | Calls `IFeatureManager.DeleteAsync` — clears every override for that provider/key. |
+
+`RemoteServiceName = "AbpFeatureManagement"`, `ModuleName = "featureManagement"`. The HTTP API module also calls `Configure<DynamicJavaScriptProxyOptions>` to **disable** the dynamic JS proxy generator for this module — the MVC UI ships hand-written JS, and exposing a dynamic `volo.abp.featureManagement.features` namespace would conflict with the Blazor/HttpApi.Client static proxies.
+
+## UI entry points
+
+Both UI flavours expose a modal:
+
+- **MVC**: `/FeatureManagement/FeatureManagementModal` Razor Page (`FeatureManagementModal.cshtml.cs`). Opened from JavaScript via `abp.modals.FeatureManagement`.
+- **Blazor**: `Volo.Abp.FeatureManagement.Blazor.Components.FeatureManagementModal` component with `OpenAsync(providerName, providerKey)` and `DeleteAsync(providerName, providerKey)`.
+
+Both modules also contribute to the Setting Management page (a sibling module) so that *host* users see a "Feature Management" tab without leaving Settings. That contribution is gated by `FeatureManagementPermissions.ManageHostFeatures`.
+
+## Where to read next
+
+- For the value-provider chain mechanics, the `[RequiresFeature]` interceptor, and `IFeatureChecker`, see [framework/cross/features](/framework/cross/features). Everything on this page builds on that.
+- For the sister module that uses the same provider model for permissions, see `modules/permission-management/overview`.
+- For DTO transport quirks (the polymorphic `IStringValueType`), see [modules/feature-management/domain-shared](/modules/feature-management/domain-shared).
+
+## Gotchas
+
+- **The framework module is still required.** `AbpFeatureManagementDomainModule` depends on `AbpFeaturesModule`. You cannot use this module standalone — it *supplies* the store, not the checker.
+- **Provider order is significant in two unrelated lists.** `AbpFeatureOptions.ValueProviders` controls reads; `FeatureManagementOptions.Providers` controls writes. They are independent type lists. Reorder one without the other and writes go to a layer reads will never look at.
+- **`StaticFeatureSaver` uses Polly with 8 retries, 8–24 s exponential back-off.** During startup the *first* request that touches a feature can briefly read stale defaults if the saver hasn't finished. Use `AbpFeatureManagementDomainModule.GetInitializeDynamicFeaturesTask()` to await completion in integration tests.
+- **`ProviderKey` of `null` is meaningful.** It marks "default values for that provider" (e.g. host-side defaults that apply to every tenant). EF Core's unique index treats `null` as a distinct value, but SQL Server treats two `null`s as duplicates in unique indexes pre-2022 — the module avoids this by filtering `null` explicitly in `IFeatureValueRepository.FindAsync`.
+- **`SaveStaticFeaturesToDatabase = true` is the default even when `IsDynamicFeatureStoreEnabled = false`.** That seems wasteful, but it means the management UI can show every definition (group + feature) it found in code via the *static* manager and persist localized display names so future restarts read the localized record without re-running the providers. Disable both flags in design-time/`dotnet ef migrations` contexts.
+
+## Module dependency graph
+
+```
+Volo.Abp.FeatureManagement.Domain.Shared
+  ↑
+Volo.Abp.FeatureManagement.Domain ─────────────────┐
+  │   depends on AbpFeaturesModule, AbpCachingModule │
+  ↑                                                   │
+Volo.Abp.FeatureManagement.Application.Contracts     │
+  │   depends on AbpAuthorizationAbstractionsModule  │
+  ↑                                                   │
+Volo.Abp.FeatureManagement.Application ◀─────────────┘
+  ↑
+  ├── Volo.Abp.FeatureManagement.HttpApi      → FeaturesController
+  ├── Volo.Abp.FeatureManagement.HttpApi.Client → FeaturesClientProxy
+  └── Volo.Abp.FeatureManagement.EntityFrameworkCore / MongoDB → repository wiring
+
+Volo.Abp.FeatureManagement.Blazor ─→ Application.Contracts + AbpSettingManagementBlazorModule
+  ├── Volo.Abp.FeatureManagement.Blazor.Server (theming shim)
+  └── Volo.Abp.FeatureManagement.Blazor.WebAssembly (theming shim + HttpApi.Client)
+
+Volo.Abp.FeatureManagement.Web ─→ Application.Contracts + AbpAspNetCoreMvcUiThemeSharedModule + AbpSettingManagementWebModule
+```
+
+A typical Blazor Server app references: Domain + Application + EntityFrameworkCore + Blazor.Server + HttpApi.
+A typical Blazor WASM app references: Blazor.WebAssembly (which transitively pulls HttpApi.Client + Blazor + theming).
+A microservice gateway as client references: HttpApi.Client only.
+
+## Where each feature value comes from at runtime
+
+A concrete walkthrough — `IFeatureChecker.IsEnabledAsync("MyApp.Reports")` for tenant `T1`:
+
+1. Framework's `FeatureChecker.GetOrNullAsync("MyApp.Reports")` walks providers in reverse: `TenantFeatureValueProvider → EditionFeatureValueProvider → DefaultValueFeatureValueProvider`.
+2. `TenantFeatureValueProvider.GetOrNullAsync(featureDef, CurrentTenant.Id)` calls `IFeatureStore.GetOrNullAsync("MyApp.Reports", "T", T1.ToString())`.
+3. `IFeatureStore` is `FeatureStore` (replaced by Domain module); it delegates to `IFeatureManagementStore.GetOrNullAsync(...)`.
+4. `FeatureManagementStore` checks `IDistributedCache<FeatureValueCacheItem>`. Cache miss → loads every override for `(T, T1.ToString())` in one query, caches all of them, returns the value for `"MyApp.Reports"`.
+5. If `null`, the framework moves to `EditionFeatureValueProvider`, then `DefaultValueFeatureValueProvider` (which returns `featureDef.DefaultValue`).
+6. The first non-null wins. `IsEnabledAsync` does `bool.Parse(result)` on the string.
+
+The whole chain typically completes in microseconds when the cache is warm — three dictionary lookups and a `bool.Parse`.
+
+## Common deployment topologies
+
+| Topology | Where Feature Management lives | Where the modal lives |
+| --- | --- | --- |
+| Monolith | Single app — Domain + Application + EF Core + HttpApi + Web/Blazor. | Same app. |
+| Blazor Server + API host | API host has Domain + Application + EF Core + HttpApi. Blazor Server host has Application + Blazor (Server). | Blazor Server host. |
+| Blazor WASM + API host | API host has Domain + Application + EF Core + HttpApi. WASM host has Blazor (WASM) + HttpApi.Client. | WASM, calls API via static proxy. |
+| Microservices | Administration service has Domain + Application + EF Core + HttpApi. Each downstream service has the framework `AbpFeaturesModule` only — values are read via `IFeatureChecker` against a `IFeatureStore` that delegates to the Administration service. | Administration UI or a gateway-hosted Blazor UI. |
+
+The microservice topology is the only one where `IFeatureStore` does *not* delegate to `FeatureManagementStore` locally — instead, the downstream services use a remote `IFeatureStore` implementation that asks the Administration service. The `Volo.Abp.PermissionManagement.Web` / `Volo.Abp.FeatureManagement.Web` modules ship a `RemoteFeatureValueClient`-style integration for this pattern via the microservice extensions.
+
+## Reading vs. writing — the two parallel chains
+
+The most common conceptual mistake is to assume that `AbpFeatureOptions.ValueProviders` (framework-side, read chain) and `FeatureManagementOptions.Providers` (this module, write chain) are the same list. They are not.
+
+| Chain | Lives in | Type | Used by |
+| --- | --- | --- | --- |
+| Read | `Volo.Abp.Features.AbpFeatureOptions.ValueProviders` | `ITypeList<IFeatureValueProvider>` | `IFeatureChecker.GetOrNullAsync` |
+| Write | `Volo.Abp.FeatureManagement.FeatureManagementOptions.Providers` | `ITypeList<IFeatureManagementProvider>` | `IFeatureManager.SetAsync` / `GetAllWithProviderAsync` |
+
+They have parallel structure — both contain a Default/Edition/Tenant trio with the same `ProviderName` discriminator — but they are different interfaces with different concrete classes. The read providers (`Default*FeatureValueProvider`) live in the framework; the write providers (`*FeatureManagementProvider`) live here.
+
+When you add a custom provider, you typically have to add it to both lists. The framework's `RequireFeaturesSimpleStateChecker` and the application service's `CheckProviderPolicy` will all reach for the *write* list.
+
+## Where audit logging captures changes
+
+Because `FeatureAppService` extends `ApplicationService`, the framework's auditing interceptor wraps `GetAsync`/`UpdateAsync`/`DeleteAsync` and emits an `AuditLog` row with:
+
+- The action name (`FeatureAppService.UpdateAsync`).
+- The serialized parameters (`{ "providerName": "T", "providerKey": "...", "input": { "features": [...] } }`).
+- The timestamp, user id, tenant id, and impersonator.
+
+This means a host admin's "switch on PremiumReports for tenant X" action is auditable out of the box without extra wiring. Combined with the [Audit Logging](/modules/audit-logging/overview) module's persistence, you get a full compliance trail.
+
+## Performance characteristics
+
+Typical timings under a warm cache:
+
+| Operation | Round-trips | Time (warm) |
+| --- | --- | --- |
+| `IFeatureChecker.IsEnabledAsync(name)` | 0 DB, 1 cache get | < 1 ms |
+| `IFeatureChecker.IsEnabledAsync(name)` cold | 1 DB (fan-out), 1 cache set-many | 5–20 ms |
+| `IFeatureAppService.GetAsync(...)` | 1 DB fan-out (cold) | 10–50 ms |
+| `IFeatureAppService.UpdateAsync(...)` per feature | 1 DB write per feature | 5–10 ms × N |
+
+The fan-out warm pattern means the first lookup pays once for a tenant; subsequent lookups are O(1). The cache invalidator clears single entries per change, so a single `SetAsync` doesn't reset the whole tenant's cache — only the affected `(name, providerName, providerKey)`.
+
+## End-to-end save flow (Blazor Server example)
+
+A complete walkthrough — host admin toggles a feature for tenant T1 in a Blazor Server host:
+
+1. Admin clicks "Manage features" → row action JS calls `FeatureManagementModal.OpenAsync("T", T1.ToString())`.
+2. The component calls `IFeatureAppService.GetAsync("T", T1.ToString())`.
+3. `FeatureAppService.CheckProviderPolicy` resolves to `AbpTenantManagement.Tenants.ManageFeatures`. Auth check passes.
+4. `IFeatureManager.GetOrNullWithProviderAsync` is called per feature; the first call warms `FeatureManagementStore`'s cache for the tenant.
+5. The DTOs are returned. The modal opens, populates `ToggleValues` / `SelectionStringValues`.
+6. Admin flips a toggle, clicks Save.
+7. The component builds `UpdateFeaturesDto` and calls `IFeatureAppService.UpdateAsync("T", T1.ToString(), dto)`.
+8. `FeatureAppService` re-runs `CheckProviderPolicy`, then loops over `dto.Features` calling `IFeatureManager.SetAsync` per feature.
+9. `FeatureManager.SetAsync` enters `TenantFeatureManagementProvider.HandleContextAsync` (changes `CurrentTenant` to T1), checks the redundant-value collapse, and writes via `FeatureManagementStore.SetAsync`.
+10. `FeatureValue` insert/update fires `EntityChangedEventData<FeatureValue>` → `FeatureValueCacheItemInvalidator` clears the cache entry.
+11. The modal calls `ICurrentApplicationConfigurationCacheResetService.ResetAsync()` → server-side application-configuration cache is invalidated.
+12. `IFeatureChecker.IsEnabledAsync(name)` from any subsequent request for tenant T1 reads the fresh value.
+
+The same flow on Blazor WASM differs at step 7 — instead of in-proc `IFeatureAppService`, the client proxy POSTs to `/api/feature-management/features` and the controller dispatches to the same `FeatureAppService` on the API host.
+
+## Feature definition vs. feature value
+
+Two distinct concepts persist in the database:
+
+| Concept | Where it lives | When it's written |
+| --- | --- | --- |
+| **Definition** — the schema (Name, DisplayName, ValueType, DefaultValue, Parent) | `FeatureDefinitionRecord`, `FeatureGroupDefinitionRecord` | At app boot, by `StaticFeatureSaver` (if `SaveStaticFeaturesToDatabase = true`). Mostly read-only after that. |
+| **Value** — the per-(provider, key) override | `FeatureValue` | At admin click time, by `IFeatureManager.SetAsync` via `FeatureManagementStore`. |
+
+Don't confuse them. Definitions are the "type system" of features; values are instances of that type system applied to a specific tenant or edition.
+
+## Module lifecycle quick reference
+
+| Phase | What happens |
+| --- | --- |
+| `PreConfigureServices` | Pre-configure actions for `ValueValidatorFactoryOptions`, MVC application parts, data-annotations resources. |
+| `ConfigureServices` | Register all services — `FeatureManagementStore`, providers, `FeatureManager`, `DynamicFeatureDefinitionStore`, repositories, JSON converters. Tag `AbpFeatureManagementResource` with base types. |
+| `OnApplicationInitializationAsync` | The Domain module schedules `InitializeDynamicFeatures` background task — Polly retry around `StaticFeatureSaver.SaveAsync`, then `IDynamicFeatureDefinitionStore.GetGroupsAsync()` pre-warm. |
+| First feature check | Cache miss → fan-out warm → cache populated. Subsequent checks O(1). |
+| First save | `FeatureManager.SetAsync` → providers run → `FeatureManagementStore` writes via repository. `EntityChangedEventData<FeatureValue>` clears the cache key. |
+| Application shutdown | The Domain module cancels its `CancellationTokenSource` so the saver background task exits cleanly. |
+
+## Where to start reading the code
+
+If you're spelunking the source for the first time, this is the suggested reading order:
+
+1. `IFeatureManagementProvider.cs` — three-method interface.
+2. `FeatureManagementStore.cs` — cache + repository.
+3. `FeatureManager.cs` — the `SetAsync` redundant-value collapse is the trickiest method in the module.
+4. `StaticFeatureSaver.cs` — the cross-app distributed-lock dance.
+5. `DynamicFeatureDefinitionStore.cs` — stamp-based invalidation.
+6. `FeatureAppService.cs` — DTO assembly + per-provider policy.
+7. `FeaturesController.cs` — three-line forwarder.
+8. UI flavours.
+
+The Domain module is where the conceptual weight lives. Everything above is plumbing.
+
+## Pair-page references
+
+This page is the entry point. Each individual layer has its own deep dive:
+
+- [Domain.Shared](/modules/feature-management/domain-shared) — constants, exceptions, JSON converters.
+- [Domain](/modules/feature-management/domain) — aggregates, store, providers, manager.
+- [Application.Contracts](/modules/feature-management/application-contracts) — DTOs, `IFeatureAppService`, permissions.
+- [Application](/modules/feature-management/application) — `FeatureAppService` and policy gating.
+- [EF Core](/modules/feature-management/efcore) — DbContext, repositories, model configuration.
+- [MongoDB](/modules/feature-management/mongodb) — Mongo context, repositories.
+- [HTTP API](/modules/feature-management/http-api) — `FeaturesController` and the dynamic-JS-proxy opt-out.
+- [HTTP API Client](/modules/feature-management/http-api-client) — `FeaturesClientProxy` static proxy.
+- [Web (MVC)](/modules/feature-management/web) — Razor Pages modal and Setting Management contributor.
+- [Blazor](/modules/feature-management/blazor) — shared Blazor UI (FeatureManagementModal, contributors).
+- [Blazor Server](/modules/feature-management/blazor-server) — theming shim for Server hosts.
+
+And the foundational framework page: [framework/cross/features](/framework/cross/features).

@@ -1,0 +1,197 @@
+---
+title: "Permission Management — HTTP API"
+description: "Controllers, routes, area conventions, and the integration endpoint that exposes IPermissionAppService and IPermissionIntegrationService over HTTP."
+---
+
+`Volo.Abp.PermissionManagement.HttpApi` is the controller-only package that exposes the application services from [Application](/modules/permission-management/application) to HTTP clients. Each controller is a thin shell that implements the matching `IApplicationService` contract and forwards every call.
+
+## File inventory
+
+```
+Volo.Abp.PermissionManagement.HttpApi/Volo/Abp/PermissionManagement/
+├── AbpPermissionManagementHttpApiModule.cs
+├── PermissionsController.cs
+└── Integration/
+    └── PermissionIntegrationController.cs
+```
+
+## Module wiring
+
+```csharp
+[DependsOn(
+    typeof(AbpPermissionManagementApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcModule)
+)]
+public class AbpPermissionManagementHttpApiModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpPermissionManagementHttpApiModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<AbpPermissionManagementResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+Two things happen here:
+
+1. The controllers ship inside this assembly — `AddApplicationPartIfNotExists` tells ASP.NET Core MVC to discover them even when the assembly is loaded as a NuGet reference rather than via project reference.
+2. The `AbpPermissionManagementResource` (declared in Domain.Shared) is augmented with `AbpUiResource` as a base type. That gives the controllers access to UI strings like *"An internal error occurred during your request"* without the controllers needing to register their own resource.
+
+The module deliberately **does not** depend on `Volo.Abp.PermissionManagement.Application`. In a microservice topology you can host the HTTP API in one service and the application service in another — the controllers will resolve `IPermissionAppService` via DI, which can point at a local implementation or a client proxy.
+
+## PermissionsController
+
+```csharp
+[RemoteService(Name = PermissionManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(PermissionManagementRemoteServiceConsts.ModuleName)]
+[Route("api/permission-management/permissions")]
+public class PermissionsController : AbpControllerBase, IPermissionAppService
+{
+    protected IPermissionAppService PermissionAppService { get; }
+
+    public PermissionsController(IPermissionAppService permissionAppService)
+    {
+        PermissionAppService = permissionAppService;
+    }
+
+    [HttpGet]
+    public virtual Task<GetPermissionListResultDto> GetAsync(string providerName, string providerKey)
+    {
+        return PermissionAppService.GetAsync(providerName, providerKey);
+    }
+
+    [HttpPut]
+    public virtual Task UpdateAsync(string providerName, string providerKey, UpdatePermissionsDto input)
+    {
+        return PermissionAppService.UpdateAsync(providerName, providerKey, input);
+    }
+}
+```
+
+Conventions in play:
+
+- `[RemoteService(Name = "AbpPermissionManagement")]` registers the controller with that remote-service name, which clients use to override the base URL via `AbpRemoteServiceOptions.RemoteServices["AbpPermissionManagement"]`.
+- `[Area("permissionManagement")]` keeps the routes namespaced for tooling. The Web module disables this area in the dynamic JS proxy generator (`DynamicJavaScriptProxyOptions.DisableModule("permissionManagement")`) because the static client proxies handle the same routes from Razor/Blazor.
+- The controller **implements** `IPermissionAppService` so the ABP MVC infrastructure can match every route automatically by inspecting the implemented interface. This is what lets the OpenAPI generator produce the canonical metadata that ships to Swagger and Angular.
+- The `IPermissionAppService` field is provided by DI — in a self-contained host this is `PermissionAppService`; in a remote-only host it is a `PermissionsClientProxy` because the application package is not loaded.
+
+### Routes
+
+| Method | Route | Action | Body |
+| --- | --- | --- | --- |
+| `GET` | `/api/permission-management/permissions?providerName=&providerKey=` | `GetAsync` | — |
+| `PUT` | `/api/permission-management/permissions?providerName=&providerKey=` | `UpdateAsync` | `UpdatePermissionsDto` |
+
+Both methods accept `providerName` and `providerKey` as query-string parameters. The PUT body is the array of `UpdatePermissionDto`. The convention is uncommon — REST purists would expect a `/api/permission-management/permissions/{providerName}/{providerKey}` shape — but it matches every other ABP "edit by entity reference" admin endpoint.
+
+## PermissionIntegrationController
+
+```csharp
+[RemoteService(Name = PermissionManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(PermissionManagementRemoteServiceConsts.ModuleName)]
+[ControllerName("PermissionIntegration")]
+[Route("integration-api/permission-management/permissions")]
+public class PermissionIntegrationController : AbpControllerBase, IPermissionIntegrationService
+{
+    protected IPermissionIntegrationService PermissionIntegrationService { get; }
+
+    public PermissionIntegrationController(IPermissionIntegrationService permissionIntegrationService)
+    {
+        PermissionIntegrationService = permissionIntegrationService;
+    }
+
+    [HttpGet]
+    [Route("is-granted")]
+    public virtual Task<ListResultDto<IsGrantedResponse>> IsGrantedAsync(List<IsGrantedRequest> input)
+    {
+        return PermissionIntegrationService.IsGrantedAsync(input);
+    }
+}
+```
+
+Notice the differences from the public controller:
+
+- The route prefix is `integration-api/...` instead of `api/...`. Most gateways are configured to drop `/integration-api/*` traffic from the public internet — only inter-service calls reach it.
+- `[ControllerName("PermissionIntegration")]` produces the OpenAPI tag `PermissionIntegration` instead of the default `PermissionIntegration` derived from the type name (here they happen to coincide, but the explicit attribute makes it stable across renames).
+- The interface is `IPermissionIntegrationService` — implemented in [Application](/modules/permission-management/application) as a wrapper around `IPermissionFinder`.
+- It is a `GET` for an endpoint that accepts a `List<IsGrantedRequest>` — possible because the ABP HTTP API conventions for `IntegrationService` use complex-object binding from JSON in the request body even for GETs, similar to OData filter endpoints. The HTTP client proxy package generates a body-bearing GET on the client side.
+
+### Routes
+
+| Method | Route | Action |
+| --- | --- | --- |
+| `GET` | `/integration-api/permission-management/permissions/is-granted` | `IsGrantedAsync` |
+
+## Sequence: PUT flow end-to-end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin
+    participant Browser
+    participant MVC as ASP.NET Core MVC
+    participant Ctl as PermissionsController
+    participant App as PermissionAppService
+    participant Mgr as PermissionManager
+    participant Prov as IPermissionManagementProvider (R)
+    participant DB
+
+    Admin->>Browser: clicks Save
+    Browser->>MVC: PUT /api/permission-management/permissions?providerName=R&providerKey=admin
+    MVC->>Ctl: route matched; model bound to UpdatePermissionsDto
+    Ctl->>App: UpdateAsync("R", "admin", input)
+    App->>App: CheckProviderPolicy("AbpIdentity.Roles.ManagePermissions")
+    loop each permission
+        App->>Mgr: SetAsync(name, "R", "admin", isGranted)
+        Mgr->>Prov: SetAsync(name, "admin", isGranted)
+        Prov->>DB: INSERT or DELETE row in AbpPermissionGrants
+    end
+    App-->>Ctl: void
+    Ctl-->>MVC: 200 OK with empty body
+    MVC-->>Browser: 200
+    Browser-->>Admin: modal closes
+```
+
+ASP.NET Core returns 200 with an empty body by default when the action returns `Task`. The Razor page that hosts the modal uses the `204 No Content` response shape via its `OnPostAsync` returning `NoContent()` — that is a Razor-layer concern, not the HTTP API's.
+
+## Versioning and OpenAPI
+
+Both controllers carry no `[ApiVersion]` attribute. The module is implicitly API-version-neutral — adding it to the global `[Api*]` conventions on the host bubbles up automatically because the controllers do not override route templates per version.
+
+When Swagger generation is enabled, the two controllers contribute:
+
+- `Permissions` group with `GET` and `PUT`.
+- `PermissionIntegration` group with `GET /is-granted`.
+
+The integration group is typically hidden from public-facing Swagger via `IDocumentFilter`s in deployments that split internal vs. external API documentation.
+
+## Hosting topologies
+
+The HTTP API module is flexible because it only depends on `Application.Contracts`. Three common topologies:
+
+| Topology | What is loaded together |
+| --- | --- |
+| Monolith | `Domain` + `EntityFrameworkCore`/`MongoDB` + `Application` + `HttpApi` + `Web`/`Blazor` |
+| Identity microservice | `Domain` + `EntityFrameworkCore`/`MongoDB` + `Application` + `HttpApi` (clients elsewhere use `HttpApi.Client`) |
+| Tiered: API gateway | `HttpApi` only, with `IPermissionAppService` resolved to the `HttpApi.Client` proxy that points at the Identity service |
+
+## Gotchas
+
+- The `[Area("permissionManagement")]` attribute is what makes the controllers participate in dynamic JS proxying. Disabling the area via `DynamicJavaScriptProxyOptions.DisableModule("permissionManagement")` (done by the Web module) does *not* unregister the controllers — it only prevents the JS shims from being generated. The controllers still answer HTTP requests.
+- The PUT endpoint is decorated `[HttpPut]` with no explicit route segment — the route is `Route("api/permission-management/permissions")` at the class level. A client posting to `/api/permission-management/permissions/` (with trailing slash) is fine; one posting to `/api/permission-management/permission` (singular) gets a 404.
+- The integration controller uses `[Route("is-granted")]` at the method level. A client mistakenly using `IsGrantedAsync` as the path segment (rather than the route attribute value) gets a 404 — ABP's HTTP client proxy uses the attribute value, so cross-language clients should look at the published OpenAPI spec, not the C# method name.
+- There are no `[AllowAnonymous]` overrides. The `[Authorize]` attribute on `PermissionAppService` flows through to the controller because the controller *implements the same interface* and the framework re-applies attributes from the contract type when generating the action descriptor.
+
+Continue with [HTTP API Client](/modules/permission-management/http-api-client).

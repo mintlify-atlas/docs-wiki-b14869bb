@@ -1,0 +1,395 @@
+---
+title: "Volo.Abp.SettingManagement.Web"
+description: "MVC Razor Pages UI at /SettingManagement — page contributors, the tab-based Index page, view components for email and timezone, and the SettingPageContributorManager that drives availability."
+---
+
+The Web package is the MVC Razor Pages implementation of the admin UI. It is *content-extensible*: the page itself is a fixed shell (a left-hand pill nav + a right-hand tab body), and every tab is rendered by an `ISettingPageContributor` registered through `SettingManagementPageOptions`.
+
+```csharp
+[DependsOn(
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpAutoMapperModule),
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpSettingManagementDomainSharedModule))]
+public class AbpSettingManagementWebModule : AbpModule { ... }
+```
+
+The dependency on `AbpAspNetCoreMvcUiThemeSharedModule` is what bridges the Razor Pages views to whatever theme is active (Basic, LeptonX, Lepton). The module does not reference the application layer directly — every server-side call goes through the auto-generated JS client.
+
+## File inventory
+
+```
+Volo.Abp.SettingManagement.Web/
+├── AbpSettingManagementWebModule.cs
+├── Navigation/
+│   ├── SettingManagementMainMenuContributor.cs
+│   └── SettingManagementMenuNames.cs
+├── Pages/SettingManagement/
+│   ├── _ViewImports.cshtml
+│   ├── Index.cshtml
+│   ├── Index.cshtml.cs
+│   ├── ISettingPageContributor.cs
+│   ├── SettingManagementPageOptions.cs
+│   ├── SettingPageContributorBase.cs
+│   ├── SettingPageContributorManager.cs
+│   ├── SettingPageCreationContext.cs
+│   ├── SettingPageGroup.cs
+│   └── Components/
+│       ├── EmailSettingGroup/
+│       │   ├── Default.cshtml
+│       │   ├── EmailSettingGroupViewComponent.cs
+│       │   ├── SendTestEmailModal.cshtml
+│       │   └── SendTestEmailModal.cshtml.cs
+│       └── TimeZoneSettingGroup/
+│           ├── Default.cshtml
+│           └── TimeZoneSettingGroupViewComponent.cs
+├── SettingManagementWebAutoMapperProfile.cs
+└── Settings/
+    ├── EmailingPageContributor.cs
+    └── TimeZonePageContributor.cs
+```
+
+## Module wiring
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpNavigationOptions>(options =>
+    {
+        options.MenuContributors.Add(new SettingManagementMainMenuContributor());
+    });
+
+    Configure<SettingManagementPageOptions>(options =>
+    {
+        options.Contributors.Add(new EmailingPageContributor());
+        options.Contributors.Add(new TimeZonePageContributor());
+    });
+
+    Configure<AbpVirtualFileSystemOptions>(options =>
+    {
+        options.FileSets.AddEmbedded<AbpSettingManagementWebModule>();
+    });
+
+    Configure<DynamicJavaScriptProxyOptions>(options =>
+    {
+        options.DisableModule(SettingManagementRemoteServiceConsts.ModuleName);
+    });
+
+    context.Services.AddAutoMapperObjectMapper<AbpSettingManagementWebModule>();
+    Configure<AbpAutoMapperOptions>(options =>
+    {
+        options.AddProfile<SettingManagementWebAutoMapperProfile>(validate: true);
+    });
+}
+```
+
+Three notable parts:
+
+* **Two built-in contributors** — `EmailingPageContributor` and `TimeZonePageContributor` are appended unconditionally. Applications add their own via the same options class.
+* **`DisableModule(ModuleName)`** turns off the dynamic JavaScript proxy generator for the `settingManagement` area. The module ships a *static* `settingManagement-proxy.js` instead.
+* **AutoMapper profile** — maps `EmailSettingsDto` ↔ `UpdateEmailSettingsViewModel` (the inner view-model class on `EmailSettingGroupViewComponent`). The mirror exists because Razor Page binding wants DataAnnotations on a non-DTO type so application-layer DTOs stay free of `[Display(Name = …)]` strings.
+
+## `Index.cshtml.cs` — the page model
+
+```csharp
+[Authorize]
+[RequiresFeature(SettingManagementFeatures.Enable)]
+public class IndexModel : AbpPageModel
+{
+    public SettingPageCreationContext SettingPageCreationContext { get; private set; }
+
+    protected SettingPageContributorManager SettingPageContributorManager { get; }
+    protected ILocalEventBus LocalEventBus { get; }
+
+    public IndexModel(ILocalEventBus localEventBus, SettingPageContributorManager settingPageContributorManager) { ... }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        SettingPageCreationContext = await SettingPageContributorManager.ConfigureAsync();
+        return Page();
+    }
+
+    public virtual Task<IActionResult> OnPostAsync()
+        => Task.FromResult<IActionResult>(Page());
+
+    public virtual async Task<IActionResult> OnPostRenderViewAsync(string id)
+    {
+        var context = await SettingPageContributorManager.ConfigureAsync();
+        var view = context.Groups.FirstOrDefault(x => x.Id == id);
+        if (view != null) return ViewComponent(view.ComponentType, view.Parameter);
+        return NoContent();
+    }
+
+    public virtual async Task<NoContentResult> OnPostRefreshConfigurationAsync()
+    {
+        await LocalEventBus.PublishAsync(new CurrentApplicationConfigurationCacheResetEventData());
+        return NoContent();
+    }
+}
+```
+
+The page has four handlers:
+
+1. **`OnGetAsync`** — runs the contributors, populates `Groups`, renders the shell.
+2. **`OnPostAsync`** — placeholder for forms that post back to the same page (unused by the default tabs but kept for compatibility).
+3. **`OnPostRenderViewAsync(id)`** — AJAX endpoint that re-renders a specific tab's view component. Called by `Index.js` when the user clicks a pill.
+4. **`OnPostRefreshConfigurationAsync`** — publishes a `CurrentApplicationConfigurationCacheResetEventData` so the client's cached `abp.setting.values` is invalidated after a save.
+
+`[Authorize]` enforces login. `[RequiresFeature(SettingManagementFeatures.Enable)]` enforces the feature gate at the page level — without it, even an authenticated tenant user can't load the URL.
+
+## `Index.cshtml` — the shell
+
+```cshtml
+<div id="SettingManagementWrapper">
+    <abp-card>
+        <abp-card-body>
+            <div class="row">
+                <div class="col-md-3">
+                    <ul class="nav flex-column nav-pills" id="tabs-nav" role="tablist">
+                        @for (var i = 0; i < Model.SettingPageCreationContext.Groups.Count; i++)
+                        {
+                            var group = Model.SettingPageCreationContext.Groups[i];
+                            var active = i == 0 ? "active" : string.Empty;
+                            <li class="nav-item">
+                                <a href="javascript:;" class="nav-link @active" data-id="@group.Id" data-bs-toggle="pill" role="tab">@group.DisplayName</a>
+                            </li>
+                        }
+                    </ul>
+                </div>
+                <div class="col-md-9">
+                    <div class="tab-content" id="tab-content"></div>
+                </div>
+            </div>
+        </abp-card-body>
+    </abp-card>
+</div>
+```
+
+The right pane (`#tab-content`) is empty on initial render. The companion JavaScript file (`Index.js`, served via the embedded `<abp-script-bundle>`) loads the first tab on `$(document).ready` by POSTing to `OnPostRenderViewAsync(firstGroupId)`. Subsequent clicks on the pills repeat the AJAX call. This means the view components are *lazy-rendered* — a tenant whose only available tab is Timezone never executes the email view component.
+
+## `SettingPageGroup`
+
+```csharp
+public class SettingPageGroup
+{
+    public const int DefaultOrder = 1000;
+
+    public string Id { get; set; }
+    public string DisplayName { get; set; }
+    public Type ComponentType { get; set; } // a ViewComponent type
+    public object Parameter { get; set; }
+    public int Order { get; set; }
+
+    public SettingPageGroup(string id, string displayName, Type componentType, object parameter = null, int order = DefaultOrder) { ... }
+}
+```
+
+The `Id` is used as both the `data-id` attribute on the pill and the lookup key in `OnPostRenderViewAsync`. The framework's view-component invocation accepts a `Type` and an optional `Parameter`; the parameter is dispatch-by-convention onto the `InvokeAsync` method.
+
+## `ISettingPageContributor` and `SettingPageContributorBase`
+
+```csharp
+public interface ISettingPageContributor
+{
+    Task ConfigureAsync(SettingPageCreationContext context);
+
+    [Obsolete("Use SettingPageContributorBase as base class and call `RequiredPermissions` or `RequiredFeatures` for better performance.")]
+    Task<bool> CheckPermissionsAsync(SettingPageCreationContext context);
+}
+```
+
+The old `CheckPermissionsAsync` is kept for backward compatibility. The recommended path is to inherit `SettingPageContributorBase`:
+
+```csharp
+public abstract class SettingPageContributorBase : ISettingPageContributor
+{
+    protected virtual SettingPageContributorBase RequiredPermissions(params string[] permissions) { ... }
+    protected virtual SettingPageContributorBase RequiredFeatures(params string[] features) { ... }
+    protected virtual SettingPageContributorBase RequiredTenantSideFeatures(params string[] features) { ... }
+
+    public abstract Task ConfigureAsync(SettingPageCreationContext context);
+}
+```
+
+The base class declares its prerequisites in the constructor. `SettingPageContributorManager` then *bulk-evaluates* every contributor's permissions in a single call:
+
+```csharp
+var permissions = new HashSet<string>();
+permissions.AddIfNotContains(contributorBases.SelectMany(x => x.GetRequiredPermissions()));
+
+var permissionChecker = ServiceProvider.GetRequiredService<IPermissionChecker>();
+var grantResult = await permissionChecker.IsGrantedAsync(permissions.ToArray());
+```
+
+This is the performance win the obsoletion message refers to — one batched permission lookup per request instead of N round-trips.
+
+## `EmailingPageContributor`
+
+```csharp
+public class EmailingPageContributor : SettingPageContributorBase
+{
+    public EmailingPageContributor()
+    {
+        RequiredTenantSideFeatures(SettingManagementFeatures.Enable);
+        RequiredTenantSideFeatures(SettingManagementFeatures.AllowChangingEmailSettings);
+        RequiredPermissions(SettingManagementPermissions.Emailing);
+    }
+
+    public override Task ConfigureAsync(SettingPageCreationContext context)
+    {
+        var l = context.ServiceProvider.GetRequiredService<IStringLocalizer<AbpSettingManagementResource>>();
+        context.Groups.Add(
+            new SettingPageGroup(
+                "Volo.Abp.EmailSetting",
+                l["Menu:Emailing"],
+                typeof(EmailSettingGroupViewComponent)));
+        return Task.CompletedTask;
+    }
+}
+```
+
+`RequiredTenantSideFeatures(...)` means the feature is checked **only when a tenant is in scope**. The host always sees the tab — that's intentional, because hosts must be able to configure SMTP infrastructure regardless of feature flags.
+
+`TimeZonePageContributor` is simpler: it requires only `SettingManagementPermissions.TimeZone` and the `Enable` feature (tenant side), and registers `TimeZoneSettingGroupViewComponent` under the ID `Volo.Abp.TimeZoneSetting`.
+
+## `SettingPageContributorManager`
+
+```csharp
+public virtual async Task<SettingPageCreationContext> ConfigureAsync()
+{
+    var contributors = CachedAvailableContributors.GetOrAdd(
+        nameof(SettingPageContributorManager),
+        await GetAvailableContributorsInternalAsync());
+
+    var context = new SettingPageCreationContext(ServiceProvider);
+    foreach (var contributor in contributors)
+    {
+        await contributor.ConfigureAsync(context);
+    }
+    context.Normalize();
+    return context;
+}
+```
+
+The manager is `IScopedDependency`, so its `CachedAvailableContributors` lives per-request. Within a single request the permission check happens once even if multiple handlers (`OnGetAsync`, `OnPostRenderViewAsync`) call `ConfigureAsync`. Across requests the check runs fresh — so toggling a feature in the same session has immediate effect.
+
+`context.Normalize()` orders groups by `Order` then `DisplayName`. The default order is 1000; bump above or below to control tab placement.
+
+## `EmailSettingGroupViewComponent`
+
+```csharp
+public class EmailSettingGroupViewComponent : AbpViewComponent
+{
+    protected IEmailSettingsAppService EmailSettingsAppService { get; }
+
+    public EmailSettingGroupViewComponent(IEmailSettingsAppService emailSettingsAppService)
+    {
+        ObjectMapperContext = typeof(AbpSettingManagementWebModule);
+        EmailSettingsAppService = emailSettingsAppService;
+    }
+
+    public virtual async Task<IViewComponentResult> InvokeAsync()
+    {
+        var emailSettings = await EmailSettingsAppService.GetAsync();
+        var model = ObjectMapper.Map<EmailSettingsDto, UpdateEmailSettingsViewModel>(emailSettings);
+        return View("~/Pages/SettingManagement/Components/EmailSettingGroup/Default.cshtml", model);
+    }
+
+    public class UpdateEmailSettingsViewModel
+    {
+        [MaxLength(256)] [Display(Name = "SmtpHost")]     public string SmtpHost { get; set; }
+        [Range(1, 65535)] [Display(Name = "SmtpPort")]    public int SmtpPort { get; set; }
+        [MaxLength(1024)] [Display(Name = "SmtpUserName")] public string SmtpUserName { get; set; }
+        [MaxLength(1024)] [DataType(DataType.Password)] [DisableAuditing] [Display(Name = "SmtpPassword")]
+        public string SmtpPassword { get; set; }
+        // ... DefaultFromAddress, DefaultFromDisplayName, …
+    }
+}
+```
+
+The inner `UpdateEmailSettingsViewModel` mirrors `UpdateEmailSettingsDto` *and* carries `[Display(Name = …)]` attributes that the Razor view uses for `<label asp-for="…">` generation. AutoMapper bridges the two via `SettingManagementWebAutoMapperProfile`.
+
+## `SendTestEmailModal.cshtml.cs`
+
+```csharp
+[Authorize(SettingManagementPermissions.EmailingTest)]
+public class SendTestEmailModal : AbpPageModel
+{
+    [BindProperty] public SendTestEmailViewModel Input { get; set; }
+    protected IEmailSettingsAppService EmailSettingsAppService { get; }
+
+    public async Task OnGetAsync()
+    {
+        var emailSettings = await EmailSettingsAppService.GetAsync();
+        Input = new SendTestEmailViewModel
+        {
+            SenderEmailAddress = emailSettings.DefaultFromAddress,
+            TargetEmailAddress = CurrentUser.Email,
+            Subject = L["TestEmailSubject", new Random().Next(1000, 9999)],
+            Body = L["TestEmailBody"]
+        };
+    }
+
+    public async Task<IActionResult> OnPostAsync()
+    {
+        ValidateModel();
+        await EmailSettingsAppService.SendTestEmailAsync(ObjectMapper.Map<SendTestEmailViewModel, SendTestEmailInput>(Input));
+        return NoContent();
+    }
+}
+```
+
+Notice the pre-fill logic on `OnGetAsync`:
+
+* `SenderEmailAddress` defaults to the currently configured default-from address.
+* `TargetEmailAddress` defaults to the current user's email.
+* `Subject` includes a random number to defeat email-client conversation grouping.
+
+Random number per request rather than per modal open — re-opening the modal generates a new subject so duplicate test emails are still distinguishable.
+
+## `SettingManagementMainMenuContributor`
+
+```csharp
+public virtual async Task ConfigureMenuAsync(MenuConfigurationContext context)
+{
+    if (context.Menu.Name != StandardMenus.Main) return;
+
+    if (context.Menu.FindMenuItem(SettingManagementMenuNames.GroupName) != null)
+    {
+        // Blazor Server may already have added it
+        return;
+    }
+
+    var settingPageContributorManager = context.ServiceProvider.GetRequiredService<SettingPageContributorManager>();
+    if (!(await settingPageContributorManager.GetAvailableContributors()).Any()) return;
+
+    var l = context.GetLocalizer<AbpSettingManagementResource>();
+    context.Menu.GetAdministration().AddItem(
+        new ApplicationMenuItem(
+            SettingManagementMenuNames.GroupName,
+            l["Settings"],
+            "~/SettingManagement",
+            icon: "fa fa-cog"
+        ).RequireFeatures(SettingManagementFeatures.Enable));
+}
+```
+
+The contributor:
+
+1. Bails if any other module has already added the menu item — guards against duplicate entries in mixed MVC/Blazor hosts.
+2. Bails if no contributor is available — the user simply won't see *Administration → Settings* at all.
+3. Tags the menu item with `RequireFeatures(SettingManagementFeatures.Enable)` so the framework's menu rendering hides it for tenants who lose the feature without a full page refresh.
+
+## Gotchas
+
+* **Lazy view components hide errors.** A misbehaving custom contributor that throws inside `InvokeAsync` returns 500 to the AJAX call but leaves the pill highlighted. Wrap your contributor's logic in try/catch and surface a friendly message.
+* **`OnPostRenderViewAsync` accepts any registered group id from any caller.** It's not anti-forgery-token-protected. Don't rely on contributor-side authorization alone if your tab exposes destructive forms — re-check on the form's POST handler.
+* **AutoMapper profile validation is *strict*.** `validate: true` runs `Mapper.ConfigurationProvider.AssertConfigurationIsValid()` at startup. Adding fields to your custom DTO/view-model without updating the profile will crash the app — useful, but surprising in dev environments.
+* **The static JS proxy must be served.** The `<abp-script-bundle>` references `/client-proxies/settingManagement-proxy.js`. The embedded resource ships with the assembly; if you self-host static files via a CDN, the embedded path must still be reachable through `app.UseStaticFiles` + the virtual file system, otherwise the page silently breaks.
+* **Two `EmailingPageContributor` types exist.** The Web module and the Blazor module each have one, in their respective namespaces. They are not interchangeable.
+
+## Cross-links
+
+* For the Blazor counterpart (different namespace, same conceptual model), see [Blazor](/modules/setting-management/blazor).
+* For the underlying app service the view components call, see [Application](/modules/setting-management/application).
+* For the feature/permission keys these contributors gate on, see [Domain.Shared](/modules/setting-management/domain-shared) and [Application.Contracts](/modules/setting-management/application-contracts).

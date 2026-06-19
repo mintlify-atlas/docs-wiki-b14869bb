@@ -1,0 +1,374 @@
+---
+title: "Volo.Abp.FeatureManagement.Domain: FeatureManagementStore, providers, IFeatureManager"
+sidebarTitle: "Domain"
+description: "The aggregates (FeatureValue, FeatureDefinitionRecord, FeatureGroupDefinitionRecord), the IFeatureManagementProvider chain, FeatureManager write semantics, the static-feature saver, and the dynamic definition store."
+---
+
+`Volo.Abp.FeatureManagement.Domain` is where the value-storage and write-side logic lives. The package contains four conceptual surfaces:
+
+1. **Aggregates** that map to physical tables — `FeatureValue`, `FeatureDefinitionRecord`, `FeatureGroupDefinitionRecord`.
+2. **Value persistence** — `IFeatureManagementStore` / `FeatureManagementStore`, `FeatureStore : IFeatureStore`, and the cache invalidator.
+3. **Write-side providers** — `IFeatureManagementProvider` + `FeatureManagementProvider` + the three concrete implementations.
+4. **Definition synchronization** — `IDynamicFeatureDefinitionStore`/`DynamicFeatureDefinitionStore`, `IStaticFeatureSaver`/`StaticFeatureSaver`, and the in-memory cache.
+
+The module entry point is `AbpFeatureManagementDomainModule`:
+
+```csharp
+[DependsOn(
+    typeof(AbpFeatureManagementDomainSharedModule),
+    typeof(AbpFeaturesModule),
+    typeof(AbpCachingModule)
+)]
+public class AbpFeatureManagementDomainModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<FeatureManagementOptions>(options =>
+        {
+            options.Providers.Add<DefaultValueFeatureManagementProvider>();
+            options.Providers.Add<EditionFeatureManagementProvider>();
+            options.Providers.Add<TenantFeatureManagementProvider>();
+            options.ProviderPolicies[TenantFeatureValueProvider.ProviderName]
+                = "AbpTenantManagement.Tenants.ManageFeatures";
+        });
+
+        Configure<AbpExceptionLocalizationOptions>(options =>
+            options.MapCodeNamespace("AbpFeatureManagement", typeof(AbpFeatureManagementResource)));
+
+        if (context.Services.IsDataMigrationEnvironment())
+        {
+            Configure<FeatureManagementOptions>(options =>
+            {
+                options.SaveStaticFeaturesToDatabase = false;
+                options.IsDynamicFeatureStoreEnabled = false;
+            });
+        }
+    }
+    // ...
+}
+```
+
+`OnApplicationInitializationAsync` schedules a background task — `InitializeDynamicFeatures` — that runs `IStaticFeatureSaver.SaveAsync` under a Polly retry loop (8 attempts, 8–24 s exponential back-off) and then pre-warms `IDynamicFeatureDefinitionStore.GetGroupsAsync()`. The cancellation is wired to `IHostApplicationLifetime.ApplicationStopping` so a shutdown during boot cancels the saver cleanly.
+
+## File inventory
+
+| Path | Role |
+| --- | --- |
+| `AbpFeatureManagementDomainModule.cs` | Module class — registers providers, schedules `StaticFeatureSaver`. |
+| `AbpFeatureManagementDbProperties.cs` | `DbTablePrefix`/`DbSchema` (from `AbpCommonDbProperties`), `ConnectionStringName = "AbpFeatureManagement"`. |
+| `FeatureValue.cs` | Aggregate root — `Name`, `Value`, `ProviderName`, `ProviderKey`. |
+| `FeatureDefinitionRecord.cs` | `BasicAggregateRoot<Guid>` mirroring `FeatureDefinition`. Has `HasSameData` and `Patch` for the saver. |
+| `FeatureGroupDefinitionRecord.cs` | Same, for groups. |
+| `IFeatureManagementStore.cs` / `FeatureManagementStore.cs` | Persistence layer over `IFeatureValueRepository` + distributed cache. |
+| `IFeatureValueRepository.cs` | Domain-side repository contract (EF/Mongo implementations live elsewhere). |
+| `IFeatureDefinitionRecordRepository.cs` / `IFeatureGroupDefinitionRecordRepository.cs` | Definition repositories. |
+| `FeatureStore.cs` | Implements `Volo.Abp.Features.IFeatureStore` by delegating to `IFeatureManagementStore`. |
+| `FeatureValueCacheItem.cs` | `[IgnoreMultiTenancy]` cache value (`Value` string + key calculator). |
+| `FeatureValueCacheItemInvalidator.cs` | `ILocalEventHandler<EntityChangedEventData<FeatureValue>>` — clears the value cache. |
+| `IFeatureManagementProvider.cs` / `FeatureManagementProvider.cs` | Write-side provider abstraction. |
+| `DefaultValueFeatureManagementProvider.cs` | Reads `feature.DefaultValue`. Set/Clear throw. |
+| `EditionFeatureManagementProvider.cs` | Falls back to `principal.FindEditionId()`. |
+| `TenantFeatureManagementProvider.cs` | Falls back to `CurrentTenant.Id`; `HandleContextAsync` switches tenant context. |
+| `TenantFeatureManagerExtensions.cs` / `EditionFeatureManagerExtensions.cs` / `DefaultValueFeatureManagerExtensions.cs` | Strongly-typed `*ForTenantAsync` / `*ForEditionAsync` / `*DefaultAsync` wrappers on `IFeatureManager`. |
+| `IFeatureManager.cs` / `FeatureManager.cs` | Write-side facade (Get/Set/Delete). |
+| `FeatureNameValue.cs` / `FeatureNameValueWithGrantedProvider.cs` / `FeatureValueProviderInfo.cs` | Read DTOs. |
+| `FeatureManagementOptions.cs` | `Providers`, `ProviderPolicies`, `SaveStaticFeaturesToDatabase`, `IsDynamicFeatureStoreEnabled`. |
+| `IDynamicFeatureDefinitionStoreInMemoryCache.cs` / `DynamicFeatureDefinitionStoreInMemoryCache.cs` | Singleton in-memory cache for dynamic features. |
+| `DynamicFeatureDefinitionStore.cs` | `[Dependency(ReplaceServices = true)]` replacement for `NullDynamicFeatureDefinitionStore`. |
+| `IFeatureDefinitionSerializer.cs` / `FeatureDefinitionSerializer.cs` | Translates `FeatureDefinition` ↔ `FeatureDefinitionRecord`. |
+| `IStaticFeatureSaver.cs` / `StaticFeatureSaver.cs` | Periodic merge of code-defined features into the DB. |
+| `StringValueTypeSerializer.cs` | Thin `IJsonSerializer` wrapper. |
+
+## Aggregates
+
+### `FeatureValue`
+
+```csharp
+public class FeatureValue : Entity<Guid>, IAggregateRoot<Guid>
+{
+    [NotNull]  public virtual string Name { get; protected set; }
+    [NotNull]  public virtual string Value { get; internal set; }
+    [NotNull]  public virtual string ProviderName { get; protected set; }
+    [CanBeNull] public virtual string ProviderKey { get; protected set; }
+
+    public FeatureValue(Guid id, string name, string value, string providerName, string providerKey)
+    {
+        Id = id;
+        Name         = Check.NotNullOrWhiteSpace(name, nameof(name));
+        Value        = Check.NotNullOrWhiteSpace(value, nameof(value));
+        ProviderName = Check.NotNullOrWhiteSpace(providerName, nameof(providerName));
+        ProviderKey  = providerKey;
+    }
+}
+```
+
+| Column | Constraint |
+| --- | --- |
+| `Name` | `nvarchar(128)` not null. |
+| `Value` | `nvarchar(128)` not null. Stored as text — the framework always treats values as `string?`. Use `IFeatureChecker.GetAsync<T>` to convert. |
+| `ProviderName` | `nvarchar(64)` not null. Use `TenantFeatureValueProvider.ProviderName` / `EditionFeatureValueProvider.ProviderName` constants. |
+| `ProviderKey` | `nvarchar(64)` **nullable**. `null` means "host default" for that provider — e.g. `(name = "Reports", providerName = "T", providerKey = null)` is a host-wide default for any tenant. |
+
+The unique index `(Name, ProviderName, ProviderKey)` is configured in EF Core / Mongo mapping. **Note** that `Value` is intentionally `internal set` — `FeatureValue` is the only entity in the module that mutates in place (no full replace) because the cache invalidator subscribes to `EntityChangedEventData<FeatureValue>` and that fires on plain Update as well as Insert.
+
+### `FeatureDefinitionRecord`
+
+Mirrors `Volo.Abp.Features.FeatureDefinition` exactly: `GroupName`, `Name`, `ParentName`, `DisplayName`, `Description`, `DefaultValue`, `IsVisibleToClients`, `IsAvailableToHost`, `AllowedProviders` (comma-joined), `ValueType` (serialized `IStringValueType`), and `ExtraProperties`.
+
+Two methods make it a serializable form of the in-memory definition:
+
+```csharp
+public bool HasSameData(FeatureDefinitionRecord otherRecord) { /* field-by-field equality */ }
+public void Patch(FeatureDefinitionRecord otherRecord) { /* selective field copy */ }
+```
+
+`StaticFeatureSaver` uses both — `HasSameData` to decide *whether* to write, `Patch` to apply only the changed fields while preserving the row Id. This means even after a major code change, `FeatureDefinitionRecord.Id` is stable.
+
+### `FeatureGroupDefinitionRecord`
+
+Trivial — `Name`, `DisplayName`, `ExtraProperties`. Same `HasSameData`/`Patch` shape.
+
+## `IFeatureManagementStore` and `FeatureManagementStore`
+
+```csharp
+public interface IFeatureManagementStore
+{
+    Task<string> GetOrNullAsync(string name, string providerName, string providerKey);
+    Task SetAsync(string name, string value, string providerName, string providerKey);
+    Task DeleteAsync(string name, string providerName, string providerKey);
+}
+```
+
+`FeatureManagementStore` is `[UnitOfWork]` decorated on every public method, so even a single `GetOrNullAsync` runs inside an ambient UoW. The interesting bit is the cache-warming on miss:
+
+```csharp
+protected virtual async Task<FeatureValueCacheItem> GetCacheItemAsync(
+    string name, string providerName, string providerKey)
+{
+    var cacheKey = CalculateCacheKey(name, providerName, providerKey);
+    var cacheItem = await Cache.GetAsync(cacheKey, considerUow: true);
+    if (cacheItem != null) return cacheItem;
+
+    cacheItem = new FeatureValueCacheItem(null);
+    await SetCacheItemsAsync(providerName, providerKey, name, cacheItem);
+    return cacheItem;
+}
+
+private async Task SetCacheItemsAsync(string providerName, string providerKey,
+    string currentName, FeatureValueCacheItem currentCacheItem)
+{
+    var featureDefinitions = await FeatureDefinitionManager.GetAllAsync();
+    var featuresDictionary = (await FeatureValueRepository.GetListAsync(providerName, providerKey))
+        .ToDictionary(s => s.Name, s => s.Value);
+
+    var cacheItems = new List<KeyValuePair<string, FeatureValueCacheItem>>();
+    foreach (var featureDefinition in featureDefinitions)
+    {
+        var featureValue = featuresDictionary.GetOrDefault(featureDefinition.Name);
+        cacheItems.Add(new KeyValuePair<string, FeatureValueCacheItem>(
+            CalculateCacheKey(featureDefinition.Name, providerName, providerKey),
+            new FeatureValueCacheItem(featureValue)));
+        if (featureDefinition.Name == currentName) currentCacheItem.Value = featureValue;
+    }
+    await Cache.SetManyAsync(cacheItems, considerUow: true);
+}
+```
+
+The pattern is "fan-out warm on first miss". A single feature lookup for tenant T triggers one repository `GetListAsync` and a single `SetManyAsync` that populates the cache entries for *every* feature for that tenant. Subsequent lookups for other features in the same request hit the cache.
+
+Cache key shape:
+
+```csharp
+public static string CalculateCacheKey(string name, string providerName, string providerKey)
+    => "pn:" + providerName + ",pk:" + providerKey + ",n:" + name;
+```
+
+Combined with `AbpDistributedCacheOptions.KeyPrefix`, a typical Redis key looks like `c:FeatureValueCacheItem,k:pn:T,pk:5a47...,n:MyApp.PremiumReports`.
+
+## `FeatureStore : IFeatureStore`
+
+The bridge into the framework:
+
+```csharp
+public class FeatureStore : IFeatureStore, ITransientDependency
+{
+    protected IFeatureManagementStore FeatureManagementStore { get; }
+    public FeatureStore(IFeatureManagementStore featureManagementStore)
+        => FeatureManagementStore = featureManagementStore;
+
+    public virtual Task<string> GetOrNullAsync(string name, string providerName, string providerKey)
+        => FeatureManagementStore.GetOrNullAsync(name, providerName, providerKey);
+}
+```
+
+Because `FeatureStore` is a `[Dependency(ReplaceServices = true)]`-style override (registered via `ITransientDependency` — `NullFeatureStore` is `Try`-registered by `AbpFeaturesModule`), referencing `AbpFeatureManagementDomainModule` is enough to swap the seam.
+
+## `FeatureValueCacheItemInvalidator`
+
+```csharp
+public class FeatureValueCacheItemInvalidator :
+    ILocalEventHandler<EntityChangedEventData<FeatureValue>>, ITransientDependency
+{
+    public virtual async Task HandleEventAsync(EntityChangedEventData<FeatureValue> eventData)
+    {
+        var cacheKey = CalculateCacheKey(eventData.Entity.Name,
+            eventData.Entity.ProviderName, eventData.Entity.ProviderKey);
+        await Cache.RemoveAsync(cacheKey, considerUow: true);
+    }
+}
+```
+
+`EntityChangedEventData<T>` fires on insert/update/delete via the framework's local event bus. Combined with `considerUow: true`, removal happens at UoW commit — keeping the cache consistent with the transaction.
+
+## Providers — read this slowly
+
+```csharp
+public interface IFeatureManagementProvider
+{
+    string Name { get; }
+    bool Compatible(string providerName);
+    Task<IAsyncDisposable> HandleContextAsync(string providerName, string providerKey);
+    Task<string> GetOrNullAsync(FeatureDefinition feature, string providerKey);
+    Task SetAsync(FeatureDefinition feature, string value, string providerKey);
+    Task ClearAsync(FeatureDefinition feature, string providerKey);
+}
+```
+
+- `Compatible(providerName)`: usually `providerName == Name`. Override if a single concrete class handles multiple discriminators (rare).
+- `HandleContextAsync`: returns an `IAsyncDisposable` that *changes ambient state* for the duration of the call — used by `TenantFeatureManagementProvider` to call `CurrentTenant.Change(tenantId)` so authorization and audit log fields reflect the affected tenant, not the caller.
+
+`FeatureManagementProvider` (abstract base):
+
+```csharp
+public virtual async Task<string> GetOrNullAsync(FeatureDefinition feature, string providerKey)
+    => await Store.GetOrNullAsync(feature.Name, Name, await NormalizeProviderKeyAsync(providerKey));
+
+public virtual async Task SetAsync(FeatureDefinition feature, string value, string providerKey)
+    => await Store.SetAsync(feature.Name, value, Name, await NormalizeProviderKeyAsync(providerKey));
+
+public virtual async Task ClearAsync(FeatureDefinition feature, string providerKey)
+    => await Store.DeleteAsync(feature.Name, Name, await NormalizeProviderKeyAsync(providerKey));
+
+protected virtual Task<string> NormalizeProviderKeyAsync(string providerKey)
+    => Task.FromResult(providerKey);
+```
+
+The `NormalizeProviderKey` hook is what concrete providers override to inject ambient context.
+
+`TenantFeatureManagementProvider`:
+
+```csharp
+public override Task<IAsyncDisposable> HandleContextAsync(string providerName, string providerKey)
+{
+    if (providerName == Name && !providerKey.IsNullOrWhiteSpace())
+        if (Guid.TryParse(providerKey, out var tenantId))
+        {
+            var disposable = CurrentTenant.Change(tenantId);
+            return Task.FromResult<IAsyncDisposable>(new AsyncDisposeFunc(() =>
+            {
+                disposable.Dispose();
+                return Task.CompletedTask;
+            }));
+        }
+    return base.HandleContextAsync(providerName, providerKey);
+}
+
+protected override Task<string> NormalizeProviderKeyAsync(string providerKey)
+{
+    if (providerKey != null) return Task.FromResult(providerKey);
+    return Task.FromResult(CurrentTenant.Id?.ToString());
+}
+```
+
+`EditionFeatureManagementProvider`:
+
+```csharp
+protected override Task<string> NormalizeProviderKeyAsync(string providerKey)
+{
+    if (providerKey != null) return Task.FromResult(providerKey);
+    return Task.FromResult(PrincipalAccessor.Principal?.FindEditionId()?.ToString("N"));
+}
+```
+
+Note `"N"` formatting (no hyphens). The framework's `EditionFeatureValueProvider` uses the same format. If you persist values from a custom path that uses `"D"` formatting, the read and write keys won't match.
+
+`DefaultValueFeatureManagementProvider` is special — it doesn't inherit from `FeatureManagementProvider`, has no `Store`, and throws on `SetAsync`/`ClearAsync`:
+
+```csharp
+public virtual Task SetAsync(FeatureDefinition feature, string value, string providerKey)
+    => throw new AbpException(
+        $"Can not set default value of a feature. It is only possible while defining the feature in a {typeof(IFeatureDefinitionProvider)} implementation.");
+```
+
+That's deliberate: defaults are *code*. The DB never overrides a default.
+
+## `FeatureManager`
+
+`FeatureManager` is the public write API. Its key behaviour is in `SetAsync` — overrides that match the fallback are stored as `null` so they don't bloat the database:
+
+```csharp
+if (providers.Count > 1 && !forceToSet && value != null)
+{
+    await using (await providers[0].HandleContextAsync(providerName, providerKey))
+    {
+        var fallbackValue = await GetOrNullInternalAsync(name, providers[1].Name, null);
+        if (fallbackValue.Value == value)
+            value = null;  // store null instead → reverts to fallback
+    }
+}
+```
+
+In practice: setting `EnableNotifications = true` on a tenant when the edition already has `EnableNotifications = true` clears the tenant override. Pass `forceToSet: true` to keep an explicit row regardless.
+
+The `GetOrNullInternalAsync` loop walks providers in **reverse** of the configured order, skipping until it hits the requested `providerName`, and returns the first non-null. That's why `Providers` order matters even for reads through `IFeatureManager` (as opposed to `IFeatureChecker`, which uses `AbpFeatureOptions.ValueProviders`).
+
+The `TenantFeatureManagerExtensions`, `EditionFeatureManagerExtensions`, and `DefaultValueFeatureManagerExtensions` add ergonomic wrappers:
+
+```csharp
+await featureManager.SetForTenantAsync(tenantId, "MyApp.Reports", "true");
+var value = await featureManager.GetOrNullForEditionAsync("MyApp.MaxUsers", editionId);
+```
+
+These all delegate to `IFeatureManager.SetAsync` / `GetOrNullAsync` with the right provider-name + Guid-to-string conversion.
+
+## Static feature saver
+
+`StaticFeatureSaver` is run by the module's `OnApplicationInitializationAsync` (only when `SaveStaticFeaturesToDatabase = true`). Pseudo-flow:
+
+1. Acquire `{KeyPrefix}_{AppName}_AbpFeatureUpdateLock` distributed lock. Skip if another instance has it.
+2. Serialize all groups/features via `IFeatureDefinitionSerializer` to `(FeatureGroupDefinitionRecord[], FeatureDefinitionRecord[])`.
+3. Compute an MD5 hash of the serialized records + `AbpFeatureOptions.DeletedFeatureGroups` + `DeletedFeatures`.
+4. Compare against `{KeyPrefix}_{AppName}_AbpFeaturesHash` cache. If equal, no-op.
+5. Otherwise acquire `{KeyPrefix}_Common_AbpFeatureUpdateLock` (cross-app), open a transactional UoW, call `UpdateChangedFeatureGroupsAsync` and `UpdateChangedFeaturesAsync`. Those compare each serialized record against the DB version via `HasSameData`, `Patch` changes in place, insert new records, and delete the ones the user listed under `DeletedFeatures`/`DeletedFeatureGroups`.
+6. On any change, bump `{KeyPrefix}_AbpInMemoryFeatureCacheStamp` so all other nodes' `DynamicFeatureDefinitionStore` refreshes within 30 s.
+7. Update the application-specific hash cache to the new MD5.
+
+The hash is computed with custom `JsonSerializerOptions` that strip `Id` from both record types — otherwise every reboot would emit a "changed" hash even with no semantic change.
+
+## Dynamic store
+
+`DynamicFeatureDefinitionStore` is registered with `[Dependency(ReplaceServices = true)]` — replacing the framework's `NullDynamicFeatureDefinitionStore`. The framework `FeatureDefinitionManager` calls it after the static store, so any DB row that *adds* a feature absent from code becomes available transparently.
+
+The in-memory cache (`DynamicFeatureDefinitionStoreInMemoryCache`) is a singleton holding `IDictionary<string, FeatureDefinition>` + `IDictionary<string, FeatureGroupDefinition>`. `EnsureCacheIsUptoDateAsync` is gated by:
+
+- `StoreCache.LastCheckTime` — if within 30 s, return.
+- Stamp comparison — if the distributed stamp differs, repopulate.
+
+`FillAsync` recursively materializes parent-child feature trees from flat records (`featureRecord.ParentName` link). Localized strings are deserialized via `ILocalizableStringSerializer` (a framework primitive).
+
+## `FeatureDefinitionSerializer`
+
+Walks `FeatureGroupDefinition.GetFeaturesWithChildren()` and produces flat record arrays. Of note:
+
+- `LocalizableStringSerializer.Serialize` uses `CultureInfo.InvariantCulture` (`CultureHelper.Use(InvariantCulture)`) so persisted display names are culture-stable.
+- Allowed providers are joined with `,`. The deserializer splits on the same character — feature names containing `,` would corrupt this list, but feature names can't legally contain a `,` (validated by `Check.NotNullOrWhiteSpace`).
+- `ValueType` is round-tripped through `StringValueTypeSerializer` → `IJsonSerializer.Serialize/Deserialize` — *not* the System.Text.Json options that ship with the Domain.Shared module. That means the JSON converter set used at serialization time is the framework's primary `IJsonSerializer`, currently System.Text.Json based on `AbpSystemTextJsonSerializerOptions`. Both paths share the same `StringValueTypeJsonConverter` registration, so they agree on shape.
+
+## Gotchas
+
+- **The Domain module unconditionally registers `TenantFeatureManagementProvider`.** Even in non-multitenant apps — the provider just resolves `CurrentTenant.Id?.ToString()` which becomes `null`, and the chain proceeds. The TODO in the source acknowledges this should arguably live in `AbpTenantManagementDomainModule` instead.
+- **`AsyncHelper.RunSync` in `OnApplicationInitialization`.** The module overrides both sync and async lifecycle hooks; the sync version sync-blocks on the async one. This is fine in normal ASP.NET Core startup but problematic in tooling-style environments without a sync context.
+- **`StaticFeatureSaver` blows away the row Id when you delete and re-add a feature** with the same name. Because it inserts new records via `IFeatureGroupDefinitionRecordRepository.InsertManyAsync` with `GuidGenerator.Create()`, the Id changes. Any external system that referenced `FeatureDefinitionRecord.Id` will lose the link.
+- **Cache key collisions on `null` `ProviderKey`.** The cache key for `pk:null` is shared across providers if you accidentally pass the literal string `"null"` as a provider key. The repository treats string `"null"` as a value, the cache writes it under `pk:null` because of `string.Concat`. Always use `null`, never `"null"`, for the host-default row.
+- **Don't enable both `SaveStaticFeaturesToDatabase = true` and a custom `IDynamicFeatureDefinitionStore`** without bumping the cache stamp in your custom store — readers will hit the static records from the saver alongside your replacements.
+- For the abstract `FeatureDefinition`, `IFeatureDefinitionContext`, `IFeatureDefinitionManager`, and the wider context of `IDynamicFeatureDefinitionStore` (and how the framework merges static + dynamic), see [framework/cross/features](/framework/cross/features).
