@@ -1,0 +1,240 @@
+---
+title: "Authentication Configuration"
+description: "End-to-end reference for the AuthServer block in appsettings.json plus the JwtBearer, Cookie and OpenIddict options that ABP host templates configure."
+---
+
+ABP application templates split authentication across three roles:
+
+1. The **AuthServer** project hosts OpenIddict and issues tokens.
+2. **API hosts** (`*.HttpApi.Host`) validate JWTs issued by the AuthServer.
+3. **UI hosts** (Blazor.Server, Web.Host, MVC) act as OpenID Connect *clients*
+   and rely on cookie authentication once the OIDC handshake is complete.
+
+All three projects read the same `AuthServer` block in `appsettings.json` but
+use different parts of it.
+
+## `AuthServer` keys at a glance
+
+| Key                                | Used by             | Type     | Description                                                                                  |
+| ---------------------------------- | ------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `AuthServer:Authority`             | API + UI hosts      | `string` | Issuer URL. Drives `JwtBearerOptions.Authority` and the OIDC discovery document.              |
+| `AuthServer:RequireHttpsMetadata`  | API + UI hosts      | `bool`   | Whether discovery must be served over HTTPS. Set `false` only in local dev.                   |
+| `AuthServer:SwaggerClientId`       | API hosts           | `string` | Client ID used by Swagger UI's OAuth flow.                                                    |
+| `AuthServer:SwaggerClientSecret`   | API hosts           | `string` | Optional secret for confidential Swagger flow.                                                |
+| `AuthServer:ClientId`              | UI hosts            | `string` | Client ID registered with OpenIddict for this UI app.                                         |
+| `AuthServer:ClientSecret`          | UI hosts            | `string` | Matching secret.                                                                              |
+| `AuthServer:MetaAddress`           | API + UI hosts      | `string` | Override for the `metadata_address` endpoint when issuer ≠ discovery URL (e.g. behind proxy). |
+
+## JwtBearer (API hosts)
+
+The HTTP API host template wires JWT validation directly from `AuthServer:*`:
+
+```csharp HttpApiHostModule.cs lines icon="file-code"
+private void ConfigureAuthentication(
+    ServiceConfigurationContext context,
+    IConfiguration configuration)
+{
+    context.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.Authority = configuration["AuthServer:Authority"];
+            options.RequireHttpsMetadata =
+                Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+            options.Audience = "MyProjectName";
+        });
+}
+```
+
+`options.Audience` is the application name registered in OpenIddict's
+**Scopes** table during `DbMigrator` seed. The discovery document is fetched
+from `{Authority}/.well-known/openid-configuration`.
+
+To accept multiple audiences, set
+`options.TokenValidationParameters.ValidAudiences = new[]{ "MyProjectName", "MyProjectName.Admin" }`.
+
+## Cookie + OIDC (UI hosts)
+
+The MVC / Blazor Server templates pair cookie authentication with the
+OpenID Connect handler:
+
+```csharp
+context.Services.AddAuthentication(options =>
+    {
+        options.DefaultScheme          = CookieAuthenticationDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = OpenIdConnectDefaults.AuthenticationScheme;
+    })
+    .AddCookie("Cookies", options =>
+    {
+        options.ExpireTimeSpan = TimeSpan.FromDays(365);
+    })
+    .AddAbpOpenIdConnect("oidc", options =>
+    {
+        options.Authority         = configuration["AuthServer:Authority"];
+        options.RequireHttpsMetadata =
+            Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+        options.ResponseType      = OpenIdConnectResponseType.Code;
+
+        options.ClientId          = configuration["AuthServer:ClientId"];
+        options.ClientSecret      = configuration["AuthServer:ClientSecret"];
+
+        options.UsePkce           = true;
+        options.SaveTokens        = true;
+        options.GetClaimsFromUserInfoEndpoint = true;
+
+        options.Scope.Add("roles");
+        options.Scope.Add("email");
+        options.Scope.Add("phone");
+        options.Scope.Add("MyProjectName");
+    });
+```
+
+`AddAbpOpenIdConnect` is an ABP wrapper around the standard handler that:
+
+- registers the dynamic claims pipeline (so claims are refreshed via the
+  dynamic-claims principal contributor),
+- maps `nameidentifier` → `sub` to match `AbpClaimTypes`,
+- and configures back-channel HTTP factories to flow ABP's `IHttpClientFactory`.
+
+## `AbpOpenIddictAspNetCoreOptions`
+
+The AuthServer project additionally configures
+`Volo.Abp.OpenIddict.AbpOpenIddictAspNetCoreOptions`:
+
+```csharp
+public class AbpOpenIddictAspNetCoreOptions
+{
+    /// <summary>
+    /// Updates AbpClaimTypes to be compatible with OpenIddict claims.
+    /// Default: true.
+    /// </summary>
+    public bool UpdateAbpClaimTypes { get; set; } = true;
+
+    /// <summary>
+    /// Set false to suppress AddDeveloperSigningCredential() call on the OpenIddictBuilder.
+    /// Default: true.
+    /// </summary>
+    public bool AddDevelopmentEncryptionAndSigningCertificate { get; set; } = true;
+}
+```
+
+| Property                                       | Default | Notes                                                                                                          |
+| ---------------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
+| `UpdateAbpClaimTypes`                          | `true`  | Aligns `AbpClaimTypes.UserId` with `Claims.Subject` so OpenIddict-issued tokens flow through ABP's claims map. |
+| `AddDevelopmentEncryptionAndSigningCertificate`| `true`  | Adds a developer signing cert. **Disable in production** and supply your own X509 certificate.                 |
+
+In production set both via `PreConfigure<AbpOpenIddictAspNetCoreOptions>`:
+
+```csharp
+PreConfigure<AbpOpenIddictAspNetCoreOptions>(builder =>
+{
+    builder.AddDevelopmentEncryptionAndSigningCertificate = false;
+});
+
+PreConfigure<OpenIddictServerBuilder>(serverBuilder =>
+{
+    serverBuilder.AddSigningCertificate(LoadCertificate());
+    serverBuilder.AddEncryptionCertificate(LoadCertificate());
+});
+```
+
+## Wildcard redirect URIs
+
+When the AuthServer needs to allow tenant-specific redirect URIs
+(`https://{tenant}.myapp.com/signin-oidc`), enable wildcard matching with
+`Volo.Abp.OpenIddict.WildcardDomains.AbpOpenIddictWildcardDomainOptions`:
+
+```csharp
+PreConfigure<AbpOpenIddictWildcardDomainOptions>(options =>
+{
+    options.EnableWildcardDomainSupport = true;
+    options.WildcardDomainsFormat.Add("https://{0}.myapp.com");
+});
+```
+
+## Anti-forgery (cookie/Cookie + same-site)
+
+UI hosts also bind `Volo.Abp.AspNetCore.Mvc.AntiForgery.AbpAntiForgeryOptions`:
+
+| Property                          | Type                | Default                                                  |
+| --------------------------------- | ------------------- | -------------------------------------------------------- |
+| `TokenCookie`                     | `CookieBuilder`     | name `XSRF-TOKEN`, `HttpOnly=false`, `SameSite=None`     |
+| `TokenCookie.Expiration`          | `TimeSpan?`         | `TimeSpan.FromDays(3650)` (10 years)                     |
+| `AuthCookieSchemaName`            | `string?`           | `"Identity.Application"`                                 |
+| `AutoValidate`                    | `bool`              | `true`                                                   |
+| `AutoValidateFilter`              | `Predicate<Type>`   | `t => true`                                              |
+| `AutoValidateIgnoredHttpMethods`  | `HashSet<string>`   | `{ "GET", "HEAD", "TRACE", "OPTIONS" }`                  |
+
+Tighten the cookie for production:
+
+```csharp
+Configure<AbpAntiForgeryOptions>(options =>
+{
+    options.TokenCookie.Name = "MyProjectName.XSRF";
+    options.TokenCookie.SecurePolicy = CookieSecurePolicy.Always;
+    options.TokenCookie.SameSite = SameSiteMode.Lax;
+});
+```
+
+## `AbpRemoteServiceOptions` and the `AuthClient` chain
+
+When an API host needs to call **another** ABP API (for example, a
+back-channel call from the Web.Host to HttpApi.Host), it both:
+
+1. uses the JWT/Cookie of the inbound request, and
+2. can fall back to a *client-credentials* flow using values from
+   `AuthClient` / `IdentityClients` sections.
+
+The relevant options class is `Volo.Abp.Http.Client.AbpRemoteServiceOptions`:
+
+```csharp
+public class AbpRemoteServiceOptions
+{
+    public RemoteServiceConfigurationDictionary RemoteServices { get; set; }
+}
+```
+
+`RemoteServices` is keyed by *service name*; each value contains a `BaseUrl`,
+optional `Version`, and the `UseCurrentAccessToken` flag. Pair it with an
+`IdentityClients` section consumed by the IdentityModel client library:
+
+```json
+"IdentityClients": {
+  "Default": {
+    "GrantType":    "client_credentials",
+    "ClientId":     "MyProjectName_BackgroundWorker",
+    "ClientSecret": "1q2w3e*",
+    "Authority":    "https://localhost:44301",
+    "Scope":        "MyProjectName"
+  }
+}
+```
+
+## End-to-end sample (production)
+
+```json
+{
+  "AuthServer": {
+    "Authority":            "https://login.contoso.com",
+    "RequireHttpsMetadata": "true",
+    "SwaggerClientId":      "MyProjectName_Swagger"
+  },
+  "RemoteServices": {
+    "Default": { "BaseUrl": "https://api.contoso.com/" }
+  },
+  "IdentityClients": {
+    "Default": {
+      "GrantType":    "client_credentials",
+      "ClientId":     "MyProjectName_App_Mvc",
+      "ClientSecret": "<from-secret-store>",
+      "Authority":    "https://login.contoso.com",
+      "Scope":        "MyProjectName"
+    }
+  }
+}
+```
+
+## Related pages
+
+- [appsettings](/reference/config/appsettings)
+- [options-pattern](/reference/config/options-pattern)
+- [module-options](/reference/config/module-options)

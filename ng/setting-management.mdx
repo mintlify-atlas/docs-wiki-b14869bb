@@ -1,0 +1,288 @@
+---
+title: "@abp/ng.setting-management"
+description: "Tabbed settings shell — drives the global Settings page and lets modules register their own tabs via SettingTabsService."
+---
+
+`@abp/ng.setting-management` is the tabbed settings page reachable at `/setting-management`. It owns nothing setting-specific itself — the tabs come from `SettingTabsService`, which other modules (Feature Management, Identity, custom modules) call to register their slice of the UI.
+
+The package is split into three sub-entries:
+
+| Import | Purpose |
+| ------ | ------- |
+| `@abp/ng.setting-management` | lazy module hosting `<abp-setting-management>` |
+| `@abp/ng.setting-management/config` | eager module — routes, menu items, `SettingTabsService`, `EmailSettingGroupComponent` |
+| (no dedicated proxy entry — email settings live in `/config`) |
+
+## File tree
+
+```text
+packages/setting-management/
+├── package.json            # "@abp/ng.setting-management" — version 7.4.0
+├── ng-package.json
+├── config/                 # @abp/ng.setting-management/config
+│   └── src/
+│       ├── public-api.ts
+│       └── lib/
+│           ├── setting-management-config.module.ts
+│           ├── services/settings-tabs.service.ts (SettingTabsService)
+│           ├── providers/
+│           │   ├── route.provider.ts
+│           │   ├── setting-tab.provider.ts
+│           │   ├── features.token.ts
+│           │   └── visible.provider.ts
+│           ├── proxy/
+│           │   ├── email-settings.service.ts
+│           │   └── models.ts
+│           ├── components/email-setting-group/email-setting-group.component.ts
+│           └── enums/
+│               ├── policy-names.ts
+│               ├── route-names.ts
+│               └── setting-tab-names.ts
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── setting-management.module.ts
+        ├── setting-management-routing.module.ts
+        ├── components/
+        │   ├── setting-management.component.ts
+        │   └── setting-management.component.html
+        └── enums/
+```
+
+## `public-api.ts`
+
+```typescript
+// packages/setting-management/src/public-api.ts
+export * from './lib/setting-management.module';
+export * from './lib/components/setting-management.component';
+export * from './lib/enums';
+```
+
+The config entry exports more surface area:
+
+```typescript
+// packages/setting-management/config/src/public-api.ts
+export * from './lib/components/email-setting-group/email-setting-group.component';
+export * from './lib/enums';
+export * from './lib/providers';
+export * from './lib/proxy';
+export * from './lib/services';
+export * from './lib/setting-management-config.module';
+```
+
+## SettingManagementModule (lazy)
+
+```typescript
+// packages/setting-management/src/lib/setting-management.module.ts
+@NgModule({
+  declarations: [SettingManagementComponent],
+  exports: [SettingManagementComponent],
+  imports: [SettingManagementRoutingModule, CoreModule, ThemeSharedModule, PageModule],
+})
+export class SettingManagementModule {
+  static forChild(): ModuleWithProviders<SettingManagementModule> {
+    return {
+      ngModule: SettingManagementModule,
+      providers: [],
+    };
+  }
+
+  static forLazy(): NgModuleFactory<SettingManagementModule> {
+    return new LazyModuleFactory(SettingManagementModule.forChild());
+  }
+}
+```
+
+Lazy loaded the usual way:
+
+```typescript
+{
+  path: 'setting-management',
+  loadChildren: () =>
+    import('@abp/ng.setting-management').then(m => m.SettingManagementModule.forLazy()),
+}
+```
+
+## SettingManagementComponent
+
+The component is intentionally tiny — it subscribes to `SettingTabsService.visible$` and shows whichever tabs the user has permission to see:
+
+```typescript
+// packages/setting-management/src/lib/components/setting-management.component.ts
+@Component({
+  selector: 'abp-setting-management',
+  templateUrl: './setting-management.component.html',
+})
+export class SettingManagementComponent implements OnDestroy, OnInit {
+  private subscription = new Subscription();
+  settings: ABP.Tab[] = [];
+  selected!: ABP.Tab;
+
+  trackByFn: TrackByFunction<ABP.Tab> = (_, item) => item.name;
+
+  constructor(private settingTabsService: SettingTabsService) {}
+
+  ngOnInit() {
+    this.subscription.add(
+      this.settingTabsService.visible$.subscribe(settings => {
+        this.settings = settings;
+        if (!this.selected) this.selected = this.settings[0];
+      }),
+    );
+  }
+
+  ngOnDestroy() { this.subscription.unsubscribe(); }
+}
+```
+
+The template loops over `settings`, renders a vertical nav with `ngb-nav`, and dynamically instantiates `selected.component` inside the right-hand pane.
+
+## SettingTabsService
+
+The registry sits in `@abp/ng.setting-management/config` and extends the framework-wide `AbstractNavTreeService<ABP.Tab>`:
+
+```typescript
+// packages/setting-management/config/src/lib/services/settings-tabs.service.ts
+@Injectable({ providedIn: 'root' })
+export class SettingTabsService extends AbstractNavTreeService<ABP.Tab> {}
+```
+
+`AbstractNavTreeService` (in `@abp/ng.core`) provides the familiar mutation API:
+
+```typescript
+settingTabsService.add([
+  { name: 'Identity', order: 200, requiredPolicy: 'AbpIdentity', component: IdentityTab },
+]);
+
+settingTabsService.patch('Identity', { order: 1 });
+settingTabsService.remove(['SomeOldTab']);
+```
+
+`visible$` is the filtered observable consumed by `SettingManagementComponent`:
+
+* every tab's `requiredPolicy` is evaluated against `ConfigStateService`;
+* hidden tabs are filtered out;
+* the result is sorted by `order` ascending.
+
+### `ABP.Tab` shape
+
+```typescript
+interface Tab {
+  name: string;                  // unique key (use eSettingManagementTabNames or your own enum)
+  order: number;
+  displayName?: string;          // optional — falls back to localizing `::Settings:<name>`
+  requiredPolicy?: string;
+  component?: Type<any>;         // rendered in the right pane
+  invisible?: boolean;           // hide without removing
+}
+```
+
+## SettingManagementConfigModule.forRoot()
+
+The eager config module wires everything together:
+
+```typescript
+// packages/setting-management/config/src/lib/setting-management-config.module.ts
+@NgModule({
+  imports: [CoreModule, ThemeSharedModule, NgxValidateCoreModule],
+  declarations: [EmailSettingGroupComponent],
+  exports: [EmailSettingGroupComponent],
+})
+export class SettingManagementConfigModule {
+  static forRoot(): ModuleWithProviders<SettingManagementConfigModule> {
+    return {
+      ngModule: SettingManagementConfigModule,
+      providers: [
+        SETTING_MANAGEMENT_ROUTE_PROVIDERS,       // adds menu entry + route
+        SETTING_MANAGEMENT_SETTING_TAB_PROVIDERS, // adds the built-in "Email Settings" tab
+        SETTING_MANAGEMENT_FEATURES_PROVIDERS,    // associates feature dependencies with tabs
+        SETTING_MANAGEMENT_VISIBLE_PROVIDERS,     // hides settings menu if all tabs are hidden
+      ],
+    };
+  }
+}
+```
+
+The four provider arrays are `APP_INITIALIZER` factories that call into `RoutesService` and `SettingTabsService` at startup.
+
+## Registering a custom tab
+
+```typescript
+import { Component, NgModule, APP_INITIALIZER } from '@angular/core';
+import { SettingTabsService } from '@abp/ng.setting-management/config';
+import { eSettingManagementTabNames } from '@abp/ng.setting-management/config';
+
+@Component({
+  selector: 'app-notifications-tab',
+  template: `<h3>Notifications</h3>`,
+})
+export class NotificationsTabComponent {}
+
+export function registerNotificationsTab(tabs: SettingTabsService) {
+  return () => {
+    tabs.add([
+      {
+        name: 'Notifications',
+        order: 500,
+        requiredPolicy: 'MyApp.Notifications.ManageSettings',
+        component: NotificationsTabComponent,
+      },
+    ]);
+  };
+}
+
+@NgModule({
+  declarations: [NotificationsTabComponent],
+  providers: [
+    {
+      provide: APP_INITIALIZER,
+      useFactory: registerNotificationsTab,
+      deps: [SettingTabsService],
+      multi: true,
+    },
+  ],
+})
+export class NotificationsConfigModule {}
+```
+
+## EmailSettingGroupComponent
+
+The config entry also ships a reusable form for the *Email Settings* tab — it wraps `EmailSettingsService` (proxy auto-generated under `config/src/lib/proxy/`) and exposes a typed reactive form with SMTP host/port/username/password fields. Other settings tabs that need email knobs can reuse it directly:
+
+```html
+<abp-email-setting-group></abp-email-setting-group>
+```
+
+## Usage
+
+```typescript
+// app.module.ts
+@NgModule({
+  imports: [
+    SettingManagementConfigModule.forRoot(),
+    FeatureManagementModule.forRoot(),   // adds the "Feature Management" tab
+  ],
+})
+export class AppModule {}
+
+// app-routing.module.ts
+{
+  path: 'setting-management',
+  loadChildren: () =>
+    import('@abp/ng.setting-management').then(m => m.SettingManagementModule.forLazy()),
+}
+```
+
+## Gotchas
+
+* `SettingTabsService` is `providedIn: 'root'`, so calling `add(...)` from anywhere registers tabs globally — make sure each tab has a unique `name` or the second `add` will replace the first.
+* The tab `component` is *not* re-instantiated on every selection — `ngFor` over `settings` with `trackByFn` keeps the views alive. If your tab's state depends on lifecycle hooks, prefer `ngOnInit` to capture state at first display.
+* The lazy module ships no providers in `forChild()` — *all* configuration (route registration, tab registration) must happen via the eager `*ConfigModule.forRoot()` calls.
+* `SETTING_MANAGEMENT_VISIBLE_PROVIDERS` hides the *menu link* when every tab is filtered out, but the route is still reachable directly. Add a `PermissionGuard` to the route data (`requiredPolicy`) if you want a hard guard.
+* `ABP.Tab.displayName` accepts both literal strings and `::Resource:Key` localization keys. The latter is preferred to keep translations centralised.
+
+## Related pages
+
+* `ng/feature-management.mdx` — registers itself as a setting tab.
+* `ng/core.mdx` — `AbstractNavTreeService` semantics.
+* `ng/theme-shared.mdx` — `ng-bootstrap` nav components consumed by the tab UI.

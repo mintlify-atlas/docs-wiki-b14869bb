@@ -1,0 +1,263 @@
+---
+title: "Blazor.Server Project"
+description: "Server-rendered Blazor host that runs UI logic on the server over SignalR — non-tiered flavour that bundles the API, application services, and OpenIddict server in one process."
+---
+
+`MyCompanyName.MyProjectName.Blazor.Server` is the **Blazor Server** host generated when you run `abp new ... -u blazor-server` (without `--tiered`). Components execute on the server; the browser only receives DOM diffs over a SignalR circuit. The same process serves the HTTP API, OpenIddict authentication endpoints, and the Razor Pages for the Account module.
+
+Compared to Blazor WebAssembly, this model is closer to traditional ASP.NET — components have direct access to `IApplicationService`, `IRepository`, and the EF Core `DbContext`, all running inside the host's DI container.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.Blazor.Server/
+├── Menus/
+│   ├── MyProjectNameMenuContributor.cs
+│   └── MyProjectNameMenus.cs
+├── Pages/
+│   └── ...
+├── Properties/
+│   └── launchSettings.json
+├── wwwroot/
+│   └── ...
+├── MyCompanyName.MyProjectName.Blazor.Server.csproj
+├── MyProjectNameBlazorModule.cs
+├── MyProjectNameBrandingProvider.cs
+├── MyProjectNameComponentBase.cs
+├── Program.cs
+├── _Imports.razor
+├── abp.resourcemapping.js
+├── appsettings.Development.json
+├── appsettings.json
+├── package.json
+└── web.config
+```
+
+## csproj at a glance
+
+| Property                        | Value                                              |
+| ------------------------------- | -------------------------------------------------- |
+| `Sdk`                           | `Microsoft.NET.Sdk.Web`                            |
+| `TargetFramework`               | `net7.0`                                           |
+| `Nullable`                      | `enable`                                           |
+| `PreserveCompilationReferences` | `true`                                             |
+| `UserSecretsId`                 | `MyCompanyName.MyProjectName-4681b4fd-...`         |
+
+| Project / Package reference                                                                 | Purpose                                |
+| ------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `Blazorise.Bootstrap5` (`1.3.1`)                                                            | Component library                      |
+| `Blazorise.Icons.FontAwesome` (`1.3.1`)                                                     | Icons                                  |
+| `Serilog.AspNetCore` / `Serilog.Sinks.Async`                                                | Logging                                |
+| `Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy`                                                   | Tenant switch                          |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared`                                                   | Theme base                             |
+| `Volo.Abp.AutoMapper`                                                                       | Mapping                                |
+| `Volo.Abp.AspNetCore.Components.Server.Theming`                                             | Server-side theming                    |
+| `Volo.Abp.AspNetCore.Components.Web.Theming`                                                | Shared theming                         |
+| `Volo.Abp.AspNetCore.Components.Server.LeptonXLiteTheme` (`2.4.*-*` package)                | Default theme                          |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite` (`2.4.*-*` package)                          | MVC + Account UI theme                 |
+| `Volo.Abp.Autofac`                                                                          | Property-injection DI                  |
+| `Volo.Abp.Swashbuckle`                                                                      | Swagger UI                             |
+| `Volo.Abp.AspNetCore.Serilog`                                                               | HTTP context enrichers                 |
+| `Volo.Abp.Account.Web.OpenIddict`                                                           | Login pages + OIDC server              |
+| `Volo.Abp.Identity.Blazor.Server`                                                           | User/role admin components             |
+| `Volo.Abp.TenantManagement.Blazor.Server`                                                   | Tenant admin components                |
+| `Volo.Abp.SettingManagement.Blazor.Server`                                                  | Settings components                    |
+| `MyCompanyName.MyProjectName.Application`                                                   | Business logic                         |
+| `MyCompanyName.MyProjectName.HttpApi`                                                       | Manual controllers + base              |
+| `MyCompanyName.MyProjectName.EntityFrameworkCore`                                           | Persistence                            |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameApplicationModule),
+    typeof(MyProjectNameEntityFrameworkCoreModule),
+    typeof(MyProjectNameHttpApiModule),
+    typeof(AbpAutofacModule),
+    typeof(AbpSwashbuckleModule),
+    typeof(AbpAspNetCoreSerilogModule),
+    typeof(AbpAccountWebOpenIddictModule),
+    typeof(AbpAspNetCoreComponentsServerLeptonXLiteThemeModule),
+    typeof(AbpAspNetCoreMvcUiLeptonXLiteThemeModule),
+    typeof(AbpIdentityBlazorServerModule),
+    typeof(AbpTenantManagementBlazorServerModule),
+    typeof(AbpSettingManagementBlazorServerModule))]
+public class MyProjectNameBlazorModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+        {
+            options.AddAssemblyResource(
+                typeof(MyProjectNameResource),
+                typeof(MyProjectNameDomainModule).Assembly,
+                typeof(MyProjectNameDomainSharedModule).Assembly,
+                typeof(MyProjectNameApplicationModule).Assembly,
+                typeof(MyProjectNameApplicationContractsModule).Assembly,
+                typeof(MyProjectNameBlazorModule).Assembly);
+        });
+
+        PreConfigure<OpenIddictBuilder>(builder =>
+        {
+            builder.AddValidation(options =>
+            {
+                options.AddAudiences("MyProjectName");
+                options.UseLocalServer();
+                options.UseAspNetCore();
+            });
+        });
+    }
+    // ConfigureServices + OnApplicationInitialization
+}
+```
+
+Highlights worth calling out:
+
+- **Two themes** are referenced: the MVC theme (`LeptonXLite`) for Account/Razor pages and the Blazor theme (`Server.LeptonXLiteTheme`) for components. Both must be registered or the login page renders without styling.
+- **Application + EntityFrameworkCore are referenced directly.** Components can resolve `IRepository<T>` and `IBookAppService` from DI without HTTP round-trips.
+
+### Bundles
+
+```csharp
+options.StyleBundles.Configure(
+    LeptonXLiteThemeBundles.Styles.Global,
+    bundle => bundle.AddFiles("/global-styles.css"));
+
+options.StyleBundles.Configure(
+    BlazorLeptonXLiteThemeBundles.Styles.Global,
+    bundle =>
+    {
+        bundle.AddFiles("/blazor-global-styles.css");
+        bundle.AddFiles("/MyCompanyName.MyProjectName.Blazor.Server.styles.css");
+    });
+```
+
+The second bundle adds Blazor's CSS isolation output (`*.styles.css`) to the global bundle. Remove that line if you choose not to use CSS isolation.
+
+### Authentication
+
+Same `ForwardIdentityAuthenticationForBearer(OpenIddictValidationAspNetCoreDefaults.AuthenticationScheme)` call as `HttpApi.HostWithIds` — the host's API surface is bearer-authenticated, the Blazor components themselves rely on the cookie produced by Razor Pages login.
+
+### Virtual file system
+
+In development the module pins every depended module to its source path under `framework/` and `modules/`. This includes Blazor-specific modules like `AbpIdentityBlazorServerModule` so editing a `.razor` component in the identity module triggers hot reload.
+
+## Program.cs
+
+```csharp
+public class Program
+{
+    public async static Task<int> Main(string[] args)
+    {
+        Log.Logger = /* Serilog */;
+        try
+        {
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Host.AddAppSettingsSecretsJson().UseAutofac().UseSerilog();
+            await builder.AddApplicationAsync<MyProjectNameBlazorModule>();
+            var app = builder.Build();
+            await app.InitializeApplicationAsync();
+            await app.RunAsync();
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            if (ex is HostAbortedException) throw;
+            Log.Fatal(ex, "Host terminated unexpectedly!");
+            return 1;
+        }
+        finally { Log.CloseAndFlush(); }
+    }
+}
+```
+
+Same shape as the other Web hosts.
+
+## appsettings.json
+
+```json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44308",
+    "RedirectAllowedUrls": "https://localhost:44308"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "AuthServer": {
+    "Authority": "https://localhost:44308",
+    "RequireHttpsMetadata": "false"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+`AuthServer:Authority` equals `App:SelfUrl` — this host **is** the OpenID provider. The `MyProjectName_BlazorServer` OpenIddict client does not need a separate URL; the OIDC validation handler uses the local server.
+
+## Key types
+
+### MyProjectNameComponentBase
+
+```csharp
+public abstract class MyProjectNameComponentBase : AbpComponentBase
+{
+    protected MyProjectNameComponentBase()
+    {
+        LocalizationResource = typeof(MyProjectNameResource);
+    }
+}
+```
+
+Inherit your components from this class to get `L["..."]`, the cascading `AuthenticationState`, and ABP UI services pre-wired.
+
+### MyProjectNameBrandingProvider
+
+`IBrandingProvider` implementation that controls the application name shown by the LeptonX Lite theme.
+
+### MyProjectNameMenus / MyProjectNameMenuContributor
+
+Same pattern as the MVC host — define menu identifiers as constants, insert a Home item, and hide the Tenant Management menu when multi-tenancy is off.
+
+## OnApplicationInitialization
+
+```csharp
+app.UseAbpRequestLocalization();
+if (!env.IsDevelopment()) app.UseErrorPage();
+app.UseCorrelationId();
+app.UseStaticFiles();
+app.UseRouting();
+app.UseAuthentication();
+app.UseAbpOpenIddictValidation();
+if (MultiTenancyConsts.IsEnabled) app.UseMultiTenancy();
+app.UseUnitOfWork();
+app.UseAuthorization();
+app.UseSwagger();
+app.UseAbpSwaggerUI(...);
+app.UseAuditing();
+app.UseAbpSerilogEnrichers();
+app.UseConfiguredEndpoints();
+```
+
+The endpoint mapping (`app.UseConfiguredEndpoints()`) registers both the Razor Page routes for the Account module **and** the SignalR endpoint `/_blazor` that backs the Blazor circuits.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Custom component                      | `Pages/MyPage.razor` with `@page "/my-page"`                     |
+| Custom menu                           | `Menus/MyProjectNameMenuContributor.ConfigureMainMenuAsync`      |
+| Replace branding                      | `MyProjectNameBrandingProvider`                                  |
+| Add a CSS file                        | `Configure<AbpBundlingOptions>` → `BlazorLeptonXLiteThemeBundles.Styles.Global` |
+| Use scoped services                   | Inject and remember DI scope rules (see Gotchas)                 |
+
+## Gotchas
+
+- **Blazor Server circuits are scoped.** A single SignalR connection equals one DI scope that lives for the duration of the connection. Singleton services injected into many components will survive every reconnect; scoped services do *not* share state between two open tabs. Designing for this is more nuanced than for a stateless HTTP request.
+- **`IRepository<T>`/`DbContext` are scoped to the circuit.** Holding a reference across an `await` boundary can leak the underlying `DbContext` for hours. Always resolve through `[Inject]` properties, not constructor fields, and use `using var scope = ScopeFactory.CreateScope()` for long-running background work.
+- **The Account module's Login page uses MVC, not Blazor.** The host loads two themes precisely because the login flow renders as a Razor Page. Removing `AbpAspNetCoreMvcUiLeptonXLiteThemeModule` produces an unstyled login screen.
+- **`MultiTenancyConsts.IsEnabled = false` removes the tenant cookie middleware.** The Razor Pages tenant switch disappears from the UI but the underlying `AbpMultiTenancyOptions.IsEnabled` is also `false`, so global queries are no longer tenant-filtered — exactly the intended behaviour.
+- **Hot reload requires `dotnet watch run`.** `dotnet run` will not pick up `.razor` changes; the embedded resource paths to `framework/` and `modules/` only help with bundled JSON/cshtml files.
+- **No `RemoteServices` section is needed.** The host calls `IApplicationService` interfaces in-process; the HTTP proxies from `HttpApi.Client` are not referenced. Adding the package would cause every call to do a self-loopback HTTP request.
+- **The Blazor circuit's authentication state changes when the cookie expires.** Use the cascading `AuthenticationStateProvider` (`Task<AuthenticationState>`) to react; the static `ICurrentUser` will *also* update once the next service call resolves, but UI components must subscribe to `AuthenticationStateChanged` to re-render.

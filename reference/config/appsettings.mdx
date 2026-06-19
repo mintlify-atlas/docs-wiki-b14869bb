@@ -1,0 +1,320 @@
+---
+title: "appsettings.json — Canonical Layout"
+description: "Reference layout of the ASP.NET Core appsettings.json file shipped by ABP templates, covering App, ConnectionStrings, AuthServer, Redis, RabbitMQ, Kafka and StringEncryption sections."
+---
+
+ABP application templates ship a stock `appsettings.json` that the host
+project loads through the standard ASP.NET Core configuration pipeline. The
+file is bound to ABP's strongly-typed options classes during module
+`ConfigureServices` (see [options-pattern](/reference/config/options-pattern)),
+but several keys are read ad-hoc with `IConfiguration["…"]` indexer access in
+the host module — for instance the `AuthServer` block is consumed by
+`ConfigureAuthentication` in the generated `*HttpApiHostModule.cs`.
+
+This page documents every top-level section that appears in the templates
+under `templates/app/aspnet-core/src/…/appsettings.json`, the type each value
+is bound to, and where the value is consumed inside the framework.
+
+## File location and load order
+
+`appsettings.json` lives next to `Program.cs` in every host project
+(`*.HttpApi.Host`, `*.Web`, `*.AuthServer`, `*.Blazor.Server`,
+`*.DbMigrator`). ASP.NET Core's host builder layers configuration sources in
+this order:
+
+1. `appsettings.json`
+2. `appsettings.{Environment}.json` (e.g. `appsettings.Development.json`)
+3. User secrets (when `Environment == Development`)
+4. Environment variables (with `__` as the section separator)
+5. Command-line arguments
+
+ABP does not override this order — later sources win, so a connection string
+exposed as `ConnectionStrings__Default` in an environment variable replaces
+the one in `appsettings.json`.
+
+## Canonical HttpApi.Host layout
+
+The non-tiered HTTP API host ships this exact file:
+
+```json appsettings.json (HttpApi.Host) lines icon="file-json"
+{
+  "App": {
+    "CorsOrigins": "https://*.MyProjectName.com,http://localhost:4200,https://localhost:44307"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "Redis": {
+    "Configuration": "127.0.0.1"
+  },
+  "AuthServer": {
+    "Authority": "https://localhost:44301",
+    "RequireHttpsMetadata": "true",
+    "SwaggerClientId": "MyProjectName_Swagger"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+## `App` section
+
+The `App` block is a convention shared by every ABP template. It is **not**
+bound to a framework options class — host code reads the keys directly:
+
+| Key                          | Type     | Default                                                      | Consumer                                                                                                |
+| ---------------------------- | -------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `App:SelfUrl`                | `string` | per-project (e.g. `https://localhost:44303` for `.Web`)      | Used as the OpenIddict issuer base URL and in redirect/back-channel URLs.                               |
+| `App:ClientUrl`              | `string` | template-specific (e.g. `http://localhost:4200` for Angular) | Used by the AuthServer when emitting links that point to the user-facing client (password reset, etc.). |
+| `App:CorsOrigins`            | `string` | comma-separated list                                         | Passed to `services.AddCors(...)` in the `ConfigureCors` method of the host module.                     |
+| `App:RedirectAllowedUrls`    | `string` | comma-separated list                                         | Used by OpenIddict / Identity to whitelist external redirect targets.                                   |
+| `App:DisablePII`             | `bool`   | `false`                                                      | When `true`, sets `IdentityModelEventSource.ShowPII = false`.                                           |
+| `App:DisableHttpsRedirection`| `bool`   | `false`                                                      | Skips `app.UseHttpsRedirection()` when `true`.                                                          |
+
+`App:SelfUrl` and `App:CorsOrigins` are the two keys you will edit most often
+when deploying to a new environment.
+
+## `ConnectionStrings` section
+
+Bound to `Volo.Abp.Data.AbpDbConnectionOptions` (more precisely to the
+`ConnectionStrings` dictionary on it). The dictionary key is the *connection
+string name* and the value is the actual ADO.NET / EF Core connection string.
+
+The framework treats `"Default"` as the fallback. See the dedicated
+[connection-strings](/reference/config/connection-strings) page for the full
+semantics and per-module overrides.
+
+```json
+"ConnectionStrings": {
+  "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True",
+  "AbpAuditLogging": "Server=…;Database=MyProjectName_AuditLogs;…",
+  "Identity":        "Server=…;Database=MyProjectName_Identity;…"
+}
+```
+
+## `AuthServer` section
+
+Used both by API hosts (as a JWT *consumer*) and by tiered Blazor/MVC hosts
+(as an OAuth client). The keys are read with `configuration["AuthServer:Key"]`
+in `MyProjectNameHttpApiHostModule.ConfigureAuthentication`:
+
+```csharp
+context.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.Authority = configuration["AuthServer:Authority"];
+        options.RequireHttpsMetadata =
+            Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+        options.Audience = "MyProjectName";
+    });
+```
+
+| Key                              | Type     | Notes                                                                                |
+| -------------------------------- | -------- | ------------------------------------------------------------------------------------ |
+| `AuthServer:Authority`           | `string` | Issuer URL of the OpenIddict / Identity Server endpoint.                             |
+| `AuthServer:RequireHttpsMetadata`| `bool`   | Whether `/.well-known/openid-configuration` must be served over HTTPS.                |
+| `AuthServer:SwaggerClientId`     | `string` | Client ID baked into the Swagger UI OAuth flow.                                       |
+| `AuthServer:ClientId`            | `string` | Client ID used by tiered hosts (Blazor.Server.Tiered, Web.Host) when calling the API. |
+| `AuthServer:ClientSecret`        | `string` | Matching secret. Replace with user secrets / environment variables in production.     |
+
+See [auth-config](/reference/config/auth-config) for the full OpenIddict /
+JWT / cookie matrix.
+
+## `Redis` section
+
+Read by `Volo.Abp.Caching.StackExchangeRedis` and the data-protection module:
+
+```json
+"Redis": {
+  "Configuration": "127.0.0.1",
+  "InstanceName": "MyProjectName:"
+}
+```
+
+`Redis:Configuration` is the StackExchange.Redis connection string (host,
+port, password, SSL). `Redis:InstanceName` is prepended to every key the
+distributed cache writes. The cache key prefix used inside the application is
+separately controlled by `AbpDistributedCacheOptions.KeyPrefix`, which the
+templates set in code:
+
+```csharp
+Configure<AbpDistributedCacheOptions>(options =>
+{
+    options.KeyPrefix = "MyProjectName:";
+});
+```
+
+## `RemoteServices` section
+
+Present in clients that call other ABP HTTP APIs (Blazor.Server.Tiered,
+Web.Host). Bound to `Volo.Abp.Http.Client.AbpRemoteServiceOptions.RemoteServices`,
+a `RemoteServiceConfigurationDictionary`.
+
+```json
+"RemoteServices": {
+  "Default": {
+    "BaseUrl": "https://localhost:44300/"
+  }
+}
+```
+
+The dictionary key is the **remote service name** used by `IDynamicProxy`
+generated proxies. `"Default"` is consulted when no service-specific entry
+exists.
+
+## `RabbitMQ` section
+
+When the RabbitMQ module is referenced, `Volo.Abp.RabbitMQ.AbpRabbitMqOptions`
+binds from a section like:
+
+```json
+"RabbitMQ": {
+  "Connections": {
+    "Default": {
+      "HostName": "localhost",
+      "Port": "5672",
+      "UserName": "guest",
+      "Password": "guest"
+    }
+  },
+  "EventBus": {
+    "ClientName": "MyProjectName",
+    "ExchangeName": "MyProjectName"
+  }
+}
+```
+
+`Connections` is a `Dictionary<string, ConnectionFactory>` keyed by
+**connection name**; the value is the raw `RabbitMQ.Client.ConnectionFactory`,
+so any property of that class (HostName, Port, VirtualHost, Uri, Ssl, …) is
+bindable. `EventBus` is `AbpRabbitMqEventBusOptions` — see
+[event-bus-config](/reference/config/event-bus-config).
+
+## `Kafka` section
+
+Mirror of the RabbitMQ layout, bound to `AbpKafkaOptions`:
+
+```json
+"Kafka": {
+  "Connections": {
+    "Default": {
+      "BootstrapServers": "localhost:9092"
+    }
+  },
+  "EventBus": {
+    "GroupId": "MyProjectName",
+    "TopicName": "MyProjectName"
+  }
+}
+```
+
+The `Default` entry binds to `Confluent.Kafka.ClientConfig`, so every
+producer/consumer setting (sasl, ssl, …) flows through.
+
+## `OpenIddict` section (AuthServer / DbMigrator only)
+
+Used by the seed contributor in the `DbMigrator` project to insert / refresh
+OpenIddict applications:
+
+```json
+"OpenIddict": {
+  "Applications": {
+    "MyProjectName_Web": {
+      "ClientId":     "MyProjectName_Web",
+      "ClientSecret": "1q2w3e*",
+      "RootUrl":      "https://localhost:44302"
+    },
+    "MyProjectName_Blazor": {
+      "ClientId": "MyProjectName_Blazor",
+      "RootUrl":  "https://localhost:44307"
+    },
+    "MyProjectName_App": {
+      "ClientId": "MyProjectName_App",
+      "RootUrl":  "http://localhost:4200"
+    },
+    "MyProjectName_Swagger": {
+      "ClientId": "MyProjectName_Swagger",
+      "RootUrl":  "https://localhost:44305"
+    }
+  }
+}
+```
+
+Each entry feeds an `OpenIddictApplicationDescriptor` at seed time. `RootUrl`
+is combined with hard-coded relative paths (`/signin-oidc`, `/authentication/login-callback`,
+…) to form the application's redirect URIs.
+
+## `StringEncryption` section
+
+Bound to `Volo.Abp.Security.Encryption.AbpStringEncryptionOptions`:
+
+| Key                                  | Type     | Notes                                                                                  |
+| ------------------------------------ | -------- | -------------------------------------------------------------------------------------- |
+| `StringEncryption:DefaultPassPhrase` | `string` | 16-character pass phrase. **Must** be replaced per environment.                         |
+| `StringEncryption:InitVectorBytes`   | `string` | Optional IV; defaults to `"jdiwosqpqpasjqlk"` if not set.                               |
+| `StringEncryption:DefaultSalt`       | `string` | Optional salt; default `"hgt!16kl"`. Used as PBKDF2 input together with the passphrase. |
+
+`SimpleStringCipher` (the implementation backing `ISettingEncryptionService` and
+`IStringEncryptionService`) reads these to AES-encrypt sensitive configuration
+values and tenant connection strings stored in the database.
+
+## `Logging` section
+
+Standard ASP.NET Core `Microsoft.Extensions.Logging` section. ABP templates
+keep the default block:
+
+```json
+"Logging": {
+  "LogLevel": {
+    "Default": "Information",
+    "Microsoft.AspNetCore": "Warning"
+  }
+}
+```
+
+If you switch to Serilog (the default in the *Solution Templates*), this
+section is read by Serilog's `Microsoft` filter sink instead.
+
+## How sections become options
+
+ABP's `ConfigureFromConfigurationOptions<T>` extension and the framework's
+default conventions bind several of these blocks in `PreConfigureServices` of
+the corresponding ABP modules:
+
+- `AbpDataModule.PreConfigureServices` binds `ConnectionStrings:*` →
+  `AbpDbConnectionOptions.ConnectionStrings`.
+- `AbpRabbitMqModule.PreConfigureServices` binds `RabbitMQ:Connections` →
+  `AbpRabbitMqOptions.Connections`.
+- `AbpKafkaModule.PreConfigureServices` binds `Kafka:Connections` →
+  `AbpKafkaOptions.Connections`.
+- `AbpEventBusRabbitMqModule.PreConfigureServices` binds `RabbitMQ:EventBus` →
+  `AbpRabbitMqEventBusOptions`.
+
+This means a module-options consumer can simply inject `IOptions<TOptions>`
+without writing any binding code; see
+[module-options](/reference/config/module-options).
+
+## Environments and overrides
+
+Replace any value at runtime with an environment variable using `__` as the
+separator:
+
+```bash icon="terminal"
+export ConnectionStrings__Default="Server=db;Database=Prod;User Id=app;Password=…"
+export AuthServer__Authority="https://login.contoso.com"
+export Redis__Configuration="redis-prod:6380,ssl=true,password=…"
+```
+
+For local development use `dotnet user-secrets`:
+
+```bash
+dotnet user-secrets set "StringEncryption:DefaultPassPhrase" "u9k3lP02Aa7Bz1xC"
+```
+
+## Related pages
+
+- [connection-strings](/reference/config/connection-strings)
+- [auth-config](/reference/config/auth-config)
+- [event-bus-config](/reference/config/event-bus-config)
+- [options-pattern](/reference/config/options-pattern)

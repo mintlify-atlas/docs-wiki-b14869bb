@@ -1,0 +1,312 @@
+---
+title: "Rebus"
+description: "External-library reference for Rebus — Volo.Abp.EventBus.Rebus distributed event bus, supported transports, persistence, and routing."
+---
+
+[Rebus](https://github.com/rebus-org/Rebus) is a free, lean .NET service bus. Where ABP's other event-bus implementations target one broker each (RabbitMQ, Kafka, Azure Service Bus), `Volo.Abp.EventBus.Rebus` defers transport choice to Rebus — so the same module can publish events over RabbitMQ, Azure Service Bus, MSMQ, SQL Server, Amazon SQS, Postgres, file system, or in-memory, depending on what you wire in.
+
+For ABP-side event semantics see [Distributed Event Bus](/framework/eventbus/distributed-eventbus) and the [Rebus deep-dive](/framework/eventbus/rebus).
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.EventBus.Rebus` | `AbpEventBusRebusModule` |
+
+```csharp
+[DependsOn(typeof(AbpEventBusModule))]
+public class AbpEventBusRebusModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddTransient(typeof(IHandleMessages<>),
+            typeof(RebusDistributedEventHandlerAdapter<>));
+
+        var preActions = context.Services.GetPreConfigureActions<AbpRebusEventBusOptions>();
+        Configure<AbpRebusEventBusOptions>(rebusOptions =>
+        {
+            preActions.Configure(rebusOptions);
+        });
+
+        context.Services.AddRebus(configure =>
+        {
+            configure.Options(options =>
+            {
+                options.Decorate<IPipeline>(d =>
+                {
+                    var step = new AbpRebusEventHandlerStep();
+                    var pipeline = d.Get<IPipeline>();
+                    return new PipelineStepInjector(pipeline).OnReceive(
+                        step, PipelineRelativePosition.After, typeof(ActivateHandlersStep));
+                });
+            });
+
+            preActions.Configure().Configurer?.Invoke(configure);
+            return configure;
+        });
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        context.ServiceProvider.GetRequiredService<RebusDistributedEventBus>().Initialize();
+        context.ServiceProvider.UseRebus();
+    }
+}
+```
+
+Two key pieces:
+
+- `RebusDistributedEventHandlerAdapter<TEvent>` translates `IHandleMessages<TEvent>` into ABP's `IDistributedEventHandler<TEvent>`.
+- `AbpRebusEventHandlerStep` is a Rebus pipeline step inserted after `ActivateHandlersStep` to integrate ABP correlation/auditing.
+
+## Options model
+
+```csharp
+public class AbpRebusEventBusOptions
+{
+    public string InputQueueName { get; set; }
+    public Action<RebusConfigurer> Configurer { get; set; }
+    public Func<IBus, Type, object, Task> Publish { get; set; }
+}
+```
+
+| Property | Default | Notes |
+| --- | --- | --- |
+| `InputQueueName` | empty | The Rebus "input queue" for this app — every consumer listens on it. Set per service. |
+| `Configurer` | wires in-memory transport + subscription storage | Replace to point at a real transport. |
+| `Publish` | uses `bus.Publish(eventData)` | Override to customise headers or routing. |
+
+The default `Configurer` is in-memory only — for any non-test use you must override.
+
+## Rebus version requirements
+
+| Component | Minimum | Notes |
+| --- | --- | --- |
+| `Rebus` (core) | 6.x | .NET Standard 2.0 and net6+. |
+| Transport packages (`Rebus.RabbitMq`, `Rebus.AzureServiceBus`, `Rebus.SqlServer`, `Rebus.PostgreSql`, `Rebus.AmazonSQS`) | matching major | Pin to the version that targets Rebus 6.x. |
+| `Rebus.ServiceProvider` | 9.x | Bridges to `Microsoft.Extensions.DependencyInjection`. |
+
+ABP's package targets Rebus 6.x.
+
+## Transports
+
+| Transport | Package | Suited for |
+| --- | --- | --- |
+| RabbitMQ | `Rebus.RabbitMq` | Most production setups; topology managed by Rebus. |
+| Azure Service Bus | `Rebus.AzureServiceBus` | Azure-native. |
+| SQL Server / PostgreSQL | `Rebus.SqlServer`, `Rebus.PostgreSql` | Polling-based; great for low-volume teams without a broker. |
+| Amazon SQS | `Rebus.AmazonSQS` | AWS-native. |
+| MSMQ | `Rebus.Msmq` | Legacy on-prem Windows. |
+| File system | `Rebus.FileSystem` | Dev / debugging. |
+| In-memory | built in | Tests. |
+
+Sample wiring for RabbitMQ:
+
+```csharp
+PreConfigure<AbpRebusEventBusOptions>(options =>
+{
+    options.InputQueueName = "catalog.input";
+    options.Configurer = configure =>
+    {
+        configure
+            .Transport(t => t.UseRabbitMq(
+                "amqp://catalog-service:Sup3rS3cret!@rabbit:5672/production",
+                options.InputQueueName))
+            .Subscriptions(s => s.StoreInRabbitMq()) // optional
+            .Routing(r => r.TypeBased()
+                .Map<UserCreatedEto>("Abp.Distributed.Events"))
+            .Serialization(s => s.UseSystemTextJson());
+    };
+});
+```
+
+For SQL Server (polling):
+
+```csharp
+options.Configurer = configure =>
+{
+    configure
+        .Transport(t => t.UseSqlServer(
+            "Server=...;Database=Bus;TrustServerCertificate=true",
+            options.InputQueueName))
+        .Subscriptions(s => s.StoreInSqlServer(
+            "Server=...;Database=Bus;TrustServerCertificate=true",
+            "Subscriptions"))
+        .Routing(r => r.TypeBased())
+        .Serialization(s => s.UseSystemTextJson());
+};
+```
+
+## Persistence concerns
+
+Rebus needs subscription, timeout, and (optionally) saga storage. Wire them per transport:
+
+- **In-memory** — fast but lost on restart.
+- **SQL Server / Postgres** — durable, recommended in production for sagas/timeouts/subscriptions.
+- **RabbitMQ** — `StoreInRabbitMq` uses the broker for subscription storage; topology stays inside the broker.
+- **Azure Service Bus** — uses topic-subscription metadata.
+
+If your app publishes timed/deferred messages, you must configure a timeout manager (`.Timeouts(t => t.StoreInSqlServer(...))`).
+
+## Sample `appsettings.json`
+
+```json
+{
+  "Rebus": {
+    "InputQueue": "catalog.input",
+    "Rabbit": {
+      "ConnectionString": "amqp://catalog-service:Sup3rS3cret!@rabbit:5672/production"
+    }
+  }
+}
+```
+
+```csharp
+PreConfigure<AbpRebusEventBusOptions>(options =>
+{
+    options.InputQueueName = configuration["Rebus:InputQueue"];
+    options.Configurer = configure => configure
+        .Transport(t => t.UseRabbitMq(
+            configuration["Rebus:Rabbit:ConnectionString"],
+            options.InputQueueName))
+        .Routing(r => r.TypeBased())
+        .Serialization(s => s.UseSystemTextJson());
+});
+```
+
+## Topology — how Rebus maps ABP events
+
+ABP's `RebusDistributedEventBus.PublishAsync` ultimately calls `IBus.Publish(eventData)` (or `IBus.Send`, depending on routing). Each event type becomes a Rebus topic. Subscribers — i.e. any service that registered `IDistributedEventHandler<TEvent>` — call `IBus.Subscribe<TEvent>()` during `Initialize`.
+
+On RabbitMQ this lays out:
+
+- One **topic exchange** named after the event type (`Volo.Abp.Identity.Etos.UserEto`).
+- One **input queue** per app (`InputQueueName`) bound to each subscribed event.
+- One **error queue** (`<input>.error`) for failures.
+
+On SQL Server it manifests as:
+
+- A `Messages` table containing serialized envelopes.
+- A `Subscriptions` table mapping topic → input queue.
+- A `Timeouts` table for deferred messages.
+
+## Two-phase initialization
+
+`AbpEventBusRebusModule.OnApplicationInitialization`:
+
+1. Resolves `RebusDistributedEventBus` and calls `Initialize()`. This walks the ABP event handler registry and calls `IBus.Subscribe<T>()` for each handled event type.
+2. Calls `context.ServiceProvider.UseRebus()` from `Rebus.ServiceProvider`. This starts the bus, returns the `IBus` singleton.
+
+If you have transient handlers added at runtime, you must re-call subscribe yourself.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Events published but never received | Default in-memory transport still configured. | Replace `Configurer` with a real transport. |
+| `RebusApplicationException: Failed to send message: ...` | Transport unreachable (broker down, DB locked). | Check broker connectivity; Rebus retries with back-off. |
+| Messages in `<input>.error` queue | Handler threw repeatedly; Rebus moved to dead-letter after `maxDeliveryAttempts`. | Inspect, fix, replay with `bus.Advanced.TransportMessage.Forward(...)`. |
+| Subscriptions disappear after restart (SQL transport) | Subscriptions stored in-memory while transport is SQL. | Add `.Subscriptions(s => s.StoreInSqlServer(...))`. |
+| Duplicate events | At-least-once delivery + non-idempotent handler. | Make handlers idempotent (key by event id). |
+| Deferred messages fire immediately | Timeout manager not configured. | `.Timeouts(t => t.StoreInSqlServer(...))`. |
+| Ambient transaction issues with SQL transport | Rebus uses ambient `TransactionScope` by default. | Configure `.Options(o => o.SetMaxParallelism(...))` and disable scope if EF transactions conflict. |
+| Queue grows unbounded | Consumer parallelism too low. | `.Options(o => o.SetNumberOfWorkers(8).SetMaxParallelism(20))`. |
+
+## Observability hints
+
+- **Rebus internals.** `Rebus.Logging` — wire `UseSerilog()` or `UseMicrosoftExtensionsLogging()` from `Rebus.Extensions.Logging`.
+- **Metrics.** No first-party metrics; subclass `IPipelineStep` to emit counters per message. Common: `rebus_messages_received_total{topic=...,result=success|error}`.
+- **Tracing.** OpenTelemetry community packages exist (`Rebus.OpenTelemetry`). Spans propagate via headers when both ends speak the same transport.
+- **Error queue gauges.** Each `<input>.error` queue should be near-zero; alert on growth.
+- **Per-transport observability** is identical to that transport's own — see the [RabbitMQ](/reference/integrations/rabbitmq), [Azure Service Bus](/reference/integrations/azure-service-bus), and [SQS / SQL] sections (covered indirectly).
+
+## When to pick Rebus vs the dedicated bus modules
+
+Pick Rebus when:
+
+- You want one event-bus abstraction with the freedom to swap transports.
+- You need sagas, deferred messages, request/reply correlation — features Rebus provides natively.
+- You may operate in mixed environments (SQL Server in DC1, RabbitMQ in DC2).
+
+Pick a dedicated module (`Volo.Abp.EventBus.RabbitMQ`, `Volo.Abp.EventBus.Kafka`, etc.) when:
+
+- You already commit to one broker and want first-class topology control from ABP options.
+- You need broker-specific features ABP exposes directly (Kafka consumer group config, Azure session id).
+- Outbox/inbox integration is a hard requirement — ABP's outbox is wired into the dedicated modules.
+
+## Error handling pipeline
+
+By default Rebus retries each message twice in-process then forwards to `<input>.error`. Tune via `.Options(o => o.SetNumberOfRetries(5))`. Combine with a second-level retry queue and exponential back-off:
+
+```csharp
+configure.Options(o =>
+{
+    o.RetryStrategy(secondLevelRetriesEnabled: true, maxDeliveryAttempts: 5);
+});
+```
+
+Second-level retry hands the message back to the pipeline with `IFailed<T>` so you can implement custom retry logic per message type.
+
+## Sagas
+
+Rebus's saga feature is a powerful complement to ABP's domain events. A saga is a long-running process keyed by a correlation id; Rebus persists its state in the saga store (`SqlServer`, `Postgres`, `MongoDB`, `Redis`).
+
+```csharp
+public class OrderSaga : Saga<OrderSagaData>,
+    IAmInitiatedBy<OrderPlacedEto>,
+    IHandleMessages<PaymentConfirmedEto>,
+    IHandleMessages<TimeoutMessage>
+{
+    protected override void CorrelateMessages(ICorrelationConfig<OrderSagaData> config)
+    {
+        config.Correlate<OrderPlacedEto>(m => m.OrderId, d => d.OrderId);
+        config.Correlate<PaymentConfirmedEto>(m => m.OrderId, d => d.OrderId);
+    }
+
+    public async Task Handle(OrderPlacedEto msg) { /* ... */ }
+}
+```
+
+ABP's `IDistributedEventHandler<T>` doesn't directly map to sagas — you mix Rebus handlers and ABP handlers in the same app.
+
+## Routing modes
+
+| Mode | Use |
+| --- | --- |
+| `TypeBased` (default) | Pub/sub by .NET type. ABP's `IDistributedEventBus` calls `bus.Publish` which routes by type. |
+| `Multicast` | Same as type-based for pub/sub. |
+| `RoutingSlip` | For chained workflows. |
+| Custom `Router` | Plug your own logic. |
+
+For polyglot environments (consumers in Java/Go), choose a serialiser they can read (`SystemTextJson`) and use a router that maps types to topic strings the other side knows.
+
+## Idempotency
+
+Rebus assigns a unique `MessageId` per envelope. Combine with an inbox table or `IIdempotencyStore` to dedupe consumers:
+
+```csharp
+configure.Options(o => o.EnableIdempotentMessages(new SqlServerIdempotencyStore(...)));
+```
+
+For ABP-specific idempotency, lean on the [inbox/outbox](/framework/eventbus/inbox-outbox) abstraction, which is integration-agnostic.
+
+## Encryption and compression
+
+Rebus supports message-level encryption (`EncryptMessages(key)`) and compression (`CompressMessages(threshold)`). Encryption uses AES-GCM with a base64 key; rotate keys via key-id headers. Useful when the transport is shared between trust boundaries.
+
+## Migrating between transports
+
+Because Rebus abstracts transport, switching from SQL Server to RabbitMQ later only requires:
+
+1. Pre-create the RabbitMQ vhost and exchange.
+2. Replace `Transport(t => t.UseSqlServer(...))` with `Transport(t => t.UseRabbitMq(...))`.
+3. Re-subscribe (`bus.Subscribe<T>()` on startup) — Rebus stores subscriptions in the new transport's storage.
+4. Drain the old queue and shut it down once empty.
+
+Rebus's polymorphic transport API is the strongest argument for using it: you don't have to know on day 1 which broker the deployment will live on.
+
+## Related references
+
+- [Distributed Event Bus](/framework/eventbus/distributed-eventbus) — the abstraction Rebus plugs into.
+- [Distributed Event Bus — Rebus](/framework/eventbus/rebus) — module internals.
+- [RabbitMQ](/reference/integrations/rabbitmq), [Azure Service Bus](/reference/integrations/azure-service-bus) — transport references applicable when Rebus uses them.

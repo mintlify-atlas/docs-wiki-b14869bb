@@ -1,0 +1,237 @@
+---
+title: "Volo.Abp meta package: entry point for the framework"
+sidebarTitle: "Volo.Abp"
+description: "Volo.Abp is the empty meta package that forwards every public type to Volo.Abp.Core. Inspect its csproj, FodyWeavers config, and NuGet role."
+---
+
+`Volo.Abp` is the package that 99% of ABP solutions reference first, yet
+it contains exactly **zero source files**. The folder
+`framework/src/Volo.Abp/` ships only a `Volo.Abp.csproj`, a `README.md`,
+a Fody weaver configuration, and the XSD that backs it. Every public
+type the project exposes — `AbpApplicationBase`, `AbpModule`,
+`ITransientDependency`, `BusinessException`, the whole modularity stack —
+physically lives in the sibling package
+`Volo.Abp.Core`. `Volo.Abp` is a *name placeholder* whose role is to
+preserve the historic NuGet identifier ABP shipped under before the
+kernel was split out, and to anchor the configure‑await build pipeline.
+
+This page documents the entire contents of the project so you understand
+why importing `Volo.Abp` is enough to bring the kernel along, and why
+the package shows up in every transitive dependency graph for ABP
+modules.
+
+<CardGroup cols={2}>
+  <Card title="Volo.Abp.Core" icon="cube" href="/framework/core/volo-abp-core">
+    The kernel package that contains every type Volo.Abp publishes.
+  </Card>
+  <Card title="Application Base" icon="play" href="/framework/core/application-base">
+    The lifecycle host that consumers ultimately new‑up.
+  </Card>
+</CardGroup>
+
+## Directory layout
+
+The whole project fits in four files plus an XSD.
+
+| File | Purpose |
+| ---- | ------- |
+| `Volo.Abp.csproj` | SDK‑style project; one `<ProjectReference>` to `Volo.Abp.Core`. |
+| `README.md` | One‑line statement that the package is a name holder. |
+| `FodyWeavers.xml` | Enables `ConfigureAwait(false)` weaving at compile time. |
+| `FodyWeavers.xsd` | Schema for the weaver configuration above. |
+
+There is no `Volo/` directory, no `Properties/AssemblyInfo.cs`, no
+`Microsoft/Extensions/...` extension methods, and no resource files.
+Anything you can see under the `Volo.Abp` namespace at runtime was
+compiled out of the `Volo.Abp.Core` assembly and re‑exported via this
+project's transitive reference.
+
+## The csproj verbatim
+
+```xml framework/src/Volo.Abp/Volo.Abp.csproj
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\..\..\configureawait.props" />
+  <Import Project="..\..\..\common.props" />
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;netstandard2.1;net7.0</TargetFrameworks>
+    <AssemblyName>Volo.Abp</AssemblyName>
+    <PackageId>Volo.Abp</PackageId>
+    <AssetTargetFallback>$(AssetTargetFallback);portable-net45+win8+wp8+wpa81;</AssetTargetFallback>
+    <GenerateAssemblyConfigurationAttribute>false</GenerateAssemblyConfigurationAttribute>
+    <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+    <GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
+    <RootNamespace />
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Volo.Abp.Core\Volo.Abp.Core.csproj" />
+  </ItemGroup>
+</Project>
+```
+
+The four interesting choices in that file are:
+
+1. **Triple target framework.** ABP must run on `netstandard2.0`
+   (e.g. Xamarin/Unity hosts), `netstandard2.1` (modern .NET Standard
+   consumers), and `net7.0` (the primary host in v7.4). The kernel does
+   the same, so any consumer can pick the highest TFM available.
+2. **Assembly name = package id = `Volo.Abp`.** The compiled
+   `Volo.Abp.dll` is intentionally identical in name to the package,
+   keeping reference resolution and stack traces stable across the
+   `Volo.Abp.Core` rename that happened years ago.
+3. **`<RootNamespace />` is blank.** The empty element disables the SDK
+   default that would have inferred `Volo.Abp` as the root namespace and
+   tried to prepend it to every type. Because the project ships no
+   sources, this would only matter if a downstream tooling step
+   inferred a namespace; the blank value silences that path.
+4. **`AssetTargetFallback`** includes the ancient portable‑class‑library
+   profiles so consumers stuck on those targets still resolve assets.
+
+Both `..\..\..\configureawait.props` and `..\..\..\common.props` are
+shared MSBuild fragments that live at the repository root and apply the
+same versioning, source‑link, and Fody settings to every project in the
+solution. That is why `Volo.Abp.csproj` does not need to mention any of
+those plumbing concerns directly.
+
+## NuGet role
+
+When ABP publishes a release, the NuGet feed receives two related
+packages for the kernel:
+
+| Package | Contents | Why it exists |
+| ------- | -------- | ------------- |
+| `Volo.Abp.Core` | The compiled kernel DLL plus reference assemblies. | Holds the actual code: `AbpApplicationBase`, `AbpModule`, DI helpers, etc. |
+| `Volo.Abp` | An empty assembly that depends on `Volo.Abp.Core`. | Backward compatibility for solutions and templates that historically referenced `Volo.Abp`. |
+
+A solution that lists `<PackageReference Include="Volo.Abp" />` pulls
+the `Volo.Abp.dll` (empty) **and** transitively `Volo.Abp.Core.dll`
+(everything). A solution that lists `<PackageReference
+Include="Volo.Abp.Core" />` directly skips the empty hop. Either form
+compiles equivalently; the kernel chooses to be referenced through
+`Volo.Abp` to keep the package graph readable in IDE solution explorers
+and `dotnet list package` output.
+
+The intent is recorded plainly in the `README.md` shipped inside the
+package:
+
+```text framework/src/Volo.Abp/README.md
+# Volo.Abp
+
+This package is a name holder. It just references to the `Volo.Abp.Core` package.
+```
+
+That sentence is the entire public documentation. Anything more
+elaborate would lie about what the project contains.
+
+## Fody weaver configuration
+
+Every project under `framework/src/` imports
+`configureawait.props`, which wires the `Fody` and `ConfigureAwait.Fody`
+analyzers into the build. The behaviour those analyzers apply is
+controlled by `FodyWeavers.xml`:
+
+```xml framework/src/Volo.Abp/FodyWeavers.xml
+<Weavers xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="FodyWeavers.xsd">
+  <ConfigureAwait ContinueOnCapturedContext="false" />
+</Weavers>
+```
+
+The single `<ConfigureAwait ContinueOnCapturedContext="false" />`
+element rewrites every `await expr` inside the assembly as if the
+developer had written `await expr.ConfigureAwait(false)`. This matters
+for two reasons even though the assembly itself contains no IL of its
+own:
+
+- The schema reference still validates against `FodyWeavers.xsd` so
+  IDEs surface the override.
+- If someone adds source to `Volo.Abp` in the future (for example a
+  legacy compatibility shim) the weaver kicks in immediately, matching
+  the kernel's behaviour without extra ceremony.
+
+The same `<ConfigureAwait>` line appears in every other framework
+project's `FodyWeavers.xml`, including
+`framework/src/Volo.Abp.Core/FodyWeavers.xml`. ABP standardises on
+`false` so library code never inadvertently captures a UI synchronization
+context.
+
+## When to reference `Volo.Abp` vs `Volo.Abp.Core`
+
+In practice the choice is cosmetic, but the patterns that show up in
+ABP's own startup templates are consistent:
+
+| Scenario | Reference | Why |
+| -------- | --------- | --- |
+| App host project (`MyApp.Web`, `MyApp.HttpApi.Host`, etc.) | Higher‑level modules such as `Volo.Abp.AspNetCore.Mvc` | Those modules transitively bring `Volo.Abp` anyway. |
+| Domain module library that only needs `AbpModule` plus base types | `Volo.Abp.Ddd.Domain` (which itself depends on `Volo.Abp`) | Keeps the public API surface aligned with what ABP samples use. |
+| Standalone test project that only needs the kernel | `Volo.Abp.Core` direct | Avoids the empty hop and shaves a few bytes from the package graph. |
+| Custom tooling assembly that re‑hosts ABP outside ASP.NET Core | `Volo.Abp.Core` direct | Same reason — the tooling never wants to be confused with a typical user app. |
+
+There is **no** scenario in which referencing both `Volo.Abp` and
+`Volo.Abp.Core` is necessary or beneficial. NuGet will resolve the
+transitive `Volo.Abp.Core` from the `Volo.Abp` reference, and adding
+both produces an identical compile.
+
+## Why a name holder package at all?
+
+ABP's history explains the split:
+
+1. The framework originally shipped as a single `Volo.Abp` assembly that
+   bundled the kernel, the modularity system, exception handling, and a
+   handful of cross‑cutting concerns.
+2. As the project grew, the maintainers extracted the kernel into a
+   dedicated `Volo.Abp.Core` assembly so that downstream packages could
+   target it without dragging in unrelated code.
+3. Renaming the existing `Volo.Abp` NuGet package would have broken
+   every consumer overnight. Instead, the team published the new kernel
+   as `Volo.Abp.Core` and turned `Volo.Abp` into the empty shim you see
+   today.
+
+The split is invisible at the C# source level because all of the types
+still declare their namespaces under `Volo.Abp.*`. From a `using` clause
+perspective nothing changed: `using Volo.Abp;` resolves identically
+whether the type lives in `Volo.Abp.dll` (historical) or
+`Volo.Abp.Core.dll` (current).
+
+## Verifying the package at build time
+
+You can confirm the meta‑package shape locally with `dotnet`:
+
+```bash
+# Build the empty assembly.
+dotnet build framework/src/Volo.Abp/Volo.Abp.csproj -c Release
+
+# List what ships inside the built nupkg.
+dotnet pack framework/src/Volo.Abp/Volo.Abp.csproj -c Release -o /tmp/pkg
+unzip -l /tmp/pkg/Volo.Abp.*.nupkg | grep -E "(dll|nuspec)"
+```
+
+The packed `.nupkg` contains exactly:
+
+| Entry | Notes |
+| ----- | ----- |
+| `Volo.Abp.nuspec` | NuGet metadata, with a dependency on `Volo.Abp.Core` matching the same version. |
+| `lib/netstandard2.0/Volo.Abp.dll` | Empty assembly. |
+| `lib/netstandard2.1/Volo.Abp.dll` | Empty assembly. |
+| `lib/net7.0/Volo.Abp.dll` | Empty assembly. |
+
+Decompiling any of those DLLs in ILSpy or `dotnet-ildasm` shows a single
+module with the assembly attributes the SDK emits by default — there is
+no metadata for a single user type because none exists in source.
+
+## Take‑aways
+
+- `Volo.Abp` is a one‑hop shim. The compile output is an empty DLL whose
+  only job is to carry a `<dependency>` element pointing at
+  `Volo.Abp.Core`.
+- The companion `FodyWeavers.xml` keeps `ConfigureAwait(false)` weaving
+  consistent with every other framework project even though the
+  assembly currently has no IL of its own.
+- All public types you import via `using Volo.Abp;` are physically
+  defined in `Volo.Abp.Core`. The next page enumerates them.
+
+<Card title="Next: Volo.Abp.Core inventory" icon="arrow-right" href="/framework/core/volo-abp-core">
+  Walk every namespace and root file inside the kernel package that
+  actually contains the framework's code.
+</Card>

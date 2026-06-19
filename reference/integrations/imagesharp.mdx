@@ -1,0 +1,266 @@
+---
+title: "ImageSharp"
+description: "External-library reference for SixLabors.ImageSharp — Volo.Abp.Imaging.ImageSharp module, encoder configuration, licensing, and how ABP wires resizing and compression contributors."
+---
+
+`Volo.Abp.Imaging.ImageSharp` plugs the cross-platform [SixLabors.ImageSharp](https://github.com/SixLabors/ImageSharp) library into ABP's imaging abstractions (`IImageResizer`, `IImageCompressor`). It is the recommended default because ImageSharp is pure managed code — no native dependencies — and runs the same on Linux containers, Windows, and macOS.
+
+For the abstractions themselves see [Imaging](/framework/imaging-blob/imaging) and the [ImageSharp page](/framework/imaging-blob/imaging-imagesharp). This page focuses on the library: what versions ABP targets, what licensing implications exist, encoder defaults, and operational guidance.
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.Imaging.ImageSharp` | `AbpImagingImageSharpModule` |
+
+```csharp
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingImageSharpModule : AbpModule { }
+```
+
+The module registers two contributors that the abstraction layer picks up via priority:
+
+- `ImageSharpImageResizerContributor` — implements `IImageResizerContributor`.
+- `ImageSharpImageCompressorContributor` — implements `IImageCompressorContributor`.
+
+## Options model
+
+```csharp
+public class ImageSharpCompressOptions
+{
+    public IImageEncoder JpegEncoder { get; set; }
+    public IImageEncoder PngEncoder  { get; set; }
+    public IImageEncoder WebpEncoder { get; set; }
+    public int DefaultQuality { get; set; } = 75;
+
+    public ImageSharpCompressOptions()
+    {
+        JpegEncoder = new JpegEncoder { Quality = DefaultQuality };
+        PngEncoder  = new PngEncoder { CompressionLevel = PngCompressionLevel.BestCompression, IgnoreMetadata = true };
+        WebpEncoder = new WebpEncoder { Quality = DefaultQuality };
+    }
+}
+```
+
+Override during module configuration:
+
+```csharp
+Configure<ImageSharpCompressOptions>(options =>
+{
+    options.DefaultQuality = 85;
+    options.JpegEncoder = new JpegEncoder { Quality = 85, ColorType = JpegEncodingColor.YCbCrRatio420 };
+    options.WebpEncoder = new WebpEncoder { Quality = 85, FileFormat = WebpFileFormatType.Lossy };
+});
+```
+
+There is no separate resize options class — resizing reads its parameters from `ImageResizeArgs` (width, height, mode) supplied by the caller.
+
+## Library version requirements
+
+| Component | Version | Notes |
+| --- | --- | --- |
+| `SixLabors.ImageSharp` | 3.x | Requires .NET 6+. ABP packages targeting net8.0 use 3.x. |
+| `SixLabors.ImageSharp.Web` (optional) | 3.x | Adds ASP.NET middleware; not used by ABP itself. |
+
+ImageSharp 3.x is a major rewrite over 1.x/2.x — APIs changed. Pin to the matching major version that ships with your ABP release.
+
+## Licensing
+
+ImageSharp is dual-licensed:
+
+- **Apache 2.0** for non-commercial / open source use.
+- **Commercial Six Labors Split License** for commercial use.
+
+If your ABP application is closed source and revenue-generating, review the [Six Labors website](https://sixlabors.com/pricing/) to determine whether you need a paid licence. ABP does not ship the licence — it's the consumer's responsibility. This is a significant difference vs Magick.NET (Apache 2.0 across the board); see the [Magick.NET reference](/reference/integrations/magicknet) for the BSD-licensed alternative.
+
+## Supported formats
+
+| Format | Decode | Encode | Notes |
+| --- | --- | --- | --- |
+| JPEG | ✅ | ✅ | Quality, chroma sub-sampling, progressive. |
+| PNG | ✅ | ✅ | 8/16-bit, indexed, animated APNG decode. |
+| WebP | ✅ | ✅ | Lossy + lossless. |
+| GIF | ✅ | ✅ | Animated. |
+| BMP | ✅ | ✅ | |
+| TGA | ✅ | ✅ | |
+| TIFF | ✅ | ✅ | LZW, Deflate. |
+| PBM / PGM / PPM | ✅ | ✅ | Netpbm. |
+| QOI | ✅ | ✅ | Quite-OK image format. |
+| HEIC / AVIF | ❌ | ❌ | Use Magick.NET if needed. |
+
+ABP's contributors detect the source format from the stream header and re-encode using the encoder from `ImageSharpCompressOptions` for JPEG, PNG, and WebP; for other formats they preserve the original encoding.
+
+## Resizer behaviour
+
+`ImageSharpImageResizerContributor` calls `image.Mutate(ctx => ctx.Resize(new ResizeOptions { ... }))`. Modes map to:
+
+| `ImageResizeMode` | ImageSharp |
+| --- | --- |
+| `None` | `ResizeMode.Stretch` (forced dimensions). |
+| `Stretch` | `ResizeMode.Stretch`. |
+| `BoxPad` | `ResizeMode.BoxPad` — fits inside box, pads. |
+| `Pad` | `ResizeMode.Pad`. |
+| `Max` | `ResizeMode.Max` (default) — fits inside, preserves aspect ratio. |
+| `Min` | `ResizeMode.Min`. |
+| `Crop` | `ResizeMode.Crop`. |
+
+The contributor returns a new stream and rewinds it; callers can pipe directly into `IBlobContainer.SaveAsync`.
+
+## Memory and performance
+
+- **Pixel format.** ImageSharp uses `Rgba32` by default; a 4000×3000 photo allocates ~46 MB. Configure `Configuration.Default.MemoryAllocator` to a pooled allocator for high-throughput services.
+- **Parallelism.** `Configuration.Default.MaxDegreeOfParallelism` defaults to `Environment.ProcessorCount`. Lower it for shared hosts.
+- **Encoder cost.** `PngCompressionLevel.BestCompression` (the ABP default) is CPU-heavy. For PNGs that don't need maximum compression, drop to `Level6`.
+- **Thread safety.** `Image` instances are not thread-safe; create one per request. The encoder objects (set in options) are safe to share.
+
+## Sample configuration
+
+A balanced profile for user avatars:
+
+```csharp
+Configure<ImageSharpCompressOptions>(options =>
+{
+    options.DefaultQuality = 80;
+    options.JpegEncoder = new JpegEncoder
+    {
+        Quality = 80,
+        ColorType = JpegEncodingColor.YCbCrRatio420,
+        Interleaved = true
+    };
+    options.PngEncoder = new PngEncoder
+    {
+        CompressionLevel = PngCompressionLevel.Level6,
+        InterlaceMethod = PngInterlaceMode.None,
+        IgnoreMetadata = true
+    };
+    options.WebpEncoder = new WebpEncoder
+    {
+        Quality = 80,
+        FileFormat = WebpFileFormatType.Lossy,
+        Method = WebpEncodingMethod.Default
+    };
+});
+
+// Optional: bound memory and CPU
+SixLabors.ImageSharp.Configuration.Default.MaxDegreeOfParallelism = 2;
+```
+
+## Containers and base images
+
+ImageSharp is pure managed code and works on:
+
+- Microsoft's `mcr.microsoft.com/dotnet/aspnet:8.0` (Debian / Ubuntu / Mariner).
+- `mcr.microsoft.com/dotnet/aspnet:8.0-alpine`.
+- Distroless (`gcr.io/distroless/dotnet`).
+
+No native font packages are required unless you draw text. For text rendering install fonts and use `SixLabors.Fonts` (separate package). Alpine doesn't ship many fonts by default — add `apk add fontconfig ttf-dejavu` if needed.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `OutOfMemoryException` on resize | Very large source (e.g. 100 MP photo). | Pre-validate dimensions; reject or downscale incrementally; raise container memory limit. |
+| `UnknownImageFormatException: Image format could not be detected` | Source stream isn't an image, or stream is at end (`Position != 0`). | Reset stream position before passing in. |
+| Output is upside-down | EXIF orientation not respected. | Call `image.Mutate(c => c.AutoOrient())` before resize. |
+| Quality looks worse than expected | `DefaultQuality=75` baked in. | Raise to 80–90 for photo content. |
+| `NotSupportedException: Encoder format not registered` | Stripped down `Configuration` missing encoders. | Use `Configuration.Default` (default) or register format manually. |
+| PNG output huge | `PngCompressionLevel.BestCompression` slow + only marginal saving on photo-like PNGs. | Choose JPEG/WebP for photos; PNG only for graphics. |
+| Animated GIF flattened | Decoder kept first frame only. | Pass `GifDecoder` options; or use Magick.NET for animation-preserving pipelines. |
+| Licence warning at runtime | Six Labors split licence detection. | Acquire commercial licence if applicable. |
+
+## Observability hints
+
+- **Per-operation timing.** Wrap resize/compress calls with `Activity` (e.g. `imaging.resize`). Useful for spotting regressions when encoders change.
+- **Memory.** `dotnet-counters monitor System.Runtime` — watch `gen-2-gc-count` and `working-set` after rolling out an imaging change; ImageSharp will surface large-object churn.
+- **CPU.** Profile with `dotnet-trace` if resize endpoints dominate latency; the encoder quality/level settings are usually the biggest lever.
+
+## When to choose ImageSharp vs Magick.NET
+
+Pick ImageSharp when:
+
+- Pure managed code is a requirement (no native deps).
+- You're on Alpine / distroless / Mariner and don't want a libMagick dependency.
+- The licence model is acceptable for your business.
+
+Pick Magick.NET when:
+
+- You need HEIC, AVIF, RAW, PSD or other exotic formats.
+- You need ImageMagick's broader operator set (artistic effects, complex compositing).
+- The Apache-2.0-only licence is required.
+
+## Pixel formats and colour spaces
+
+ImageSharp default is `Rgba32` (8 bits per channel + alpha). For HDR content use `Rgba64` or `RgbaVector` and call `image.CloneAs<Rgba64>()`. For grayscale (medical, OCR) `L8` halves memory:
+
+```csharp
+using var image = Image.Load<L8>(stream);
+```
+
+ABP's contributors use `Rgba32` — override if your pipeline is grayscale-heavy.
+
+Colour profiles (ICC) are preserved on JPEG/PNG/TIFF unless you call `image.Metadata.IccProfile = null`. Keep them for accurate printing workflows; drop them to shrink output for the web.
+
+## Animated GIF and WebP
+
+ImageSharp 3.x decodes animated GIF/WebP via `ImageFrameCollection`. ABP's contributors operate on the primary frame only; to resize all frames preserve the collection:
+
+```csharp
+using var image = await Image.LoadAsync(stream);
+image.Mutate(c => c.Resize(new ResizeOptions { Size = new Size(400, 400), Mode = ResizeMode.Max }));
+// All frames are resized in-place.
+await image.SaveAsync(output, new GifEncoder { });
+```
+
+This is more memory intensive — a 100-frame 4 K GIF can easily reach hundreds of MB. Bound size before accepting uploads.
+
+## EXIF handling
+
+By default ImageSharp keeps EXIF on save. Configure per encoder:
+
+```csharp
+new JpegEncoder { SkipMetadata = true }
+new PngEncoder  { IgnoreMetadata = true } // default in ABP
+new WebpEncoder { SkipMetadata = true }
+```
+
+Stripping EXIF is recommended for user-uploaded photos to remove GPS coordinates and device serials. ABP's default PNG encoder already strips; JPEG and WebP defaults keep metadata.
+
+## Streaming considerations
+
+ABP's contributors call `Image.Load(stream)`, which buffers the entire decoded image in memory. For very large uploads (gigapixel scans) consider a tile-based pipeline:
+
+```csharp
+using var image = await Image.LoadAsync<Rgba32>(new DecoderOptions
+{
+    SkipMetadata = true,
+    TargetSize = new Size(2048, 2048) // hint
+}, stream);
+```
+
+The `TargetSize` hint lets the JPEG decoder scale down on read (~ 8× faster). Not all decoders honour it.
+
+## Drawing and text
+
+For watermarks / dynamic image generation, install `SixLabors.Fonts` and `SixLabors.ImageSharp.Drawing` (separate licence, same model). Font files must be available — Alpine images ship none. Mount a font (`fonts.ttf`) into `/app/fonts/` and load with `SystemFonts.Add`.
+
+```csharp
+SystemFonts.Add("fonts/DejaVuSans.ttf");
+var font = SystemFonts.CreateFont("DejaVu Sans", 16);
+image.Mutate(c => c.DrawText("CONFIDENTIAL", font, Color.Red, new PointF(10, 10)));
+```
+
+## Comparing output across providers
+
+If you switch between ImageSharp and Magick.NET, expect:
+
+- Different JPEG chroma sub-sampling defaults (visual difference at low quality).
+- Different PNG compression levels at the same `CompressionLevel` value.
+- WebP quality scale identical, but lossless toggles differ.
+
+Pick one provider and stick with it for downstream pipelines that hash images (CDN, signed URL caches) — same input + same provider yields stable bytes.
+
+## Related references
+
+- [Imaging](/framework/imaging-blob/imaging) — abstractions, contributors.
+- [Imaging — ImageSharp](/framework/imaging-blob/imaging-imagesharp) — contributor internals.
+- [Magick.NET](/reference/integrations/magicknet) — alternative.

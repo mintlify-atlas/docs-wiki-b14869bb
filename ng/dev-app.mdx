@@ -1,0 +1,328 @@
+---
+title: "apps/dev-app"
+description: "The Angular playground that exercises every @abp/ng.* package end-to-end — bootstrap module, lazy routes, environment shape and Nx build target."
+---
+
+`apps/dev-app/` is the playground the framework team boots while iterating on the `@abp/ng.*` packages. It's a *full* ABP-Angular app: hooked to a real backend over OIDC, wired to LeptonX layouts, lazy-loading Identity / Tenant Management / Setting Management / Account, and shipping the loader bar, dynamic layout, and internet-status indicator at the top level.
+
+This page documents the layout and bootstrap wiring so contributors can read the playground as the canonical reference.
+
+## File tree
+
+```text
+apps/dev-app/
+├── project.json            # Nx project definition (build/serve/test targets)
+├── tsconfig.json
+├── tsconfig.app.json
+├── tsconfig.spec.json
+├── jest.config.ts
+└── src/
+    ├── index.html
+    ├── main.ts
+    ├── polyfills.ts
+    ├── styles.scss
+    ├── favicon.ico
+    ├── test-setup.ts
+    ├── assets/
+    ├── environments/
+    │   ├── environment.ts          # dev — points at https://localhost:44305
+    │   └── environment.prod.ts
+    └── app/
+        ├── app.module.ts
+        ├── app-routing.module.ts
+        ├── app.component.ts
+        ├── route.provider.ts
+        ├── home/
+        │   ├── home.module.ts
+        │   ├── home-routing.module.ts
+        │   ├── home.component.ts
+        │   └── home.component.html
+        └── shared/
+            └── shared.module.ts
+```
+
+## Bootstrap
+
+The entry is conventional — `main.ts` bootstraps `AppModule`:
+
+```typescript
+// apps/dev-app/src/main.ts
+import { enableProdMode } from '@angular/core';
+import { platformBrowserDynamic } from '@angular/platform-browser-dynamic';
+import { AppModule } from './app/app.module';
+import { environment } from './environments/environment';
+
+if (environment.production) {
+  enableProdMode();
+}
+
+platformBrowserDynamic()
+  .bootstrapModule(AppModule)
+  .catch(err => console.error(err));
+```
+
+## AppComponent
+
+A three-line shell — every visible surface is owned by an ABP component:
+
+```typescript
+// apps/dev-app/src/app/app.component.ts
+@Component({
+  selector: 'app-root',
+  template: `
+    <abp-loader-bar></abp-loader-bar>
+    <abp-dynamic-layout></abp-dynamic-layout>
+    <abp-internet-status></abp-internet-status>
+  `,
+})
+export class AppComponent {}
+```
+
+* `<abp-loader-bar>` — top-of-screen progress bar driven by `HttpWaitService` + `RouterWaitService`.
+* `<abp-dynamic-layout>` — looks at the active route's `data.layout` and renders the matching layout component (application / account / empty). Registered by LeptonX in this playground but ABP-basic works the same.
+* `<abp-internet-status>` — standalone component from `@abp/ng.theme.shared` that watches `InternetConnectionService` and shows an offline banner.
+
+## AppModule — wiring every package
+
+```typescript
+// apps/dev-app/src/app/app.module.ts
+@NgModule({
+  imports: [
+    BrowserModule,
+    BrowserAnimationsModule,
+    AppRoutingModule,
+    CoreModule.forRoot({
+      environment,
+      registerLocaleFn: registerLocale(),
+      sendNullsAsQueryParam: false,
+      skipGetAppConfiguration: false,
+    }),
+    AbpOAuthModule.forRoot(),
+    ThemeSharedModule.forRoot(),
+    AccountConfigModule.forRoot(),
+    IdentityConfigModule.forRoot(),
+    TenantManagementConfigModule.forRoot(),
+    FeatureManagementModule.forRoot(),
+    SettingManagementConfigModule.forRoot(),
+    ThemeLeptonXModule.forRoot(),
+    SideMenuLayoutModule.forRoot(),
+    AccountLayoutModule.forRoot(),
+    InternetConnectionStatusComponent,
+  ],
+  providers: [APP_ROUTE_PROVIDER],
+  declarations: [AppComponent],
+  bootstrap: [AppComponent],
+})
+export class AppModule {}
+```
+
+Reading the imports top-to-bottom is the recommended starting tour of the framework:
+
+1. `CoreModule.forRoot(options)` — registers `ConfigStateService`, `RestService`, the `APP_INITIALIZER` that hydrates application configuration, dynamic locale registration.
+2. `AbpOAuthModule.forRoot()` — replaces the stub `AuthService` / `AuthGuard` / `ApiInterceptor` with the real OIDC implementations.
+3. `ThemeSharedModule.forRoot()` — modal, toast, confirmation, validation, error handlers.
+4. `AccountConfigModule`, `IdentityConfigModule`, `TenantManagementConfigModule`, `SettingManagementConfigModule` — eager modules that register routes, menu items and permission policies *before* the lazy feature modules load.
+5. `FeatureManagementModule.forRoot()` — registers the *Features* tab in the settings UI.
+6. `ThemeLeptonXModule.forRoot()`, `SideMenuLayoutModule.forRoot()`, `AccountLayoutModule.forRoot()` — LeptonX theme + its application + account layout (the basic theme equivalents would be `ThemeBasicModule.forRoot()`).
+7. `InternetConnectionStatusComponent` — imported as standalone so `<abp-internet-status>` works in the template.
+
+`APP_ROUTE_PROVIDER` is the playground's own contribution to `RoutesService`:
+
+```typescript
+// apps/dev-app/src/app/route.provider.ts
+import { eLayoutType, RoutesService } from '@abp/ng.core';
+import { APP_INITIALIZER } from '@angular/core';
+
+export const APP_ROUTE_PROVIDER = [
+  { provide: APP_INITIALIZER, useFactory: configureRoutes, deps: [RoutesService], multi: true },
+];
+
+function configureRoutes(routesService: RoutesService) {
+  return () => {
+    routesService.add([
+      {
+        path: '/',
+        name: '::Menu:Home',
+        iconClass: 'fas fa-home',
+        order: 1,
+        layout: eLayoutType.application,
+      },
+    ]);
+  };
+}
+```
+
+The `::Menu:Home` localization key, the `fas fa-home` icon and `layout: eLayoutType.application` flow through `RoutesService.add` into the breadcrumb, the side menu, and `<abp-dynamic-layout>` simultaneously.
+
+## Routing — lazy loading the entire framework
+
+```typescript
+// apps/dev-app/src/app/app-routing.module.ts
+const routes: Routes = [
+  {
+    path: '',
+    pathMatch: 'full',
+    loadChildren: () => import('./home/home.module').then(m => m.HomeModule),
+  },
+  {
+    path: 'account',
+    loadChildren: () => import('@abp/ng.account').then(m => m.AccountModule.forLazy()),
+  },
+  {
+    path: 'identity',
+    loadChildren: () => import('@abp/ng.identity').then(m => m.IdentityModule.forLazy()),
+  },
+  {
+    path: 'tenant-management',
+    loadChildren: () =>
+      import('@abp/ng.tenant-management').then(m => m.TenantManagementModule.forLazy()),
+  },
+  {
+    path: 'setting-management',
+    loadChildren: () =>
+      import('@abp/ng.setting-management').then(m => m.SettingManagementModule.forLazy()),
+  },
+];
+
+@NgModule({
+  imports: [RouterModule.forRoot(routes, {})],
+  exports: [RouterModule],
+})
+export class AppRoutingModule {}
+```
+
+Each feature module exposes a `forLazy()` factory that wraps `forChild()` in a `LazyModuleFactory` so Angular can instantiate it through `loadChildren`. No `APP_INITIALIZER` lives inside the lazy chunk — that's why the `*ConfigModule.forRoot()` calls are in `AppModule`.
+
+## Environment
+
+```typescript
+// apps/dev-app/src/environments/environment.ts
+import { Environment } from '@abp/ng.core';
+
+const baseUrl = 'http://localhost:4200';
+
+export const environment = {
+  production: false,
+  hmr: false,
+  application: { baseUrl, name: 'MyProjectName', logoUrl: '' },
+  oAuthConfig: {
+    issuer: 'https://localhost:44305/',
+    clientId: 'MyProjectName_App',
+    scope: 'offline_access MyProjectName',
+    responseType: 'code',
+    redirectUri: baseUrl,
+  },
+  apis: {
+    default:                   { url: 'https://localhost:44305',
+                                 rootNamespace: 'MyCompanyName.MyProjectName' },
+    AbpAccount:                { rootNamespace: 'Volo.Abp' },
+    AbpFeatureManagement:      { rootNamespace: 'Volo.Abp' },
+    AbpPermissionManagement:   { rootNamespace: 'Volo.Abp.PermissionManagement' },
+    AbpTenantManagement:       { rootNamespace: 'Volo.Abp.TenantManagement' },
+    AbpIdentity:               { rootNamespace: 'Volo.Abp' },
+    SettingManagement:         { rootNamespace: 'Volo.Abp.SettingManagement' },
+  },
+} as Environment;
+```
+
+Notable bits:
+
+* `oAuthConfig.responseType: 'code'` ⇒ `@abp/ng.oauth` picks `AuthCodeFlowStrategy`.
+* `apis.default.url` is the fallback API base; each module entry overrides only the *namespace* for its proxies.
+* `apis.AbpFeatureManagement` deliberately uses `rootNamespace: 'Volo.Abp'` (not `Volo.Abp.FeatureManagement`) because the backend ships those controllers under the parent namespace — a quirk worth knowing when consuming the auto-generated proxies.
+
+## HomeModule + SharedModule
+
+`HomeModule` is intentionally tiny — it shows that lazy modules can mix and match `SharedModule` plus an ABP feature module without re-importing the framework:
+
+```typescript
+// apps/dev-app/src/app/home/home.module.ts
+@NgModule({
+  declarations: [HomeComponent],
+  imports: [SharedModule, HomeRoutingModule],
+})
+export class HomeModule {}
+```
+
+```typescript
+// apps/dev-app/src/app/shared/shared.module.ts
+@NgModule({
+  declarations: [],
+  imports:  [CoreModule, ThemeSharedModule, NgbDropdownModule, NgxValidateCoreModule],
+  exports:  [CoreModule, ThemeSharedModule, NgbDropdownModule, NgxValidateCoreModule],
+})
+export class SharedModule {}
+```
+
+This is the recommended pattern for application code: import `SharedModule` everywhere, and let it re-export Core / Theme primitives.
+
+## Nx project.json
+
+```json
+// apps/dev-app/project.json (excerpt)
+{
+  "name": "dev-app",
+  "projectType": "application",
+  "sourceRoot": "apps/dev-app/src",
+  "prefix": "app",
+  "targets": {
+    "build": {
+      "executor": "@angular-devkit/build-angular:browser",
+      "outputs": ["{options.outputPath}"],
+      "options": {
+        "outputPath": "dist/apps/dev-app",
+        "index": "apps/dev-app/src/index.html",
+        "main": "apps/dev-app/src/main.ts",
+        "polyfills": "apps/dev-app/src/polyfills.ts",
+        "tsConfig": "apps/dev-app/tsconfig.app.json",
+        "inlineStyleLanguage": "scss",
+        "allowedCommonJsDependencies": ["chart.js", "js-sha256"],
+        "assets":  ["apps/dev-app/src/favicon.ico", "apps/dev-app/src/assets"],
+        "styles":  [/* 20+ bundle entries — LeptonX, Bootstrap, FontAwesome, ngx-datatable, ng-zorro */ ]
+      },
+      "configurations": {
+        "production":  { /* budgets, fileReplacements, outputHashing */ },
+        "development": { "buildOptimizer": false, "optimization": false,
+                         "vendorChunk": true, "sourceMap": true }
+      },
+      "defaultConfiguration": "production"
+    },
+    "serve": { /* … */ }
+  }
+}
+```
+
+Highlights:
+
+* `allowedCommonJsDependencies` lists `chart.js` and `js-sha256` — both are CJS but ABP needs them at runtime, and listing them suppresses Angular's CJS warning.
+* The `styles` array bundles every CSS asset for both LTR and RTL renditions (`bootstrap-rtl.min`, `bootstrap-dim.rtl`, `layout-bundle.rtl` …) with `inject: false`, so the runtime theme switcher in LeptonX can load whichever CSS it needs without forcing the LTR version onto RTL languages.
+* `ng-zorro-antd/tree/style/index.min.css` is bundled but `inject: false` — `@abp/ng.components/tree` loads it lazily via `LazyLoadService`, so the bundle is only fetched when the tree component actually renders.
+
+## Running
+
+```bash
+# From npm/ng-packs/
+nx serve dev-app                # http://localhost:4200
+nx build dev-app                # production build into dist/apps/dev-app
+nx test  dev-app                # Jest
+
+# Lint + e2e
+nx lint dev-app
+nx e2e  dev-app-e2e
+```
+
+The matching backend has to be running on `https://localhost:44305` — typically the ABP `MyProjectName.HttpApi.Host` startup project from the framework's `samples/` directory, or any application generated via the ABP CLI.
+
+## Gotchas
+
+* The dev-app runs on `http://localhost:4200` but talks to an HTTPS backend on `https://localhost:44305`. Browsers reject the OIDC redirect unless you trust the backend's self-signed certificate first — `dotnet dev-certs https --trust` resolves it.
+* `environment.production: false` enables HMR-friendly defaults, but `environment.hmr: false` keeps Angular HMR off — HMR breaks `@abp/ng.oauth`'s `tryLogin()` because the silent refresh subscriber survives the module replacement.
+* `apis.AbpFeatureManagement.rootNamespace` deliberately points at `'Volo.Abp'`; changing it to `'Volo.Abp.FeatureManagement'` will break the auto-generated proxies because the schematic walks the namespace tree literally.
+* `<abp-internet-status>` is standalone — it lives in the module's `imports` array, not `declarations`. Mixing it with the non-standalone `<abp-loader-bar>` in the same template is fine but each follows its own ownership rules.
+* The dev-app uses LeptonX (`ThemeLeptonXModule`, `SideMenuLayoutModule`, `AccountLayoutModule`). Switching to the basic theme is a one-liner — swap those three modules for `ThemeBasicModule.forRoot()` and update the `styles` array in `project.json`.
+
+## Related pages
+
+* `ng/overview.mdx` — workspace map.
+* `ng/core.mdx` and `ng/oauth.mdx` — the modules the playground bootstraps first.
+* `ng/identity.mdx`, `ng/tenant-management.mdx`, `ng/setting-management.mdx` — feature modules behind the lazy routes.

@@ -1,0 +1,443 @@
+---
+title: "abp new"
+description: "Deep dive into NewCommand — the verb that creates an ABP solution from a startup template, including every supported flag, the project-builder pipeline and the post-creation hooks."
+---
+
+`abp new` is the most-touched verb in the CLI. Behind the friendly
+"Creating your project…" log line sits a multi-stage pipeline that:
+
+1. parses ~30 flags from `CommandLineArgs`,
+2. fetches a `.zip` template from `nuget.abp.io` (or a local folder),
+3. unpacks it, substitutes the company/project name,
+4. runs `dotnet ef migrations add`, `abp install-libs` and `abp bundle`
+   as needed,
+5. opens a "thanks" page in the browser.
+
+The orchestrator is `NewCommand`; the heavy lifting is split between
+`ProjectCreationCommandBase` (option parsing) and `TemplateProjectBuilder`
+(downloading + materialising the template).
+
+## File inventory
+
+```text
+framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/
+├── Commands/
+│   ├── NewCommand.cs                 # ExecuteAsync, usage info, examples
+│   ├── ProjectCreationCommandBase.cs # Option parsing + post-creation hooks
+│   ├── ListTemplatesCommand.cs       # Sibling: prints available -t values
+│   └── Services/
+│       ├── ConnectionStringProvider.cs
+│       ├── InitialMigrationCreator.cs
+│       ├── ThemePackageAdder.cs
+│       └── AngularThemeConfigurer.cs
+├── ProjectBuilding/
+│   ├── TemplateProjectBuilder.cs     # Downloads + unzips templates
+│   ├── ProjectBuildArgs.cs           # Immutable bag of every parsed flag
+│   ├── ProjectBuildResult.cs         # Resulting ZIP bytes
+│   ├── ITemplateInfoProvider.cs      # Default & known templates
+│   ├── Templates/                    # AppTemplate, MicroserviceTemplate, …
+│   └── AbpIoSourceCodeStore.cs       # ZIP cache under ~/.abp/templates
+└── ProjectModification/
+    ├── InitialMigrationCreator.cs    # dotnet ef migrations add Initial
+    ├── ThemePackageAdder.cs          # leptonx-lite / basic theme wiring
+    └── AngularPwaSupportAdder.cs     # PWA wiring for -u angular --pwa
+```
+
+## Command class
+
+`NewCommand` extends `ProjectCreationCommandBase` and implements
+`IConsoleCommand`. The constructor receives every service the pipeline
+might need, including the `IBundlingService` and `IInstallLibsService` so
+that the post-creation hooks can run inline rather than re-shelling out.
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/NewCommand.cs
+public class NewCommand : ProjectCreationCommandBase, IConsoleCommand, ITransientDependency
+{
+    public const string Name = "new";
+
+    protected TemplateProjectBuilder TemplateProjectBuilder { get; }
+    public ITemplateInfoProvider TemplateInfoProvider { get; }
+
+    public NewCommand(
+        ConnectionStringProvider connectionStringProvider,
+        SolutionPackageVersionFinder solutionPackageVersionFinder,
+        ICmdHelper cmdHelper,
+        IInstallLibsService installLibsService,
+        CliService cliService,
+        AngularPwaSupportAdder angularPwaSupportAdder,
+        InitialMigrationCreator initialMigrationCreator,
+        ThemePackageAdder themePackageAdder,
+        ILocalEventBus eventBus,
+        IBundlingService bundlingService,
+        ITemplateInfoProvider templateInfoProvider,
+        TemplateProjectBuilder templateProjectBuilder,
+        AngularThemeConfigurer angularThemeConfigurer) :
+        base(connectionStringProvider, solutionPackageVersionFinder, cmdHelper,
+             installLibsService, cliService, angularPwaSupportAdder,
+             initialMigrationCreator, themePackageAdder, eventBus,
+             bundlingService, angularThemeConfigurer)
+    {
+        TemplateInfoProvider  = templateInfoProvider;
+        TemplateProjectBuilder = templateProjectBuilder;
+    }
+    …
+}
+```
+
+## Control flow
+
+The high-level flow inside `ExecuteAsync` is a straight line of named
+steps:
+
+```csharp
+public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    var projectName = NamespaceHelper.NormalizeNamespace(commandLineArgs.Target);
+    if (string.IsNullOrWhiteSpace(projectName))
+        throw new CliUsageException("Project name is missing!" + … + GetUsageInfo());
+
+    ProjectNameValidator.Validate(projectName);
+    Logger.LogInformation("Creating your project...");
+    Logger.LogInformation("Project name: " + projectName);
+
+    var template = commandLineArgs.Options.GetOrNull(Options.Template.Short,
+                                                    Options.Template.Long)
+                   ?? (await TemplateInfoProvider.GetDefaultAsync()).Name;
+
+    var isTiered = commandLineArgs.Options.ContainsKey(Options.Tiered.Long);
+    var projectArgs = await GetProjectBuildArgsAsync(commandLineArgs, template, projectName);
+
+    var result = await TemplateProjectBuilder.BuildAsync(projectArgs);
+
+    ExtractProjectZip(result, projectArgs.OutputFolder);
+    Logger.LogInformation($"'{projectName}' has been successfully created to '{projectArgs.OutputFolder}'");
+
+    ConfigureNpmPackagesForTheme(projectArgs);
+    await RunGraphBuildForMicroserviceServiceTemplate(projectArgs);
+    await CreateInitialMigrationsAsync(projectArgs);
+
+    if (!commandLineArgs.Options.ContainsKey(Options.SkipInstallingLibs.Long))
+    {
+        await RunInstallLibsForWebTemplateAsync(projectArgs);
+        ConfigureAngularJsonForThemeSelection(projectArgs);
+    }
+
+    if (!commandLineArgs.Options.ContainsKey(Options.SkipBundling.Long))
+        await RunBundleForBlazorWasmOrMauiBlazorTemplateAsync(projectArgs);
+
+    await ConfigurePwaSupportForAngular(projectArgs);
+    OpenRelatedWebPage(projectArgs, template, isTiered, commandLineArgs);
+}
+```
+
+The single source of truth for the parsed flags is the
+`ProjectBuildArgs` returned by `GetProjectBuildArgsAsync` — every
+downstream stage reads from that bag rather than touching
+`CommandLineArgs` again.
+
+### Where each flag is consumed
+
+| Flag | Read by | Effect |
+| --- | --- | --- |
+| `-t`/`--template` | `NewCommand` | Selects template (`app`, `app-pro`, `module`, `module-pro`, `console`, `microservice`, `microservice-service-pro`, …). Defaults to `ITemplateInfoProvider.GetDefaultAsync()`. |
+| `-u`/`--ui` | `ProjectCreationCommandBase.GetUiFramework` | `mvc` / `blazor` / `blazor-server` / `angular` / `none`. |
+| `-m`/`--mobile` | `GetMobilePreference` | `none` / `react-native` / `maui` (template-dependent). |
+| `-d`/`--database-provider` | `GetDatabaseProvider` | `ef` ↔ `EntityFrameworkCore`, `mongo`/`mongodb` ↔ `MongoDb`. |
+| `--dbms` | `GetDatabaseManagementSystem` | `sqlserver`, `mysql`, `postgresql`, `oracle`, `sqlite`, … |
+| `-cs`/`--connection-string` | `GetConnectionString` | Replaces the placeholder in `appsettings.json`. Auto-derived for non-SQL Server DBMS when not provided. |
+| `-o`/`--output-folder` | `GetProjectBuildArgsAsync` | Where to extract the ZIP. |
+| `-v`/`--version` | Same | Forwarded to the source-code store. Supports `branch@dev`. |
+| `--preview` | Same | Pre-release templates from `nuget.abp.io`. Refuses to run on a stable CLI build. |
+| `-ts`/`--template-source` | Same | Local folder or network path that overrides `nuget.abp.io`. |
+| `-csf`/`--create-solution-folder` | `GetCreateSolutionFolderPreference` | Wrap output in `<projectName>` folder. |
+| `--theme` | `GetThemeByTemplateOrNull` | `leptonx-lite` (default) / `basic` / `leptonx` (Pro). |
+| `--theme-style` | `GetThemeStyleOrNull` | Variant of the chosen theme. |
+| `--tiered` | `ExecuteAsync` | App template only — separate IdentityServer + WebHost. |
+| `--no-ui` | `GetUiFramework` | Module template only — drop the MVC host project. |
+| `--no-random-port` | `ProjectBuildArgs` | Use template defaults instead of randomising. |
+| `--separate-auth-server` (alias `--separate-identity-server`) | `OpenRelatedWebPage` | Render a separate AuthServer project; reflected in the "thanks" URL. |
+| `--local-framework-ref --abp-path …` | `GetProjectBuildArgsAsync` | Replace NuGet refs with `<ProjectReference>` to your `abp` clone. |
+| `--with-public-website` | Same | App-Pro template only. Adds a public-facing Razor site. |
+| `--pwa` (`-pwa`) | `ConfigurePwaSupportForAngular` | Adds `@angular/pwa`. |
+| `-ms`/`--main-solution` | Microservice service template only | Where to merge the new service. |
+| `-sib`/`--skip-installing-libs` | `ExecuteAsync` | Don't auto-run `abp install-libs`. |
+| `-sb`/`--skip-bundling` | `ExecuteAsync` | Don't auto-run `abp bundle` (Blazor WASM templates). |
+| `-sc`/`--skip-cache` | `GetProjectBuildArgsAsync` | Bypass the `~/.abp/templates` ZIP cache. |
+
+Every flag has a short/long pair declared as a nested `static class
+Options` on `ProjectCreationCommandBase`:
+
+```csharp
+public static class Options
+{
+    public static class Template          { public const string Short = "t";  public const string Long = "template"; }
+    public static class DatabaseProvider  { public const string Short = "d";  public const string Long = "database-provider"; }
+    public static class UiFramework       { public const string Short = "u";  public const string Long = "ui"; }
+    public static class Mobile            { public const string Short = "m";  public const string Long = "mobile"; }
+    public static class Version           { public const string Short = "v";  public const string Long = "version"; }
+    public static class OutputFolder      { public const string Short = "o";  public const string Long = "output-folder"; }
+    public static class ConnectionString  { public const string Short = "cs"; public const string Long = "connection-string"; }
+    public static class Preview           {                                   public const string Long = "preview"; }
+    public static class Tiered            {                                   public const string Long = "tiered"; }
+    public static class CreateSolutionFolder { public const string Short = "csf"; public const string Long = "create-solution-folder"; }
+    // …
+}
+```
+
+## How `GetProjectBuildArgsAsync` reads each flag
+
+The exact source is ~150 lines of straight-line code in
+`ProjectCreationCommandBase`. Two patterns repeat throughout:
+
+```csharp
+var version = commandLineArgs.Options.GetOrNull(Options.Version.Short,
+                                                Options.Version.Long);
+var isPreview = commandLineArgs.Options.ContainsKey(Options.Preview.Long);
+```
+
+Two interesting branches:
+
+- **Microservice service template (`-t microservice-service-pro`)** — the
+  command searches the current folder for a `*.sln`; if missing it asks
+  for `-ms`/`--main-solution`. It then derives the new project's
+  output folder from `MicroserviceServiceTemplateBase.CalculateTargetFolder`.
+- **Connection string defaulting** — if no `-cs` was given **and** the
+  DBMS is not SQL Server, the command computes a sane default via
+  `ConnectionStringProvider.GetByDbms(dbms, outputFolder)`, so a quick
+  `abp new Acme.X --dbms postgresql` produces a working
+  `appsettings.json` out of the box.
+
+Finally, the bag is returned:
+
+```csharp
+return new ProjectBuildArgs(
+    solutionName, template, version, outputFolder,
+    databaseProvider, databaseManagementSystem, uiFramework, mobileApp,
+    publicWebSite, gitHubAbpLocalRepositoryPath, gitHubVoloLocalRepositoryPath,
+    templateSource, commandLineArgs.Options, connectionString, pwa,
+    theme, themeStyle, skipCache);
+```
+
+## TemplateProjectBuilder — fetching the ZIP
+
+`TemplateProjectBuilder.BuildAsync(ProjectBuildArgs)` resolves the right
+concrete builder from `ProjectBuilding/Templates`:
+
+| Template name | Class | Notes |
+| --- | --- | --- |
+| `app` | `AppTemplate` | Default. Free-tier solution template. |
+| `app-pro` | `AppProTemplate` | Commercial. Requires login. |
+| `module` | `ModuleTemplate` | Free-tier reusable module. |
+| `module-pro` | `ModuleProTemplate` | Commercial module template. |
+| `console` | `ConsoleTemplate` | Minimal console host. |
+| `microservice-service-pro` | `MicroserviceServiceProTemplate` | Adds a service into an existing microservice solution. |
+
+The builder downloads the ZIP from `nuget.abp.io` through
+`AbpIoSourceCodeStore`. Cached ZIPs live at `~/.abp/templates`; the
+filename encodes the template + version. With `-sc`/`--skip-cache` the
+cache is bypassed and the file is refreshed.
+
+Inside the ZIP, the placeholders `MyCompanyName` and `MyProjectName` are
+substituted in every text file. Binary files (`.png`, `.ico`,
+`.snk`, …) are copied verbatim. The final `ProjectBuildResult.ZipContent`
+is then unpacked by `ProjectCreationCommandBase.ExtractProjectZip`, which
+uses `ICSharpCode.SharpZipLib`:
+
+```csharp
+using (var zipInputStream = new ZipInputStream(new MemoryStream(project.ZipContent)))
+{
+    var zipEntry = zipInputStream.GetNextEntry();
+    while (zipEntry != null)
+    {
+        var fullZipToPath = Path.Combine(outputFolder, zipEntry.Name);
+        Directory.CreateDirectory(Path.GetDirectoryName(fullZipToPath)!);
+        if (Path.GetFileName(fullZipToPath).Length > 0)
+        {
+            var buffer = new byte[4096];
+            using var streamWriter = File.Create(fullZipToPath);
+            StreamUtils.Copy(zipInputStream, streamWriter, buffer);
+        }
+        zipEntry = zipInputStream.GetNextEntry();
+    }
+}
+```
+
+## Post-creation hooks
+
+After extracting, `NewCommand` runs several optional stages, each guarded
+by a flag and/or a template check.
+
+### 1. NPM packages for the chosen theme
+
+`ConfigureNpmPackagesForTheme` invokes `ThemePackageAdder` to add
+`@volo/abp.ng.theme.lepton-x` (or basic) entries to the `package.json`
+of the appropriate UI project. Only runs when the template has a UI.
+
+### 2. Graph build for microservice templates
+
+```csharp
+if (MicroserviceServiceTemplateBase.IsMicroserviceServiceTemplate(projectArgs.TemplateName))
+{
+    await EventBus.PublishAsync(new ProjectCreationProgressEvent {
+        Message = "Building the microservice solution" }, false);
+    CmdHelper.RunCmd("dotnet build /graphbuild", projectArgs.OutputFolder);
+}
+```
+
+The `dotnet build /graphbuild` ensures cross-project references resolve
+before the next step.
+
+### 3. Initial EF Core migration
+
+`InitialMigrationCreator` runs `dotnet ef migrations add Initial` against
+the `…EntityFrameworkCore` project. Skipped for Mongo and for non-EF
+templates.
+
+### 4. `abp install-libs`
+
+For MVC/Blazor Server templates, the in-process
+`IInstallLibsService.InstallLibsAsync(outputFolder)` runs to populate
+`wwwroot/libs`. See [`abp install-libs`](./cli-install-libs).
+
+### 5. `abp bundle`
+
+For Blazor WebAssembly and MAUI Blazor templates,
+`IBundlingService.BundleAsync(outputFolder, …)` is invoked to write the
+bundle inputs. See [`abp bundle`](./cli-bundle).
+
+### 6. PWA wiring
+
+For `-u angular --pwa`, `AngularPwaSupportAdder` runs
+`ng add @angular/pwa` and patches `index.html`.
+
+### 7. Thanks page
+
+In a non-DEBUG build, `OpenRelatedWebPage` opens
+`https://abp.io/project-created-success?ui=mvc&db=EntityFrameworkCore&tiered=no`
+(or `https://commercial.abp.io/…` for the pro templates):
+
+```csharp
+var url = $"https://{urlPrefix}.abp.io/project-created-success?" +
+          $"ui={uiFramework:g}&db={databaseProvider:g}&tiered={tieredYesNo}";
+CmdHelper.Open(url);
+```
+
+For the microservice template the URL is
+`https://docs.abp.io/en/commercial/latest/startup-templates/microservice/index`
+instead.
+
+## Usage reference
+
+The full usage screen rendered by `GetUsageInfo()`:
+
+```text
+Usage:
+  abp new <project-name> [options]
+
+Options:
+  -t|--template <template-name>               (default: app)
+  -u|--ui <ui-framework>                      (if supported by the template)
+  -m|--mobile <mobile-framework>              (if supported by the template)
+  -d|--database-provider <database-provider>  (if supported by the template)
+  -o|--output-folder <output-folder>          (default: current folder)
+  -v|--version <version>                      (default: latest version)
+  --preview                                   (use latest pre-release version)
+  -ts|--template-source <template-source>     (local or network template source)
+  -csf|--create-solution-folder               (default: true)
+  -cs|--connection-string <connection-string> (your database connection string)
+  --dbms <database-management-system>         (sqlserver, mysql, postgresql, …)
+  --theme <theme-name>                        (default: leptonx-lite)
+  --tiered                                    (if supported by the template)
+  --no-ui                                     (if supported by the template)
+  --no-random-port                            (use template defaults)
+  --separate-auth-server                      (if supported by the template)
+  --local-framework-ref --abp-path <path>     (use local <ProjectReference>s)
+  -sib|--skip-installing-libs
+  -sb|--skip-bundling
+  -sc|--skip-cache
+```
+
+### Examples
+
+```bash
+# Default MVC + EF Core + Lepton-X Lite
+abp new Acme.BookStore
+
+# Tiered: split IdentityServer + WebHost
+abp new Acme.BookStore --tiered
+
+# Angular SPA on MongoDB
+abp new Acme.BookStore -u angular -d mongodb
+
+# Blazor WebAssembly, sqlite, custom output folder
+abp new Acme.BookStore -u blazor --dbms sqlite -o c:\src\bookstore
+
+# Use a local clone of abp instead of NuGet
+abp new Acme.BookStore --local-framework-ref --abp-path C:\github\abp
+
+# Module template, no UI host
+abp new Acme.BookStore -t module --no-ui
+
+# React Native mobile shell only
+abp new Acme.BookStore -m react-native
+
+# Preview pre-release template
+abp new Acme.BookStore --preview
+
+# Add a service into an existing microservice solution
+cd MyMicroserviceSolution
+abp new Catalog -t microservice-service-pro -ms ./MyMicroserviceSolution.sln
+```
+
+## Where files end up
+
+| Template | Output structure |
+| --- | --- |
+| `app` | `<output>/Acme.BookStore/aspnet-core/{src,test}` |
+| `app-pro` | Same plus `Acme.BookStore.AuthServer` when `--tiered`. |
+| `module` | `<output>/Acme.BookStore.SuggestionApp/src,test` |
+| `console` | Single console project under `<output>/Acme.BookStore`. |
+| `microservice` | Generates a full microservice solution with `apps/`, `services/`, `gateways/`. |
+| `microservice-service-pro` | Drops a new service into `services/<name>` of an existing microservice solution. |
+
+## Gotchas
+
+- **Project name format.** `NamespaceHelper.NormalizeNamespace` strips
+  invalid characters; `ProjectNameValidator.Validate` rejects names
+  starting with a digit or containing a reserved keyword. The
+  recommended pattern is `Company.Product`.
+- **`-cs` without `--dbms`.** A connection string alone does not change
+  the DBMS — you'll get SQL Server provider code with a connection
+  string that doesn't fit.
+- **`--preview` requires a preview CLI.** Outside `DEBUG` the command
+  throws `CliUsageException("You can only create a new preview solution
+  with preview CLI version.")`.
+- **`branch@…` versions** build NuGet packages from a local git clone
+  (`--abp-path`) and use them — slow but unbeatable for trying ABP
+  changes before they ship.
+- **Templates are cached aggressively.** If `--preview` doesn't seem to
+  pick up the newest pre-release, add `-sc` to bypass
+  `~/.abp/templates`.
+- **`--separate-identity-server` is the legacy spelling of
+  `--separate-auth-server`** — both are still accepted (see
+  `OpenRelatedWebPage`), but new code should prefer the new spelling.
+- **`abp install-libs` and `abp bundle` only run if NPM/Yarn are
+  present.** If they aren't installed, `NewCommand` logs a warning and
+  the project will still build, but `wwwroot/libs` will be empty.
+
+## Cross-references
+
+- [CLI host](./cli) — how `CliService` resolves `NewCommand` from DI.
+- [Command registry](./cli-commands) — where `NewCommand.Name = "new"`
+  is plugged into `AbpCliOptions.Commands`.
+- [`abp install-libs`](./cli-install-libs) and
+  [`abp bundle`](./cli-bundle) — services that `NewCommand` calls
+  in-process after extraction.
+- [`abp add-package` / `add-module`](./cli-add-package) — what you run
+  after a successful `new`.
+- [DbMigrator template](./dbmigrator) — generated under
+  `src/<Project>.DbMigrator` by the `app`/`app-pro` templates.
+- Official docs:
+  [docs.abp.io/en/abp/latest/CLI](https://docs.abp.io/en/abp/latest/CLI),
+  [Startup templates](https://docs.abp.io/en/abp/latest/Startup-Templates/Index).

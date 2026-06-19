@@ -1,0 +1,211 @@
+---
+title: "HttpApi.HostWithIds Project"
+description: "All-in-one ASP.NET Core host that combines the HTTP API and the OpenIddict-based identity server — the default for non-tiered Angular and MAUI solutions."
+---
+
+`MyCompanyName.MyProjectName.HttpApi.HostWithIds` is a **single process** that exposes both the application's HTTP API and the OpenIddict-based authentication endpoints (`/connect/authorize`, `/connect/token`, `/.well-known/openid-configuration`). The "WithIds" suffix is shorthand for "with Identity server".
+
+This host is produced by `abp new ... -u angular` (or similar non-tiered flavours) and runs at `https://localhost:44305` in development. It is **mutually exclusive** with the split [HttpApi.Host](/templates/aspnetcore/httpapi-host) + [AuthServer](/templates/aspnetcore/authserver) pair — pick one model when you create the solution.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.HttpApi.HostWithIds/
+├── Controllers/
+│   └── ...
+├── Properties/
+│   └── launchSettings.json
+├── wwwroot/
+│   └── ...
+├── MyCompanyName.MyProjectName.HttpApi.HostWithIds.csproj
+├── MyProjectNameBrandingProvider.cs
+├── MyProjectNameHttpApiHostModule.cs
+├── Program.cs
+├── abp.resourcemapping.js
+├── appsettings.Development.json
+├── appsettings.json
+├── package.json
+└── web.config
+```
+
+The static assets folder (`wwwroot/`), the `package.json`, the `abp.resourcemapping.js` file, and `MyProjectNameBrandingProvider.cs` exist because this host serves the **Account** module's Razor Pages — the login/register/forgot-password UI is rendered by this process.
+
+## csproj at a glance
+
+| Property                        | Value                                              |
+| ------------------------------- | -------------------------------------------------- |
+| `Sdk`                           | `Microsoft.NET.Sdk.Web`                            |
+| `TargetFramework`               | `net7.0`                                           |
+| `PreserveCompilationReferences` | `true`                                             |
+| `UserSecretsId`                 | `MyCompanyName.MyProjectName-4681b4fd-...`         |
+
+| Project / Package reference                                                                 | Purpose                                |
+| ------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `Volo.Abp.AspNetCore.MultiTenancy`                                                          | Tenant resolver middleware             |
+| `Volo.Abp.Autofac`                                                                          | Property-injection DI                  |
+| `Volo.Abp.AspNetCore.Serilog`                                                               | HTTP context enrichers                 |
+| `Volo.Abp.Swashbuckle`                                                                      | Swagger UI                             |
+| `Volo.Abp.Account.Web.OpenIddict`                                                           | Razor pages for login / consent        |
+| `Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy`                                                   | Tenant switch on the login UI          |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared`                                                   | Theme base                             |
+| `Volo.Abp.AutoMapper`                                                                       | Used by the account module             |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite` (`2.4.*-*` package)                          | Default theme                          |
+| `MyCompanyName.MyProjectName.Application`                                                   | Business logic                         |
+| `MyCompanyName.MyProjectName.EntityFrameworkCore`                                           | Persistence                            |
+| `MyCompanyName.MyProjectName.HttpApi`                                                       | Manual controllers + base              |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameHttpApiModule),
+    typeof(AbpAutofacModule),
+    typeof(AbpAspNetCoreMultiTenancyModule),
+    typeof(MyProjectNameApplicationModule),
+    typeof(MyProjectNameEntityFrameworkCoreModule),
+    typeof(AbpAspNetCoreMvcUiLeptonXLiteThemeModule),
+    typeof(AbpAccountWebOpenIddictModule),
+    typeof(AbpAspNetCoreSerilogModule),
+    typeof(AbpSwashbuckleModule))]
+public class MyProjectNameHttpApiHostModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<OpenIddictBuilder>(builder =>
+        {
+            builder.AddValidation(options =>
+            {
+                options.AddAudiences("MyProjectName");
+                options.UseLocalServer();
+                options.UseAspNetCore();
+            });
+        });
+    }
+    // ConfigureServices, OnApplicationInitialization ...
+}
+```
+
+The single most important call is the `PreConfigure<OpenIddictBuilder>` block:
+
+- `AddValidation` registers a token validation handler.
+- `UseLocalServer()` tells the validator that this same process **issues** the tokens — no JWKS network roundtrip required.
+- `UseAspNetCore()` plugs validation into the ASP.NET Core authentication scheme.
+
+The host then bridges the cookie/identity authentication produced by Razor Pages to the OpenIddict validation scheme:
+
+```csharp
+context.Services.ForwardIdentityAuthenticationForBearer(
+    OpenIddictValidationAspNetCoreDefaults.AuthenticationScheme);
+```
+
+### URL configuration
+
+```csharp
+Configure<AppUrlOptions>(options =>
+{
+    options.Applications["MVC"].RootUrl = configuration["App:SelfUrl"];
+    options.RedirectAllowedUrls.AddRange(
+        configuration["App:RedirectAllowedUrls"]?.Split(',') ?? Array.Empty<string>());
+
+    options.Applications["Angular"].RootUrl = configuration["App:ClientUrl"];
+    options.Applications["Angular"].Urls[AccountUrlNames.PasswordReset] = "account/reset-password";
+});
+```
+
+The `Applications["Angular"]` entry is what makes the **forgot-password email** point back at `http://localhost:4200/account/reset-password` — the Angular SPA URL — instead of the host's own MVC URL. Change `App:ClientUrl` for production.
+
+### Bundling
+
+```csharp
+Configure<AbpBundlingOptions>(options =>
+{
+    options.StyleBundles.Configure(
+        LeptonXLiteThemeBundles.Styles.Global,
+        bundle => bundle.AddFiles("/global-styles.css"));
+});
+```
+
+Adds `wwwroot/global-styles.css` to the LeptonX Lite global style bundle so customizations are applied to the login UI.
+
+### Conventional controllers, CORS, Swagger, Virtual File System
+
+These follow the same patterns as the [HttpApi.Host](/templates/aspnetcore/httpapi-host) project — see there for in-depth coverage. The only difference is that **`AddAbpSwaggerGenWithOAuth`** points at `configuration["AuthServer:Authority"]` which is *this* host's own URL.
+
+## OnApplicationInitialization (the request pipeline)
+
+```csharp
+app.UseAbpRequestLocalization();
+if (!env.IsDevelopment()) app.UseErrorPage();
+app.UseCorrelationId();
+app.UseStaticFiles();
+app.UseRouting();
+app.UseCors();
+app.UseAuthentication();
+app.UseAbpOpenIddictValidation();
+
+if (MultiTenancyConsts.IsEnabled) app.UseMultiTenancy();
+
+app.UseUnitOfWork();
+app.UseAuthorization();
+app.UseSwagger();
+app.UseAbpSwaggerUI(c => { ... });
+app.UseAuditing();
+app.UseAbpSerilogEnrichers();
+app.UseConfiguredEndpoints();
+```
+
+Notice the **additional `app.UseAbpOpenIddictValidation()`** between `UseAuthentication` and `UseMultiTenancy`. This middleware reads the bearer token, validates it against the local OpenIddict server, and converts the result to an `HttpContext.User` so downstream tenant resolution can read claims.
+
+## appsettings.json
+
+```json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44305",
+    "ClientUrl": "http://localhost:4200",
+    "CorsOrigins": "https://*.MyProjectName.com,http://localhost:4200,https://localhost:44307",
+    "RedirectAllowedUrls": "http://localhost:4200,https://localhost:44307"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "AuthServer": {
+    "Authority": "https://localhost:44305",
+    "RequireHttpsMetadata": "false",
+    "SwaggerClientId": "MyProjectName_Swagger"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+`AuthServer:Authority` equals `App:SelfUrl` because this **is** the authorization server. Setting `RequireHttpsMetadata` to `false` is acceptable for local development; never ship that to production.
+
+## OpenIddict client seeding
+
+The `DbMigrator/appsettings.json` file contains the seed entries the `OpenIddictDataSeedContributor` reads. For a HostWithIds deployment the relevant clients are typically:
+
+- `MyProjectName_App` — the Angular/MAUI public client (no secret, PKCE only).
+- `MyProjectName_Swagger` — the swagger UI client.
+
+If you also enable the Blazor WASM UI you add `MyProjectName_Blazor` to the seed entries.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Branded login page                    | Override `Pages/Account/Login.cshtml` (copied from `Volo.Abp.Account.Web`) |
+| Custom branding (logo, name)          | `MyProjectNameBrandingProvider`                                  |
+| Add an OAuth scope                    | `AddAudiences("...")` + new entry in `commonScopes` of the seed  |
+| Extra OpenIddict client               | Section in `DbMigrator/appsettings.json` + seed call             |
+| Different theme                       | Swap the LeptonX Lite package for `LeptonX` (commercial)         |
+
+## Gotchas
+
+- **Both validator and issuer in one process.** `options.UseLocalServer()` works because the OpenIddict server is registered through `AbpAccountWebOpenIddictModule`. If you accidentally split that dependency out, validation silently fails with `IDX10501: Signature validation failed`.
+- **`ForwardIdentityAuthenticationForBearer` is required.** Without it the Razor Pages login (Cookie scheme) and the API authentication (Bearer scheme) cannot share user state — your `[Authorize]` API endpoints will return 401 even after a successful browser login.
+- **`AppUrlOptions["Angular"]`** is meaningful only when an Angular client is connecting. Removing the line is safe in MVC-only solutions; renaming the key to a custom string requires matching `AccountUrlNames` lookups in any account module override.
+- **`UseErrorPage()` runs only in non-development.** Diagnosing OpenIddict errors locally requires the developer exception page — don't blanket-enable `UseErrorPage()` in dev or the underlying ABP errors disappear behind a styled error page.
+- **HTTPS metadata.** Setting `RequireHttpsMetadata = "false"` in production allows token replay over plaintext HTTP and breaks every modern OIDC compliance review. Always restore `"true"` for non-dev environments.
+- **`SelfUrl` must match exactly the URL clients use to reach this host.** If clients hit `https://localhost:44305/` but `SelfUrl` is `https://localhost:44305` (no trailing slash), redirect URIs and audiences will be mismatched at random — pick a convention and stick to it across the seed file *and* `appsettings.json`.

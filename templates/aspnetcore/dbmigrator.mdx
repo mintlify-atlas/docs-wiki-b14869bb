@@ -1,0 +1,214 @@
+---
+title: "DbMigrator Project"
+description: "Console application that applies EF Core (or MongoDB) schema changes and runs every IDataSeedContributor — the canonical bootstrap for host and tenant databases."
+---
+
+`MyCompanyName.MyProjectName.DbMigrator` is a **short-lived console process** that performs schema migration and initial data seeding for every host and tenant database in the solution. It is the program you run after `dotnet build` to bring a fresh deployment to a usable state.
+
+The console is a thin shell: it boots an `IHostedService` that creates an ABP application around `MyProjectNameDbMigratorModule`, calls `MyProjectNameDbMigrationService.MigrateAsync()` from `Domain`, and shuts down.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.DbMigrator/
+├── DbMigratorHostedService.cs
+├── MyCompanyName.MyProjectName.DbMigrator.csproj
+├── MyProjectNameDbMigratorModule.cs
+├── Program.cs
+└── appsettings.json
+```
+
+## csproj at a glance
+
+| Property            | Value                                              |
+| ------------------- | -------------------------------------------------- |
+| `Sdk`               | `Microsoft.NET.Sdk`                                |
+| `OutputType`        | `Exe`                                              |
+| `TargetFramework`   | `net7.0`                                           |
+| `Nullable`          | `enable`                                           |
+
+| Package reference                                     | Version | Purpose                          |
+| ----------------------------------------------------- | ------- | -------------------------------- |
+| `Serilog.Extensions.Logging`                          | `3.1.0` | Adapter to `Microsoft.Extensions.Logging` |
+| `Serilog.Sinks.Async`                                 | `1.5.0` | Async file/console sinks         |
+| `Serilog.Sinks.File`                                  | `5.0.0` | File output                      |
+| `Serilog.Sinks.Console`                               | `4.0.1` | Console output                   |
+| `Microsoft.Extensions.Hosting`                        | `7.0.0` | Generic host                     |
+
+| Project reference                                                 | Purpose                                    |
+| ----------------------------------------------------------------- | ------------------------------------------ |
+| `Volo.Abp.Autofac`                                                | Property-injection DI                      |
+| `Volo.Abp.Caching.StackExchangeRedis` *(tiered only)*             | Distributed cache for seed contributors    |
+| `MyCompanyName.MyProjectName.Application.Contracts`               | Permission definitions to seed             |
+| `MyCompanyName.MyProjectName.EntityFrameworkCore`                 | Schema migrator implementation             |
+
+The `Volo.Abp.Caching.StackExchangeRedis` reference is conditional in the template (`<TEMPLATE-REMOVE IF-NOT='TIERED'>`) — it is shipped only with the tiered flavours because non-tiered deployments do not run a Redis instance during local development.
+
+The `appsettings.json` file is copied to the publish directory:
+
+```xml
+<Content Include="appsettings.json">
+  <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+  <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+</Content>
+```
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(AbpAutofacModule),
+    typeof(AbpCachingStackExchangeRedisModule), // tiered only
+    typeof(MyProjectNameEntityFrameworkCoreModule),
+    typeof(MyProjectNameApplicationContractsModule))]
+public class MyProjectNameDbMigratorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context) // tiered only
+    {
+        Configure<AbpDistributedCacheOptions>(options => { options.KeyPrefix = "MyProjectName:"; });
+    }
+}
+```
+
+The dependencies are intentionally narrow:
+
+- **`EntityFrameworkCore`** provides `EntityFrameworkCoreMyProjectNameDbSchemaMigrator`, which the seed contributor pipeline picks up through `IEnumerable<IMyProjectNameDbSchemaMigrator>`.
+- **`Application.Contracts`** brings in `MyProjectNamePermissionDefinitionProvider` so the permission-management seed contributor knows what permissions exist.
+
+The MongoDB flavour replaces the EF reference with `MyProjectNameMongoDbModule`.
+
+## DbMigratorHostedService
+
+```csharp
+public class DbMigratorHostedService : IHostedService
+{
+    private readonly IHostApplicationLifetime _hostApplicationLifetime;
+    private readonly IConfiguration _configuration;
+
+    public DbMigratorHostedService(IHostApplicationLifetime hostApplicationLifetime, IConfiguration configuration)
+    {
+        _hostApplicationLifetime = hostApplicationLifetime;
+        _configuration = configuration;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        using (var application = await AbpApplicationFactory.CreateAsync<MyProjectNameDbMigratorModule>(options =>
+        {
+            options.Services.ReplaceConfiguration(_configuration);
+            options.UseAutofac();
+            options.Services.AddLogging(c => c.AddSerilog());
+            options.AddDataMigrationEnvironment();
+        }))
+        {
+            await application.InitializeAsync();
+
+            await application.ServiceProvider
+                .GetRequiredService<MyProjectNameDbMigrationService>()
+                .MigrateAsync();
+
+            await application.ShutdownAsync();
+            _hostApplicationLifetime.StopApplication();
+        }
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}
+```
+
+`options.AddDataMigrationEnvironment()` flags the running application so guard clauses such as `if (IsInDataMigrationContext()) return;` (used by some modules' lifetime hooks) take effect. After `MigrateAsync()` completes the service signals the host to terminate the process — there is no long-running work to keep alive.
+
+## Program.cs
+
+```csharp
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Information()
+            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+            .MinimumLevel.Override("Volo.Abp", LogEventLevel.Warning)
+#if DEBUG
+            .MinimumLevel.Override("MyCompanyName.MyProjectName", LogEventLevel.Debug)
+#else
+            .MinimumLevel.Override("MyCompanyName.MyProjectName", LogEventLevel.Information)
+#endif
+            .Enrich.FromLogContext()
+            .WriteTo.Async(c => c.File("Logs/logs.txt"))
+            .WriteTo.Async(c => c.Console())
+            .CreateLogger();
+
+        await CreateHostBuilder(args).RunConsoleAsync();
+    }
+
+    public static IHostBuilder CreateHostBuilder(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            .AddAppSettingsSecretsJson()
+            .ConfigureLogging((context, logging) => logging.ClearProviders())
+            .ConfigureServices((hostContext, services) =>
+            {
+                services.AddHostedService<DbMigratorHostedService>();
+            });
+}
+```
+
+- `MinimumLevel.Override("Volo.Abp", Warning)` keeps the framework's verbose startup logs out of `Logs/logs.txt` so the migrator output stays readable.
+- `RunConsoleAsync` blocks until the hosted service signals `StopApplication()`.
+- `AddAppSettingsSecretsJson` enables `appsettings.secrets.json` resolution.
+
+## appsettings.json
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "Redis": {                       // tiered only
+    "Configuration": "127.0.0.1"
+  },
+  "OpenIddict": {
+    "Applications": {
+      "MyProjectName_Web":                { "ClientId": "MyProjectName_Web",                "ClientSecret": "1q2w3e*", "RootUrl": "https://localhost:44302" },
+      "MyProjectName_Blazor":             { "ClientId": "MyProjectName_Blazor",                                       "RootUrl": "https://localhost:44307" },
+      "MyProjectName_App":                { "ClientId": "MyProjectName_App",                                          "RootUrl": "http://localhost:4200"  },
+      "MyProjectName_BlazorServerTiered": { "ClientId": "MyProjectName_BlazorServerTiered",  "ClientSecret": "1q2w3e*", "RootUrl": "https://localhost:44309" },
+      "MyProjectName_Swagger":            { "ClientId": "MyProjectName_Swagger",                                        "RootUrl": "https://localhost:44305" }
+    }
+  }
+}
+```
+
+The `OpenIddict:Applications` section is the contract between this console and `OpenIddictDataSeedContributor` in `Domain`. Each entry that has a non-empty `ClientId` triggers `CreateApplicationAsync(...)` — entries with no secret produce **public** PKCE-only clients; entries with a secret produce **confidential** Hybrid-flow clients.
+
+## What MigrateAsync actually does
+
+The orchestration lives in `MyProjectNameDbMigrationService` (in `Domain`) and reads:
+
+1. **EF Core only** — bootstrap: if no `Migrations/` folder exists in the `EntityFrameworkCore` project, shell out to `abp create-migration-and-run-migrator` and return early.
+2. Run every `IMyProjectNameDbSchemaMigrator` against the host database.
+3. Run every `IDataSeedContributor` (Identity admin, permissions, OpenIddict clients, your custom seed).
+4. For each tenant in `ITenantRepository.GetListAsync(includeDetails: true)`:
+   - Change `ICurrentTenant`.
+   - If the tenant defines its own connection strings, migrate the tenant database (deduplicated by connection string with a `HashSet`).
+   - Run seed contributors again for the tenant context.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Add a seed contributor                | New class in `Domain` implementing `IDataSeedContributor`        |
+| Change the default admin email/password | Override the constants in your own seed contributor and adjust `MyProjectNameDbMigrationService` |
+| Run extra SQL after schema migration  | Add a method to `MyProjectNameDbMigrationService.MigrateAsync()` |
+| Add an OpenIddict client              | New entry in `appsettings.json` + matching `CreateApplicationAsync` call in `OpenIddictDataSeedContributor` |
+| Skip tenant seed                      | Remove the `foreach (var tenant in tenants)` block (not recommended) |
+
+## Gotchas
+
+- **Run from the project directory.** `MyProjectNameDbMigrationService.GetSolutionDirectoryPath()` walks upward looking for a `.sln` file. Running the published binary from a folder without one (a Docker image without source, for instance) means the EF Core bootstrap step fails — but normal migration still works as long as the `Migrations/` folder already exists in the binary.
+- **The console reads its own `appsettings.json`, not the API host's.** Updating connection strings in `HttpApi.Host/appsettings.json` does not affect the migrator. Keep both files in sync (or move secrets into a shared User Secrets / environment variables).
+- **Redis is required in tiered flavours.** The seed contributors invalidate distributed caches at the end of their run; without Redis the next access in the API host serves stale data until in-memory caches expire.
+- **`AddDataMigrationEnvironment()` flag.** Some modules (`Volo.Abp.AspNetCore.MultiTenancy`, for example) short-circuit certain background work when this flag is set. Removing the call causes the migrator to attempt to start jobs it cannot finish.
+- **No HTTP API is exposed.** The migrator is not a host. Trying to hit `http://localhost:5000/` while it is running does nothing — the console exits as soon as work is finished.
+- **Re-running is idempotent for schema** (`Database.MigrateAsync()` applies only pending migrations) **but additive for seeds**. Re-seeding will not overwrite an existing OpenIddict client; you must `DELETE FROM AbpOpenIddictApplications WHERE ClientId = ...` first if you change a client's grant types.
+- **Don't add MVC / Razor packages.** Doing so pulls in the full Kestrel pipeline and slows down container startup unnecessarily — the migrator is supposed to be a small, fast bootstrap.

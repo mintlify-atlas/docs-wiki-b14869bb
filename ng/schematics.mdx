@@ -1,0 +1,299 @@
+---
+title: "@abp/ng.schematics"
+description: "Angular CLI schematics that generate API proxies, scaffold libraries and switch themes — the foundation that @abp/nx.generators and the abp-cli call into."
+---
+
+`@abp/ng.schematics` is the code-generation layer of the Angular workspace. It implements the `proxy-add`, `proxy-refresh`, `proxy-remove`, `proxy-index`, `api`, `create-lib` and `change-theme` schematics — the same building blocks the ABP CLI and `@abp/nx.generators` call into when an app needs new proxies or a brand-new module library.
+
+Unlike most `@abp/ng.*` packages, this one isn't a runtime library. It ships TypeScript code that runs at *build/scaffold time* inside Angular Devkit's `Tree` abstraction.
+
+## File tree
+
+```text
+packages/schematics/
+├── package.json            # "@abp/ng.schematics" — version 7.4.0
+├── jest.config.ts
+├── tsconfig.json
+└── src/
+    ├── collection.json
+    ├── test-setup.ts
+    ├── constants/
+    ├── enums/
+    ├── index.ts
+    ├── models/
+    ├── utils/                       # helpers shared across commands
+    └── commands/
+        ├── proxy-add/
+        │   ├── index.ts
+        │   └── schema.json
+        ├── proxy-refresh/
+        ├── proxy-remove/
+        ├── proxy-index/
+        ├── api/
+        │   ├── index.ts
+        │   ├── schema.json
+        │   ├── files-enum/         # templates for generated enums
+        │   ├── files-model/        # templates for generated DTOs
+        │   └── files-service/      # templates for generated services
+        ├── create-lib/
+        │   ├── index.ts
+        │   ├── schema.json
+        │   ├── files-package/
+        │   └── files-secondary-entrypoint/
+        └── change-theme/
+            ├── index.ts
+            ├── schema.json
+            ├── style-map.ts
+            └── theme-options.enum.ts
+```
+
+## `collection.json`
+
+The schematic collection that Angular CLI / Nx pick up:
+
+```json
+{
+  "schematics": {
+    "proxy-add":     { "description": "ABP Proxy Generator Add Schematics",
+                       "factory": "./commands/proxy-add",
+                       "schema":  "./commands/proxy-add/schema.json" },
+    "proxy-index":   { "description": "ABP Proxy Generator Index Schematics",
+                       "factory": "./commands/proxy-index",
+                       "schema":  "./commands/proxy-index/schema.json" },
+    "proxy-refresh": { "description": "ABP Proxy Generator Refresh Schematics",
+                       "factory": "./commands/proxy-refresh",
+                       "schema":  "./commands/proxy-refresh/schema.json" },
+    "proxy-remove":  { "description": "ABP Proxy Generator Remove Schematics",
+                       "factory": "./commands/proxy-remove",
+                       "schema":  "./commands/proxy-remove/schema.json" },
+    "api":           { "description": "ABP API Generator Schematics",
+                       "factory": "./commands/api",
+                       "schema":  "./commands/api/schema.json" },
+    "create-lib":    { "description": "ABP Create Library Schematics",
+                       "factory": "./commands/create-lib",
+                       "schema":  "./commands/create-lib/schema.json" },
+    "change-theme":  { "description": "ABP Change Styles of Theme Schematics",
+                       "factory": "./commands/change-theme",
+                       "schema":  "./commands/change-theme/schema.json" }
+  }
+}
+```
+
+## proxy-add — primary entry point
+
+This is what `abp generate-proxy -t ng` actually invokes. Given a backend module name, an API name and a target Angular project, it:
+
+1. resolves the workspace project, builds the target directory (`src/app/proxy/<module>` by default);
+2. reads `proxy-config.json` (if present) to remember which modules were already generated;
+3. fetches the API definition JSON from the backend (`<apiUrl>/api/abp/api-definition`);
+4. clears the previous output (`mergeAndAllowDelete` survives stray manual edits the user wants to keep);
+5. regenerates models, enums and services from the definition;
+6. writes `proxy-config.json`, `README.md` (warning about regeneration), and `index.ts` barrels.
+
+```typescript
+// packages/schematics/src/commands/proxy-add/index.ts (excerpt)
+export default function (schema: GenerateProxySchema) {
+  const params = removeDefaultPlaceholders(schema);
+  const moduleName = params.module || 'app';
+
+  return chain([
+    async (host: Tree) => {
+      const target = await resolveProject(host, params.target!);
+      const targetPath = buildTargetPath(target.definition, params.entryPoint);
+      const readProxyConfig = createProxyConfigReader(targetPath);
+      let generated: string[] = [];
+
+      try {
+        generated = readProxyConfig(host).generated;
+        const index = generated.findIndex(m => m === moduleName);
+        if (index < 0) generated.push(moduleName);
+      } catch (_) {
+        generated.push(moduleName);
+      }
+
+      const getApiDefinition = createApiDefinitionGetter(params);
+      const data = { generated, ...(await getApiDefinition(host)) };
+      data.generated = [];
+
+      const clearProxy       = createProxyClearer(targetPath);
+      const saveProxyConfig  = createProxyConfigSaver(data, targetPath);
+      const saveProxyWarning = createProxyWarningSaver(targetPath);
+      const generateApis     = createApisGenerator(schema, generated);
+      const generateIndex    = createProxyIndexGenerator(targetPath);
+
+      return chain([
+        mergeAndAllowDelete(host, clearProxy),
+        saveProxyConfig,
+        saveProxyWarning,
+        generateApis,
+        generateIndex,
+      ]);
+    },
+  ]);
+}
+```
+
+### Schema fields
+
+```json
+{
+  "module":      "app",                 // backend module name (defaults to "app")
+  "apiName":     "default",             // entry under environment.apis
+  "source":      "MyAppSource",         // angular project to read env/apis from
+  "target":      "MyAppTarget",         // angular project to write code into
+  "url":         "https://api.local",   // override the API definition URL
+  "serviceType": "application | integration | all",
+  "entryPoint":  ""                     // for libs, the secondary entry to target
+}
+```
+
+`removeDefaultPlaceholders` strips the literal string `default` from CLI args so the actual defaults kick in.
+
+### Running it
+
+```bash
+ng generate @abp/ng.schematics:proxy-add \
+  --module=identity \
+  --apiName=AbpIdentity \
+  --source=MyApp \
+  --target=MyApp
+```
+
+## proxy-refresh / proxy-remove / proxy-index
+
+These three commands share `proxy-add`'s machinery but differ in *what* they regenerate:
+
+* **proxy-refresh** — re-runs the whole pipeline for every entry in the saved `proxy-config.json`. Use after a backend API change to refresh all proxies in one go.
+* **proxy-remove** — removes a single module from `proxy-config.json` *and* deletes its files, then regenerates the index. Used when an app drops a backend module.
+* **proxy-index** — rewrites only the barrel `index.ts`. Used by other commands as a final step; you rarely call it directly.
+
+```typescript
+// packages/schematics/src/commands/proxy-remove/index.ts (excerpt)
+export default function (schema: GenerateProxySchema) {
+  const params = removeDefaultPlaceholders(schema);
+  const moduleName = params.module || 'app';
+
+  return async (host: Tree) => {
+    const target = await resolveProject(host, params.target!);
+    const targetPath = buildTargetPath(target.definition, params.entryPoint);
+    const { generated } = createProxyConfigReader(targetPath)(host);
+
+    const index = generated.findIndex(m => m === moduleName);
+    if (index < 0) return host;
+    generated.splice(index, 1);
+    /* … regenerate */
+  };
+}
+```
+
+## api — the lower-level template runner
+
+`api` is the templated layer beneath `proxy-add`: given a parsed API definition (a list of controllers + DTOs + enums), it walks the file templates under `files-enum/`, `files-model/`, `files-service/` and writes them out.
+
+```typescript
+// packages/schematics/src/commands/api/index.ts (excerpt)
+import { defaultEServiceType, eServiceType, Exception } from '../../enums';
+import { Controller, GenerateProxySchema, ServiceGeneratorParams } from '../../models';
+import {
+  applyWithOverwrite,
+  buildTargetPath,
+  createControllerToServiceMapper,
+  createImportRefsToModelReducer,
+  createImportRefToEnumMapper,
+  /* … */
+} from '../../utils';
+```
+
+The templates use Angular Devkit's `applyTemplates(...)` interpolation. Each generated service includes the right `@Injectable({ providedIn: 'root' })`, `apiName`, and method signatures with typed input/output DTOs — exactly what `@abp/ng.identity/proxy` (and every other `/proxy` sub-entry) is shipped with.
+
+## create-lib — scaffold an Angular library or secondary entry
+
+`create-lib` is the schematic the framework team uses to create new packages inside `npm/ng-packs/packages/`. Consumers also run it when they need a feature library inside their own monorepo:
+
+```typescript
+// packages/schematics/src/commands/create-lib/index.ts (excerpt)
+export default function (schema: GenerateLibSchema) {
+  return async (tree: Tree) => {
+    if (schema.override || !(await checkLibExist(schema, tree))) {
+      return chain([createLibrary(schema)]);
+    }
+  };
+}
+```
+
+Schema:
+
+```json
+{
+  "packageName":           "my-feature",
+  "isSecondaryEntrypoint": false,
+  "isModuleTemplate":      false,
+  "override":              false
+}
+```
+
+* `isSecondaryEntrypoint: true` writes a secondary entry under an existing package (mirroring the way `@abp/ng.components` ships `page`, `tree`, `chart.js`).
+* `isModuleTemplate: true` ships an ABP-style module skeleton with `forRoot`, `forChild`, `forLazy` factories, replaceable enums and a sample routing module.
+
+Behind the scenes it uses Angular's `@schematics/angular` to register the library in `angular.json`, then merges ABP-specific templates on top (`tsconfig.lib.prod.json`, `ng-package.json`, `public-api.ts`).
+
+## change-theme — swap the active theme
+
+`change-theme` rewrites the stylesheet section of `angular.json` and updates `package.json` dependencies to point at the chosen theme variant:
+
+```typescript
+// packages/schematics/src/commands/change-theme/style-map.ts (excerpt)
+export const styleMap: Record<ThemeOptionsEnum, string[]> = {
+  [ThemeOptionsEnum.Basic]:      ['bootstrap/dist/css/bootstrap.min.css', '@abp/ng.theme.basic/styles.css'],
+  [ThemeOptionsEnum.LeptonX]:    ['@volo/abp.ng.theme.lepton-x/css/bootstrap.css', /* … */ ],
+  [ThemeOptionsEnum.LeptonXLite]: [/* … */ ],
+};
+```
+
+`ThemeOptionsEnum` maps a numeric prompt choice (1, 2, 3) to a named theme. The command updates `architect.build.options.styles` (and `serve` configurations) to the matching entries.
+
+## Utility module
+
+`utils/` is where the heavy lifting lives. Highlights:
+
+| Helper | Purpose |
+| ------ | ------- |
+| `resolveProject(tree, name)` | reads `angular.json` and returns a `ProjectDefinition` |
+| `buildTargetPath(definition, entryPoint?)` | computes the proxy root (`<project-root>/src/app/proxy` for apps, `<lib-root>/src/proxy` for libraries, plus `<entryPoint>` for secondary entries) |
+| `createApiDefinitionGetter(schema)` | downloads the API definition JSON via `got` (with auth headers when supplied) |
+| `applyWithOverwrite(url, rules)` | template helper that overwrites existing files (vs. Angular's default `MergeStrategy.Default`) |
+| `interpolate` | shorthand for `applyTemplates({ ...cases, ...data })` |
+| `cases` (camel / kebab / pascal) | string-case helpers used everywhere |
+
+## Running the schematics
+
+```bash
+# Add a proxy for the identity module
+ng g @abp/ng.schematics:proxy-add identity AbpIdentity MyApp MyApp
+
+# Refresh every proxy in the workspace
+ng g @abp/ng.schematics:proxy-refresh
+
+# Create a new ABP-style library
+ng g @abp/ng.schematics:create-lib reporting
+
+# Switch from basic to LeptonX
+ng g @abp/ng.schematics:change-theme 2
+```
+
+Nx workspaces typically call the schematics through `@abp/nx.generators` — see `ng/generators.mdx`.
+
+## Gotchas
+
+* The schematics resolve `tsconfig` paths from `angular.json`. Custom workspaces (Bazel, vanilla npm) need a synthetic `angular.json` or the resolution fails.
+* `proxy-add` will *delete* manual edits inside the target proxy folder. The `mergeAndAllowDelete` step is opinionated — files outside the generated set survive, but anything matching the previous generation is overwritten.
+* `proxy-config.json` is the source of truth for `proxy-refresh`. Removing it forces you to re-run `proxy-add` for every module before `proxy-refresh` becomes meaningful again.
+* The API definition URL is `<apiUrl>/api/abp/api-definition`. If the backend requires authentication for the metadata endpoint, pass `--token` (the schematics will forward it as `Authorization: Bearer ...`).
+* `change-theme` only updates `angular.json` and `package.json`. Running `npm install` (or `yarn`/`pnpm`) afterwards is still required to pull in the new theme package.
+* The schematics pin `@angular-devkit/*` to `~16.0.0`. Workspaces on a different Angular major can still consume the generated *output*, but cannot run the schematics directly without compatibility shims.
+
+## Related pages
+
+* `ng/generators.mdx` — Nx wrappers that delegate to these schematics.
+* `ng/dev-app.mdx` — the playground used to exercise the generated proxies.
+* `ng/core.mdx` — `RestService` and `EnvironmentService.getApiUrl` consume `apiName` and the generated services.

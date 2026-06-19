@@ -1,0 +1,347 @@
+---
+title: "Options Pattern — Configure, PreConfigure & Monitor"
+sidebarTitle: "Options Pattern"
+description: "How ABP layers PreConfigure, Configure and IConfiguration binding on top of the standard .NET IOptions pattern, including snapshot vs monitor semantics."
+---
+
+ABP exposes every framework knob through the standard .NET options pattern
+(`IOptions<TOptions>`, `IOptionsSnapshot<TOptions>`, `IOptionsMonitor<TOptions>`),
+but it wraps that pattern with two module-friendly entry points:
+`Configure<TOptions>` and `PreConfigure<TOptions>`. The pair makes the
+module lifecycle two-phase: every depended-on module gets a chance to
+seed defaults in `PreConfigureServices` *before* the consuming module
+runs `ConfigureServices` and locks in user overrides. Understanding the
+ordering is what lets you reason about why `AbpAspNetCoreMultiTenancyModule`
+can append resolvers, why `AbpBackgroundJobsHangfireModule` can patch
+`AbpHangfireOptions.BackgroundJobServerFactory`, and why a host-level
+`Configure<TOptions>` call in your `*Module.cs` always wins.
+
+This page documents the contracts, the resolution order, the binding
+helpers, and the lifecycle gotchas that follow from ABP's options
+abstraction.
+
+## File inventory
+
+| Type | Location |
+| --- | --- |
+| `AbpModule.PreConfigure<TOptions>` / `Configure<TOptions>` | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs` |
+| `ServiceCollectionPreConfigureExtensions` | `framework/src/Volo.Abp.Core/Volo/Abp/Options/ServiceCollectionPreConfigureExtensions.cs` |
+| `PreConfigureActionList<TOptions>` | `framework/src/Volo.Abp.Core/Volo/Abp/Options/PreConfigureActionList.cs` |
+| `IPreConfigureServices` | `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/IPreConfigureServices.cs` |
+| `AbpOptionsFactory<TOptions>` | `framework/src/Volo.Abp.Core/Volo/Abp/Options/AbpOptionsFactory.cs` |
+| `AbpDynamicOptionsManager<TOptions>` | `framework/src/Volo.Abp.Core/Volo/Abp/Options/AbpDynamicOptionsManager.cs` |
+| `AbpApplicationCreationOptions` | `framework/src/Volo.Abp.Core/Volo/Abp/AbpApplicationCreationOptions.cs` |
+
+## How an option flows through startup
+
+```mermaid
+flowchart TD
+    A[Host calls AbpApplicationFactory.Create&lt;TModule&gt;] --> B[PreConfigureServices phase]
+    B -->|each module| C[module.PreConfigure&lt;TOptions&gt;(...)]
+    C --> D[PreConfigureActionList&lt;TOptions&gt; appended]
+    D --> E[ConfigureServices phase]
+    E -->|each module| F[module.Configure&lt;TOptions&gt;(...)]
+    F --> G[services.AddOptions&lt;TOptions&gt;()]
+    G --> H[IConfiguration binding via Configure&lt;TOptions&gt;(section)]
+    H --> I[IOptionsFactory.Create runs]
+    I --> J{Scope?}
+    J -->|Singleton| K[IOptions&lt;TOptions&gt;]
+    J -->|Scoped| L[IOptionsSnapshot&lt;TOptions&gt;]
+    J -->|Push updates| M[IOptionsMonitor&lt;TOptions&gt;]
+```
+
+`PreConfigureActionList<TOptions>` is created as a singleton accessor
+the first time any module calls `services.PreConfigure<TOptions>(...)`.
+The list is consumed by *the next* module that calls
+`services.ExecutePreConfiguredActions<TOptions>()` — typically a module
+running in `ConfigureServices` that needs to know what its consumers
+have already requested.
+
+## The two AbpModule hooks
+
+```csharp
+// framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs
+protected void PreConfigure<TOptions>(Action<TOptions> configureOptions)
+    where TOptions : class
+{
+    ServiceConfigurationContext.Services.PreConfigure(configureOptions);
+}
+
+protected void Configure<TOptions>(Action<TOptions> configureOptions)
+    where TOptions : class
+{
+    ServiceConfigurationContext.Services.Configure(configureOptions);
+}
+
+protected void Configure<TOptions>(IConfiguration configuration)
+    where TOptions : class
+{
+    ServiceConfigurationContext.Services.Configure<TOptions>(configuration);
+}
+```
+
+`PreConfigure<TOptions>` does **not** call
+`services.AddOptions().Configure(...)` — that would land it in the
+ordinary post-configure pipeline. It writes to
+`PreConfigureActionList<TOptions>` only, which is a separate
+collaboration channel between modules. To read those actions back,
+consumers call:
+
+```csharp
+var defaults = context.Services.ExecutePreConfiguredActions<MyModuleOptions>();
+```
+
+This returns a `MyModuleOptions` instance produced by replaying every
+`PreConfigure<MyModuleOptions>(...)` call. ABP's authentication module
+uses this pattern to discover token validators that downstream modules
+have requested.
+
+## Module lifecycle order
+
+ABP's module manager invokes hooks in this fixed order per module graph:
+
+1. `PreConfigureServicesAsync` / `PreConfigureServices` (depth-first
+   over the module dependency graph)
+2. `ConfigureServicesAsync` / `ConfigureServices`
+3. `PostConfigureServicesAsync` / `PostConfigureServices`
+4. `OnPreApplicationInitializationAsync` / `OnPreApplicationInitialization`
+5. `OnApplicationInitializationAsync` / `OnApplicationInitialization`
+6. `OnPostApplicationInitializationAsync` / `OnPostApplicationInitialization`
+7. (on dispose) `OnApplicationShutdown`
+
+Inside a single phase, **dependees run before dependents**. That means a
+module decorated with `[DependsOn(typeof(AbpDataModule))]` will see
+`AbpDataModule.PreConfigureServices` already executed by the time its
+own `PreConfigureServices` runs. The implication: defaults seeded by
+the framework are visible to your application module *during*
+`PreConfigureServices`.
+
+## Binding to appsettings.json
+
+The canonical pattern inside an ABP module is:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    var configuration = context.Services.GetConfiguration();
+
+    Configure<AbpRabbitMqOptions>(options =>
+    {
+        options.Connections.Default.UserName = configuration["RabbitMQ:UserName"];
+        options.Connections.Default.Password = configuration["RabbitMQ:Password"];
+    });
+
+    // or, bind a whole section:
+    Configure<AbpDistributedCacheOptions>(configuration.GetSection("DistributedCache"));
+}
+```
+
+`context.Services.GetConfiguration()` is the extension that walks back
+to the `IConfiguration` instance the host added to the service
+collection (every ABP host registers `IConfiguration` as a singleton
+during `Host.CreateDefaultBuilder`).
+
+## IOptions vs IOptionsSnapshot vs IOptionsMonitor
+
+| Interface | Lifetime | Use when |
+| --- | --- | --- |
+| `IOptions<TOptions>` | Singleton — value built once | Module-level configuration that never changes (e.g. `AbpAuditingOptions.HideErrors`, `AbpBlobStoringOptions.Containers`). |
+| `IOptionsSnapshot<TOptions>` | Scoped — re-evaluated per request | Per-request settings sensitive to `appsettings.{Environment}.json` reloads or per-tenant overrides (`AbpDbConnectionOptions` for tenant DB routing). |
+| `IOptionsMonitor<TOptions>` | Singleton with change tokens | Background workers and long-lived services that need to react to live config reloads via `OnChange(callback)`. |
+
+ABP's `DefaultConnectionStringResolver` uses
+`IOptionsMonitor<AbpDbConnectionOptions>` precisely because connection
+strings can be reloaded at runtime when configuration changes.
+
+## AbpOptionsFactory and dynamic options
+
+`AbpOptionsFactory<TOptions>` replaces the built-in
+`OptionsFactory<TOptions>` for any options type that needs cross-cutting
+behaviour (auditing, multi-tenancy). It is the hook that lets
+`AbpDynamicOptionsManager<TOptions>` materialise tenant-specific values
+on top of the static configuration. If you do not register
+`AddAbpDynamicOptions<TOptions, TManager>()` you get vanilla
+`IOptionsSnapshot` semantics — i.e. static per scope.
+
+## AbpApplicationCreationOptions
+
+The very earliest hook is `AbpApplicationCreationOptions`, the lambda
+you pass to `AddApplication<TModule>(options => ...)`. It runs *before*
+any module's `PreConfigureServices`:
+
+```csharp
+builder.Services.AddApplication<MyHostModule>(options =>
+{
+    options.PlugInSources.AddFolder(Path.Combine(env.ContentRootPath, "plugins"));
+    options.Configuration.UserSecretsAssembly = typeof(Program).Assembly;
+});
+```
+
+You use it to register plug-in sources, to swap the `IConfiguration`
+builder, or to disable the default modularity bootstrap.
+
+## Override resolution order
+
+When the same option is touched in multiple places, the last writer
+wins because `IOptionsFactory` applies actions in registration order:
+
+```mermaid
+sequenceDiagram
+    participant Framework as Framework module
+    participant App as Application module
+    participant Host as Host module
+    Framework->>Framework: PreConfigure&lt;T&gt;(defaults)
+    App->>App: Configure&lt;T&gt;(override A)
+    Host->>Host: Configure&lt;T&gt;(IConfiguration section)
+    Host->>Host: Configure&lt;T&gt;(override B)
+    Note over Host: Resolution order applied at IOptions build time:<br/>defaults &rarr; override A &rarr; bound section &rarr; override B
+```
+
+So if your application module sets
+`options.IsEnabled = false` but the host module binds a section that
+contains `"IsEnabled": true`, the host wins. To enforce a value you
+have to use `PostConfigure<T>(...)` or call `Configure<T>(...)` after
+the binding step.
+
+## Pre-configure pattern in practice
+
+The `AbpBackgroundJobsHangfireModule` pre-configures the Hangfire
+options based on the resolved `AbpBackgroundJobOptions.IsJobExecutionEnabled`
+flag in `OnPreApplicationInitialization`:
+
+```csharp
+// framework/src/Volo.Abp.BackgroundJobs.HangFire/.../AbpBackgroundJobsHangfireModule.cs
+public override void OnPreApplicationInitialization(ApplicationInitializationContext context)
+{
+    var options = context.ServiceProvider
+        .GetRequiredService<IOptions<AbpBackgroundJobOptions>>().Value;
+    if (!options.IsJobExecutionEnabled)
+    {
+        var hangfireOptions = context.ServiceProvider
+            .GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+        hangfireOptions.BackgroundJobServerFactory = CreateOnlyEnqueueJobServer;
+    }
+}
+```
+
+The pattern is: read a *consumer* option, then mutate a *producer*
+option that has not yet been finalised by the time the application
+container materialises Hangfire's background job server.
+
+## Common gotchas
+
+- `Configure<TOptions>(configuration.GetSection("X"))` binds *names*
+  case-insensitively but does not validate unknown keys. Misspelt
+  section names silently produce default-valued options.
+- `IOptions<TOptions>` is a singleton; injecting it into a multi-tenant
+  service means you see the *host-level* configuration, not the
+  current tenant's overrides. Use `IOptionsSnapshot<TOptions>` if you
+  rely on `AbpDynamicOptionsManager`.
+- `PreConfigure<TOptions>(...)` does not run when the consumer never
+  calls `ExecutePreConfiguredActions<TOptions>()`. It is opt-in on
+  both sides.
+- Calling `Configure<TOptions>(...)` twice with the same lambda is
+  cumulative, not replacing. Both lambdas fire on every options build.
+- `OptionsBuilder<TOptions>.ValidateOnStart()` is supported but ABP
+  modules rarely use it; prefer explicit checks in `OnApplicationInitialization`.
+
+## Reading options from singletons
+
+If you depend on `IOptions<T>` from a singleton, you get the value
+built at startup. If you depend on `IOptionsMonitor<T>` you can
+subscribe to changes:
+
+```csharp
+public class CacheKeyPrefixWatcher : ISingletonDependency, IDisposable
+{
+    private readonly IDisposable _subscription;
+    private string _prefix;
+
+    public CacheKeyPrefixWatcher(IOptionsMonitor<AbpDistributedCacheOptions> monitor)
+    {
+        _prefix = monitor.CurrentValue.KeyPrefix ?? string.Empty;
+        _subscription = monitor.OnChange(updated =>
+        {
+            _prefix = updated.KeyPrefix ?? string.Empty;
+        });
+    }
+
+    public void Dispose() => _subscription?.Dispose();
+}
+```
+
+`IOptionsMonitor<T>.OnChange` fires when any registered
+`IOptionsChangeTokenSource<T>` raises a token — including the binder
+that wraps `IConfigurationSection.GetReloadToken()`. So updating
+`appsettings.json` at runtime propagates to monitored options without
+a restart, *provided* the configuration provider supports reloading
+(`AddJsonFile(..., reloadOnChange: true)` does; environment variables
+do not).
+
+## Worked example: ABP module customising another module's options
+
+```csharp
+public class MyAuditOverridesModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        // Bind from JSON
+        Configure<AbpAuditingOptions>(configuration.GetSection("Auditing"));
+
+        // Then strengthen defaults
+        Configure<AbpAuditingOptions>(options =>
+        {
+            options.IsEnabled = true;
+            options.HideErrors = false;
+            options.IsEnabledForAnonymousUsers = false;
+            options.AlwaysLogOnException = true;
+        });
+
+        // Always-on enforcement regardless of JSON
+        PostConfigure<AbpAuditingOptions>(options =>
+        {
+            options.AlwaysLogOnException = true;
+        });
+    }
+}
+```
+
+The `PostConfigure<T>` action runs after the JSON binding and after
+every `Configure<T>` lambda in any module, so `AlwaysLogOnException`
+is guaranteed to be `true` even if downstream modules try to flip it
+off.
+
+## When PreConfigure is the only safe choice
+
+Some options must be available *during another module's*
+`ConfigureServices` because that module branches on them — for
+example, a logger module that decides whether to add console
+formatters based on host configuration. `Configure<T>` actions are
+not executed until the container is built, so reading
+`IOptions<T>.Value` at `ConfigureServices` time would not see them.
+Use `PreConfigure<T>` plus `ExecutePreConfiguredActions<T>` to expose
+the values eagerly:
+
+```mermaid
+sequenceDiagram
+    participant Lib as Library module (PreConfigureServices)
+    participant App as Consumer module (ConfigureServices)
+    Lib->>Lib: PreConfigure&lt;LoggerOptions&gt;(options =&gt; options.MinimumLevel = "Information")
+    App->>App: var defaults = services.ExecutePreConfiguredActions&lt;LoggerOptions&gt;()
+    App->>App: if (defaults.MinimumLevel == "Information") services.AddSerilogConsole()
+```
+
+## Cross-references
+
+- [appsettings.json layout](/reference/config/appsettings) — the file
+  that feeds `IConfiguration` into every `Configure<TOptions>` call.
+- [Module options & override order](/reference/config/module-options) —
+  catalogue of every `Abp<Module>Options` class.
+- [Application startup flow](/flows/application-startup) — the broader
+  module pipeline this options pattern plugs into.
+- [Dependency injection](/flows/dependency-injection) — how ABP wires
+  `IOptionsFactory` replacements per options type.
+- [Connection strings](/reference/config/connection-strings) — a
+  concrete example of `IOptionsMonitor` consumption.

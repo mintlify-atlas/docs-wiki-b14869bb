@@ -1,0 +1,143 @@
+---
+title: "Application.Contracts Project"
+description: "DTOs, application service interfaces, and permission definitions — the public contract shared between the host API and every typed client (Blazor WebAssembly, MAUI, NuGet)."
+---
+
+`MyCompanyName.MyProjectName.Application.Contracts` defines **what** the server-side application can do, expressed only in interfaces and data-transfer objects. It contains no business logic. Everything in here is intended to be referenced by clients — including Blazor WebAssembly, so the project multi-targets `netstandard2.0`, `netstandard2.1` and `net7.0`.
+
+Once you publish a NuGet package from this project, third-party consumers can call your APIs through ABP's [Dynamic C# HTTP Client Proxies](https://docs.abp.io/en/abp/latest/API/Dynamic-CSharp-API-Clients) without sharing source.
+
+## When to put code here
+
+Add a file to `Application.Contracts` when it is:
+
+- An **application service interface** (`IBookAppService : IApplicationService`).
+- A **DTO** (`BookDto`, `CreateUpdateBookDto`).
+- A **permission constant** or `PermissionDefinitionProvider`.
+- A **DTO extension registration** (extra properties on a module DTO).
+
+Keep aggregates, repository interfaces, domain services and EF Core mappings *out* of this project — those belong to `Domain` and the database-specific projects.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.Application.Contracts/
+├── Permissions/
+│   ├── MyProjectNamePermissionDefinitionProvider.cs
+│   └── MyProjectNamePermissions.cs
+├── MyCompanyName.MyProjectName.Application.Contracts.csproj
+├── MyProjectNameApplicationContractsModule.cs
+└── MyProjectNameDtoExtensions.cs
+```
+
+## csproj at a glance
+
+| Property            | Value                                              |
+| ------------------- | -------------------------------------------------- |
+| `TargetFrameworks`  | `netstandard2.0;netstandard2.1;net7.0`             |
+| `Nullable`          | `enable`                                           |
+| `RootNamespace`     | `MyCompanyName.MyProjectName`                      |
+
+| Project reference                                                              | Purpose                                          |
+| ------------------------------------------------------------------------------ | ------------------------------------------------ |
+| `MyCompanyName.MyProjectName.Domain.Shared`                                    | Localization resource, multi-tenancy constants    |
+| `Volo.Abp.ObjectExtending`                                                     | DTO extension property API                       |
+| `Volo.Abp.Account.Application.Contracts`                                       | `IAccountAppService`, `RegisterDto`, etc.        |
+| `Volo.Abp.Identity.Application.Contracts`                                      | `IIdentityUserAppService`, `IdentityUserDto`     |
+| `Volo.Abp.PermissionManagement.Application.Contracts`                          | `IPermissionAppService`, `PermissionGrantInfoDto` |
+| `Volo.Abp.TenantManagement.Application.Contracts`                              | `ITenantAppService`, `TenantDto`                 |
+| `Volo.Abp.FeatureManagement.Application.Contracts`                             | `IFeatureAppService`                             |
+| `Volo.Abp.SettingManagement.Application.Contracts`                             | `ISettingAppService`                             |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameDomainSharedModule),
+    typeof(AbpAccountApplicationContractsModule),
+    typeof(AbpFeatureManagementApplicationContractsModule),
+    typeof(AbpIdentityApplicationContractsModule),
+    typeof(AbpPermissionManagementApplicationContractsModule),
+    typeof(AbpSettingManagementApplicationContractsModule),
+    typeof(AbpTenantManagementApplicationContractsModule),
+    typeof(AbpObjectExtendingModule))]
+public class MyProjectNameApplicationContractsModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        MyProjectNameDtoExtensions.Configure();
+    }
+}
+```
+
+`PreConfigureServices` is used so DTO extension properties are registered **before** any consumer module sees the DTO types — the `AbpObjectExtendingModule` reads the registrations during its own configuration.
+
+## Key types
+
+### MyProjectNameDtoExtensions
+
+Static class with a `OneTimeRunner` guard, identical pattern to the module-extension configurator in `Domain.Shared`. Use it to add fields onto DTOs declared by depended modules without sub-classing them:
+
+```csharp
+ObjectExtensionManager.Instance
+    .AddOrUpdateProperty<IdentityRoleDto, string>("Title");
+```
+
+After this call any HTTP client (and the framework's auto-generated proxies) sees `Title` as a first-class property on `IdentityRoleDto`.
+
+### MyProjectNamePermissions
+
+```csharp
+public static class MyProjectNamePermissions
+{
+    public const string GroupName = "MyProjectName";
+    //public const string MyPermission1 = GroupName + ".MyPermission1";
+}
+```
+
+Plain constant container. The `GroupName` matches the namespace used by `MyProjectNamePermissionDefinitionProvider` so groupings stay aligned across the codebase.
+
+### MyProjectNamePermissionDefinitionProvider
+
+Registers the permission group with localization wired to `MyProjectNameResource`:
+
+```csharp
+public override void Define(IPermissionDefinitionContext context)
+{
+    var myGroup = context.AddGroup(MyProjectNamePermissions.GroupName);
+    //myGroup.AddPermission(MyProjectNamePermissions.MyPermission1, L("Permission:MyPermission1"));
+}
+
+private static LocalizableString L(string name)
+    => LocalizableString.Create<MyProjectNameResource>(name);
+```
+
+Add new permissions and consume them on application services via the `[Authorize(MyProjectNamePermissions.MyPermission1)]` attribute (or the `ICurrentUser.IsGrantedAsync` check).
+
+## How to add a new application service contract
+
+1. Create `Books/IBookAppService.cs`:
+    ```csharp
+    public interface IBookAppService : ICrudAppService<BookDto, Guid, PagedAndSortedResultRequestDto, CreateUpdateBookDto> { }
+    ```
+2. Add the matching DTOs (`BookDto`, `CreateUpdateBookDto`) under the same folder.
+3. Add a permission constant in `MyProjectNamePermissions` and register it in the provider.
+4. Build — the HTTP API host's `ConventionalControllers.Create(typeof(MyProjectNameApplicationModule).Assembly)` call will expose the interface as a controller automatically, and `MyProjectNameHttpApiClientModule.AddHttpClientProxies(typeof(MyProjectNameApplicationContractsModule).Assembly, ...)` will surface it as a client proxy.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| New DTO                               | New `.cs` file under a feature folder                            |
+| New application service interface     | `IBookAppService : IApplicationService` (or `ICrudAppService<>`) |
+| New permission                        | `MyProjectNamePermissions` + provider `myGroup.AddPermission(...)` |
+| Add property to a module DTO          | `MyProjectNameDtoExtensions.Configure()`                         |
+| Hide a permission for non-multi-tenant scenarios | Use `multiTenancySide: MultiTenancySides.Host` overload on `AddPermission` |
+
+## Gotchas
+
+- **Multi-targeting matters.** The Blazor WebAssembly project transitively references this assembly through `HttpApi.Client`. If you reference an EF Core or AutoMapper package here the wasm publish step will fail with `NETSDK1080: A PackageReference for 'Microsoft.EntityFrameworkCore' was included...`.
+- **`PreConfigureServices` ordering.** DTO extension properties are stored in a process-wide `ObjectExtensionManager`. Calling `Configure()` from `ConfigureServices` (instead of `PreConfigureServices`) works for the host but breaks the C# client proxies because they read the registrations earlier in the pipeline.
+- **Permissions must localize.** Always pass `L("Permission:MyPermission1")` not `"MyPermission1"` to `AddPermission`. The string is shown on the **Permission Management** dialog; raw constants leak technical names into the UI.
+- **Don't reference `MyProjectNameApplicationModule`.** That would create a cyclic dependency: `Application -> Application.Contracts -> Application`. Contracts must remain a leaf project.
+- **`GroupName` must be unique.** Conflict with another module's `PermissionGroupDefinition` makes ABP throw at startup with `AbpException: Already exists a permission group: ...`.

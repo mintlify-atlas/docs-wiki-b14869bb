@@ -1,0 +1,302 @@
+---
+title: "Connection Strings & Tenant Database Routing Reference"
+sidebarTitle: "Connection Strings"
+description: "Configure ABP ConnectionStrings, per-module overrides, IConnectionStringResolver and multi-tenant database routing through AbpDbConnectionOptions."
+---
+
+ABP's data layer reads connection strings through a single
+`AbpDbConnectionOptions` instance that exposes the standard ASP.NET
+Core `ConnectionStrings` dictionary, augmented with two extra
+resolution layers: a *module-name* lookup (so that
+`ConnectionStrings:AbpAuditLogging` routes audit data away from the
+default database) and a *tenant-aware* lookup (so that a tenant can
+override any connection string at runtime). This page documents the
+binding, the resolution algorithm, the canonical module names, and the
+multi-tenancy hooks that drive per-tenant database routing.
+
+## File inventory
+
+| Type | Location |
+| --- | --- |
+| `AbpDbConnectionOptions` | `framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDbConnectionOptions.cs` |
+| `ConnectionStrings` | `framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStrings.cs` |
+| `ConnectionStringNameAttribute` | `framework/src/Volo.Abp.Data/Volo/Abp/Data/ConnectionStringNameAttribute.cs` |
+| `IConnectionStringResolver` | `framework/src/Volo.Abp.Data/Volo/Abp/Data/IConnectionStringResolver.cs` |
+| `DefaultConnectionStringResolver` | `framework/src/Volo.Abp.Data/Volo/Abp/Data/DefaultConnectionStringResolver.cs` |
+| `MultiTenantConnectionStringResolver` | `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/MultiTenantConnectionStringResolver.cs` |
+| `TenantConfiguration` | `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantConfiguration.cs` |
+| `AbpDatabaseInfoDictionary` | `framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDatabaseInfoDictionary.cs` |
+
+## Configuration shape
+
+`AbpDbConnectionOptions` exposes two collections:
+
+```csharp
+public class AbpDbConnectionOptions
+{
+    public ConnectionStrings ConnectionStrings { get; set; }   // string -> string
+    public AbpDatabaseInfoDictionary Databases { get; set; }   // database -> module mapping
+}
+```
+
+`ConnectionStrings` derives from `Dictionary<string, string?>` and
+defines one well-known key:
+
+```csharp
+public class ConnectionStrings : Dictionary<string, string?>
+{
+    public const string DefaultConnectionStringName = "Default";
+
+    public string? Default
+    {
+        get => this.GetOrDefault(DefaultConnectionStringName);
+        set => this[DefaultConnectionStringName] = value;
+    }
+}
+```
+
+The binding happens automatically because every ABP host module wires:
+
+```csharp
+Configure<AbpDbConnectionOptions>(configuration);
+```
+
+which pulls the `ConnectionStrings` section out of `appsettings.json`
+verbatim.
+
+## Resolution algorithm
+
+The single entry point is
+`IConnectionStringResolver.ResolveAsync(connectionStringName)`. The
+default implementation, `DefaultConnectionStringResolver`, calls
+`AbpDbConnectionOptions.GetConnectionStringOrNull(name)` which walks
+the chain below:
+
+```mermaid
+flowchart TD
+    A[ResolveAsync(name)] --> B[ConnectionStrings.GetOrDefault(name)]
+    B --> C{Hit?}
+    C -->|yes| Z[Return]
+    C -->|no| D{fallbackToDatabaseMappings?}
+    D -->|yes| E[Databases.GetMappedDatabaseOrNull(name)]
+    E --> F{Mapping exists?}
+    F -->|yes| G[ConnectionStrings.GetOrDefault(database.DatabaseName)]
+    G --> H{Hit?}
+    H -->|yes| Z
+    F -->|no| I{fallbackToDefault?}
+    H -->|no| I
+    I -->|yes| J[ConnectionStrings.Default]
+    J --> Z
+    I -->|no| K[Return null]
+```
+
+`name` is the `[ConnectionStringName("...")]` attribute value on the
+DbContext (or the FQN of the DbContext type if the attribute is
+absent). When multi-tenancy is enabled, `MultiTenantConnectionStringResolver`
+wraps `DefaultConnectionStringResolver` and consults
+`ICurrentTenant.Tenant.ConnectionStrings` first.
+
+## ConnectionStrings section keys
+
+The reserved `Default` key is the fallback for every module. Every
+other key is a *module-specific* override identified by the module's
+`ConnectionStringName` constant:
+
+| Module | ConnectionStringName | Defined in |
+| --- | --- | --- |
+| Audit Logging | `AbpAuditLogging` | `modules/audit-logging/src/Volo.Abp.AuditLogging.Domain/Volo/Abp/AuditLogging/AbpAuditLoggingDbProperties.cs` |
+| Background Jobs | `AbpBackgroundJobs` | `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/AbpBackgroundJobsDbProperties.cs` |
+| Identity | `AbpIdentity` | `modules/identity/.../AbpIdentityDbProperties.cs` |
+| Tenant Management | `AbpTenantManagement` | `modules/tenant-management/.../AbpTenantManagementDbProperties.cs` |
+| Setting Management | `AbpSettingManagement` | `modules/setting-management/.../AbpSettingManagementDbProperties.cs` |
+| Permission Management | `AbpPermissionManagement` | `modules/permission-management/.../AbpPermissionManagementDbProperties.cs` |
+| Feature Management | `AbpFeatureManagement` | `modules/feature-management/.../AbpFeatureManagementDbProperties.cs` |
+
+The framework reads these constants via the
+`[ConnectionStringName(AbpXxxDbProperties.ConnectionStringName)]`
+attribute placed on each module's DbContext.
+
+## Sample appsettings.json
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "Server=.;Database=MyApp;Trusted_Connection=True;TrustServerCertificate=True",
+    "AbpAuditLogging": "Server=.;Database=MyApp_AuditLogs;Trusted_Connection=True",
+    "AbpBackgroundJobs": "Server=.;Database=MyApp_Jobs;Trusted_Connection=True",
+    "AbpIdentity": "Server=.;Database=MyApp_Identity;Trusted_Connection=True"
+  }
+}
+```
+
+Environment-variable form (Linux):
+
+```bash
+ConnectionStrings__Default="Server=db;Database=MyApp;User Id=sa;Password=..."
+ConnectionStrings__AbpAuditLogging="Server=audit;Database=MyApp_AuditLogs;..."
+```
+
+## Routing whole DbContexts
+
+`AbpDbConnectionOptions.Databases` is a secondary index that maps one
+*physical database* to many *module connection-string names*. Use it
+when several modules share a database that is different from `Default`:
+
+```csharp
+Configure<AbpDbConnectionOptions>(options =>
+{
+    options.Databases.Configure("OperationalDb", database =>
+    {
+        database.MappedConnections.Add("AbpAuditLogging");
+        database.MappedConnections.Add("AbpBackgroundJobs");
+    });
+});
+```
+
+Now `ResolveAsync("AbpAuditLogging")` returns
+`ConnectionStrings["OperationalDb"]` when there is no explicit
+`ConnectionStrings:AbpAuditLogging` entry. This is what
+`fallbackToDatabaseMappings=true` enables in
+`GetConnectionStringOrNull`.
+
+## How modules consume the resolver
+
+```csharp
+public class MyDbContextFactory
+{
+    private readonly IConnectionStringResolver _resolver;
+
+    public MyDbContextFactory(IConnectionStringResolver resolver)
+    {
+        _resolver = resolver;
+    }
+
+    public async Task<MyDbContext> CreateAsync()
+    {
+        var connectionString = await _resolver.ResolveAsync<MyDbContext>();
+        return new MyDbContext(new DbContextOptionsBuilder<MyDbContext>()
+            .UseSqlServer(connectionString)
+            .Options);
+    }
+}
+```
+
+`ResolveAsync<TDbContext>()` is the generic extension that reads the
+DbContext's `[ConnectionStringName]` attribute via
+`ConnectionStringNameAttribute.GetConnStringName(typeof(TDbContext))`,
+defaulting to the FQN when the attribute is absent.
+
+## Multi-tenant database routing
+
+When `AbpMultiTenancyOptions.IsEnabled=true`, ABP registers
+`MultiTenantConnectionStringResolver` as the
+`IConnectionStringResolver`. It first checks
+`ICurrentTenant.Tenant.ConnectionStrings`, which is the dictionary on
+`TenantConfiguration`:
+
+```csharp
+[Serializable]
+public class TenantConfiguration
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = default!;
+    public ConnectionStrings? ConnectionStrings { get; set; }
+    public bool IsActive { get; set; }
+}
+```
+
+So a tenant whose configuration carries:
+
+```json
+{
+  "Id": "33333333-3333-3333-3333-333333333333",
+  "Name": "acme",
+  "ConnectionStrings": {
+    "Default": "Server=db-acme;Database=Acme;...",
+    "AbpAuditLogging": "Server=audit;Database=Acme_Audit;..."
+  }
+}
+```
+
+is routed to a dedicated database — even though the host's
+`appsettings.json` only configures the shared `Default` key. The
+resolution chain becomes:
+
+```mermaid
+flowchart TD
+    A[ResolveAsync(name)] --> B{Current tenant?}
+    B -->|yes| C[Tenant.ConnectionStrings.GetOrDefault(name)]
+    C --> D{Hit?}
+    D -->|yes| Z[Return]
+    D -->|no| E[Tenant.ConnectionStrings.Default]
+    E --> F{Hit?}
+    F -->|yes| Z
+    F -->|no| G[Host AbpDbConnectionOptions resolution]
+    B -->|no| G
+    G --> Z
+```
+
+This is the implementation of the **hybrid / per-tenant** database
+strategy controlled by `AbpMultiTenancyOptions.DatabaseStyle`.
+
+## Default tenant store appsettings shape
+
+`AbpDefaultTenantStoreOptions` reads tenant configurations directly
+from `appsettings.json` when you do not use the Tenant Management
+module:
+
+```json
+{
+  "Tenants": [
+    {
+      "Id": "33333333-3333-3333-3333-333333333333",
+      "Name": "acme",
+      "ConnectionStrings": {
+        "Default": "Server=db-acme;Database=Acme;..."
+      }
+    }
+  ]
+}
+```
+
+See [Multi-tenancy configuration](/reference/config/multi-tenancy-config)
+for the rest of the tenant store schema.
+
+## Gotchas
+
+- `ConnectionStrings.Default` is `null` by default. If you never set
+  it and never set a module-specific override, every `ResolveAsync(...)`
+  call returns `null` and the DbContext factory throws.
+- `IConnectionStringResolver` is registered as **transient** but
+  `DefaultConnectionStringResolver` caches
+  `IOptionsMonitor<AbpDbConnectionOptions>.CurrentValue` *once* in its
+  constructor. Live `appsettings.json` changes therefore require a new
+  resolver instance — which you get on every DbContext creation
+  because of the transient lifetime.
+- Setting `ConnectionStrings:Default` to an empty string is treated as
+  *no value*; the resolver uses `IsNullOrEmpty` everywhere.
+- `ConnectionStrings` is a case-insensitive dictionary in .NET
+  configuration but a case-sensitive `Dictionary<string, string?>` in
+  memory. Keys are normalised by the configuration provider, so
+  `connectionstrings:default` in `appsettings.json` is fine, but
+  manual `options.ConnectionStrings["DEFAULT"]` mutations from code
+  will not collide with `Default`.
+- The `Databases` mapping does **not** create a new connection — it
+  only redirects the lookup to a different *key* inside
+  `ConnectionStrings`. You still have to populate that key.
+- Tenant connection strings are loaded by the tenant store, which
+  caches results in `IDistributedCache`. Changing a tenant's
+  connection string at runtime requires invalidating the cache entry
+  for that tenant or restarting the application.
+
+## Cross-references
+
+- [Options pattern](/reference/config/options-pattern) for the
+  `IOptionsMonitor<AbpDbConnectionOptions>` lifetime semantics.
+- [Multi-tenancy configuration](/reference/config/multi-tenancy-config)
+  for `AbpDefaultTenantStoreOptions` and `DatabaseStyle`.
+- [appsettings.json layout](/reference/config/appsettings).
+- [Authentication configuration](/reference/config/auth-config) — the
+  OpenIddict / AuthServer modules also resolve connection strings via
+  this pipeline.
+- [Module options catalogue](/reference/config/module-options).

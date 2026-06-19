@@ -1,0 +1,270 @@
+---
+title: "HttpApi.Host Project"
+description: "Standalone ASP.NET Core host that exposes the application's HTTP API to a separate authorization server (split AuthServer scenario)."
+---
+
+`MyCompanyName.MyProjectName.HttpApi.Host` is the **API-only host** that the *separated AuthServer* template flavour ships with. It runs on its own URL (default `https://localhost:44300`), serves `/api/...` endpoints, and validates JWT access tokens issued by the AuthServer project.
+
+Use this host when you generated your solution with the `--separate-auth-server` switch (Angular/MAUI flavours, or any tiered MVC/Blazor deployment that wants a dedicated authentication issuer). For the alternative all-in-one scenario where the host **is** the authorization server, see [HttpApi.HostWithIds](/templates/aspnetcore/httpapi-host-with-ids).
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.HttpApi.Host/
+├── Controllers/
+│   └── ...
+├── Properties/
+│   └── launchSettings.json
+├── MyCompanyName.MyProjectName.HttpApi.Host.csproj
+├── MyProjectNameHttpApiHostModule.cs
+├── Program.cs
+├── appsettings.Development.json
+├── appsettings.json
+└── web.config
+```
+
+## csproj at a glance
+
+| Property                        | Value                                              |
+| ------------------------------- | -------------------------------------------------- |
+| `Sdk`                           | `Microsoft.NET.Sdk.Web`                            |
+| `TargetFramework`               | `net7.0`                                           |
+| `PreserveCompilationReferences` | `true`                                             |
+| `UserSecretsId`                 | `MyCompanyName.MyProjectName-4681b4fd-...`         |
+
+| Package reference                                                | Version  | Purpose                                  |
+| ---------------------------------------------------------------- | -------- | ---------------------------------------- |
+| `Serilog.AspNetCore`                                             | `5.0.0`  | Structured logging                       |
+| `Serilog.Sinks.Async`                                            | `1.5.0`  | Async file/console sinks                  |
+| `Microsoft.AspNetCore.Authentication.JwtBearer`                  | `7.0.10` | JWT validation                            |
+| `Microsoft.AspNetCore.DataProtection.StackExchangeRedis`         | `7.0.10` | Shared data-protection keyring            |
+| `DistributedLock.Redis`                                          | `1.0.2`  | `IDistributedLockProvider`                |
+
+| Project reference                                                                 | Purpose                                    |
+| --------------------------------------------------------------------------------- | ------------------------------------------ |
+| `Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy`                                         | Tenant-resolving middleware                |
+| `Volo.Abp.Autofac`                                                                | Property-injection DI                      |
+| `Volo.Abp.Caching.StackExchangeRedis`                                             | Distributed cache                          |
+| `Volo.Abp.DistributedLocking`                                                     | Distributed lock provider                  |
+| `Volo.Abp.AspNetCore.Serilog`                                                     | HTTP context enrichers                     |
+| `Volo.Abp.Swashbuckle`                                                            | Swagger UI integration                     |
+| `MyCompanyName.MyProjectName.Application`                                         | Business logic                             |
+| `MyCompanyName.MyProjectName.EntityFrameworkCore`                                 | Persistence                                |
+| `MyCompanyName.MyProjectName.HttpApi`                                             | Manual controllers + base                  |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameHttpApiModule),
+    typeof(AbpAutofacModule),
+    typeof(AbpCachingStackExchangeRedisModule),
+    typeof(AbpDistributedLockingModule),
+    typeof(AbpAspNetCoreMvcUiMultiTenancyModule),
+    typeof(MyProjectNameApplicationModule),
+    typeof(MyProjectNameEntityFrameworkCoreModule),
+    typeof(AbpAspNetCoreSerilogModule),
+    typeof(AbpSwashbuckleModule))]
+public class MyProjectNameHttpApiHostModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        var hostingEnvironment = context.Services.GetHostingEnvironment();
+
+        ConfigureConventionalControllers();
+        ConfigureAuthentication(context, configuration);
+        ConfigureCache(configuration);
+        ConfigureVirtualFileSystem(context);
+        ConfigureDataProtection(context, configuration, hostingEnvironment);
+        ConfigureDistributedLocking(context, configuration);
+        ConfigureCors(context, configuration);
+        ConfigureSwaggerServices(context, configuration);
+    }
+    // ...
+}
+```
+
+### Authentication
+
+```csharp
+context.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.Authority = configuration["AuthServer:Authority"];
+        options.RequireHttpsMetadata = Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+        options.Audience = "MyProjectName";
+    });
+```
+
+The host **only validates** tokens; it never issues them. The matching `"MyProjectName"` audience must be present in the access tokens minted by the AuthServer (the scope is seeded by `OpenIddictDataSeedContributor` in the `Domain` project).
+
+### Conventional controllers
+
+```csharp
+Configure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ConventionalControllers.Create(typeof(MyProjectNameApplicationModule).Assembly);
+});
+```
+
+This single call converts every `IApplicationService` in `Application.dll` into an HTTP endpoint — no manual controller required.
+
+### CORS
+
+```csharp
+context.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(builder =>
+    {
+        builder
+            .WithOrigins(configuration["App:CorsOrigins"]?
+                .Split(",", StringSplitOptions.RemoveEmptyEntries)
+                .Select(o => o.RemovePostFix("/"))
+                .ToArray() ?? Array.Empty<string>())
+            .WithAbpExposedHeaders()
+            .SetIsOriginAllowedToAllowWildcardSubdomains()
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials();
+    });
+});
+```
+
+`App:CorsOrigins` is a **comma-separated** list from `appsettings.json`. The host accepts wildcards (`https://*.MyProjectName.com`) and strips trailing slashes. `WithAbpExposedHeaders()` exposes `X-Correlation-ID`, `Abp-Tenant-Id`, and the localization headers so browser clients can read them.
+
+### Data protection
+
+```csharp
+var dataProtectionBuilder = context.Services.AddDataProtection().SetApplicationName("MyProjectName");
+if (!hostingEnvironment.IsDevelopment())
+{
+    var redis = ConnectionMultiplexer.Connect(configuration["Redis:Configuration"]!);
+    dataProtectionBuilder.PersistKeysToStackExchangeRedis(redis, "MyProjectName-Protection-Keys");
+}
+```
+
+In development the keyring lives on disk under `%LOCALAPPDATA%`. In production keys must be persisted to Redis so that **all replicas** of the API host can decrypt antiforgery tokens and authentication cookies issued by other replicas.
+
+### Distributed locking
+
+```csharp
+context.Services.AddSingleton<IDistributedLockProvider>(sp =>
+{
+    var connection = ConnectionMultiplexer.Connect(configuration["Redis:Configuration"]!);
+    return new RedisDistributedSynchronizationProvider(connection.GetDatabase());
+});
+```
+
+Redis-backed locks for any service that requests `IAbpDistributedLock`.
+
+### Swagger + OAuth
+
+`AddAbpSwaggerGenWithOAuth` wires Swagger UI's "Authorize" button to the AuthServer's `/connect/authorize` endpoint using the **swagger client** that the seed contributor creates (`MyProjectName_Swagger`). The `OAuthScopes("MyProjectName")` call requests the application scope.
+
+### Virtual file system
+
+In development the host calls `ReplaceEmbeddedByPhysical<MyProjectNameDomainSharedModule>(...)` (and similar for Domain/Application.Contracts/Application). This lets you edit JSON localization files or razor pages without restarting the host — the framework reads them straight from disk.
+
+## Program.cs
+
+```csharp
+Log.Logger = new LoggerConfiguration()
+#if DEBUG
+    .MinimumLevel.Debug()
+#else
+    .MinimumLevel.Information()
+#endif
+    .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+    .MinimumLevel.Override("Microsoft.EntityFrameworkCore", LogEventLevel.Warning)
+    .Enrich.FromLogContext()
+    .WriteTo.Async(c => c.File("Logs/logs.txt"))
+    .WriteTo.Async(c => c.Console())
+    .CreateLogger();
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Host.AddAppSettingsSecretsJson().UseAutofac().UseSerilog();
+await builder.AddApplicationAsync<MyProjectNameHttpApiHostModule>();
+var app = builder.Build();
+await app.InitializeApplicationAsync();
+await app.RunAsync();
+```
+
+- `WebApplication.CreateBuilder` is the .NET 6+ minimal-hosting builder.
+- `AddAppSettingsSecretsJson` enables `appsettings.secrets.json` resolution (handy for staging deployments).
+- `UseAutofac()` swaps the default DI container for Autofac to enable property injection.
+- `AddApplicationAsync<>` boots the ABP module graph.
+
+## OnApplicationInitialization (the request pipeline)
+
+```csharp
+app.UseAbpRequestLocalization();
+app.UseCorrelationId();
+app.UseStaticFiles();
+app.UseRouting();
+app.UseCors();
+app.UseAuthentication();
+
+if (MultiTenancyConsts.IsEnabled)
+{
+    app.UseMultiTenancy();
+}
+
+app.UseAuthorization();
+app.UseSwagger();
+app.UseAbpSwaggerUI(options => { ... });
+app.UseAuditing();
+app.UseAbpSerilogEnrichers();
+app.UseUnitOfWork();
+app.UseConfiguredEndpoints();
+```
+
+The order **matters**:
+
+1. Localization first so error/log messages downstream are translated.
+2. CORS before auth so pre-flight requests succeed for anonymous endpoints.
+3. `UseAuthentication` -> `UseMultiTenancy` -> `UseAuthorization` — the tenant resolver runs *after* the user is identified but *before* permission checks fire.
+4. `UseUnitOfWork` wraps the endpoint pipeline in a UoW; removing it causes `EntityChangedEventData` to never publish.
+
+## appsettings.json
+
+```json
+{
+  "App": {
+    "CorsOrigins": "https://*.MyProjectName.com,http://localhost:4200,https://localhost:44307"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "Redis": { "Configuration": "127.0.0.1" },
+  "AuthServer": {
+    "Authority": "https://localhost:44301",
+    "RequireHttpsMetadata": "true",
+    "SwaggerClientId": "MyProjectName_Swagger"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+Replace `DefaultPassPhrase` in every environment — it seeds ABP's `IStringEncryptionService` and leaving it at the template default exposes every encrypted value in your database.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Add a new audience to JWT validation  | `AddJwtBearer(options => options.TokenValidationParameters.ValidAudiences = new[] {...})` |
+| Different CORS policy                 | Edit `ConfigureCors`                                              |
+| Disable Redis in dev                  | Remove the Redis call in `ConfigureDataProtection` (the conditional already does this) |
+| Add an extra Swagger doc              | Second `options.SwaggerDoc(...)` call                             |
+| Toggle multi-tenancy URL middleware   | `app.UseMultiTenancy()` is guarded by `MultiTenancyConsts.IsEnabled` |
+
+## Gotchas
+
+- **JWT validation requires the `Authority` URL to match the token issuer exactly.** Trailing slashes, `http` vs `https`, and port numbers all matter. Mismatch yields `IDX10204: Unable to validate issuer` — visible only in the log file.
+- **CORS allows credentials AND wildcard subdomains.** `AllowCredentials()` plus `WithOrigins("https://*.MyProjectName.com")` only works because `SetIsOriginAllowedToAllowWildcardSubdomains()` is called. Removing that line breaks credentialed cross-origin requests with no fallback.
+- **`appsettings.Development.json` is loaded last.** If you override `AuthServer:Authority` there make sure the *production* file does **not** rely on the development value — environment overrides are additive.
+- **Redis is required even in single-instance scaling.** Distributed cache, distributed locking, and data-protection keyring all read `Redis:Configuration`. Without Redis the host falls back to in-memory implementations and tokens issued by replica A cannot be validated by replica B.
+- **The Swagger client is seeded by `OpenIddictDataSeedContributor`**; if you delete the `MyProjectName_Swagger` entry from `DbMigrator/appsettings.json` the "Authorize" dialog will reject every login because the client_id is unknown.
+- **`UseUnitOfWork()` must appear AFTER `UseAuthorization()`** — otherwise the unit-of-work begins before the user identity is set and tenant-aware filters use the wrong `CurrentTenant.Id`.

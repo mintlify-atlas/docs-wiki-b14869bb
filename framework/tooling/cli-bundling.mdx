@@ -1,0 +1,422 @@
+---
+title: "abp bundle"
+description: "How BundleCommand walks a Blazor WebAssembly or MAUI Blazor project, discovers every bundle contributor from the module graph and patches index.html with the resulting CSS/JS references."
+---
+
+`abp bundle` is the CLI verb that makes Blazor WebAssembly (and MAUI
+Blazor) projects pick up the styles and scripts that every ABP module
+needs — Bootstrap, Lepton-X, the SignalR client, Datatables.NET,
+ChartJS, FontAwesome, etc. Instead of every module shipping its own
+`<script>` tags, ABP collects them at build time through the
+`AbpBundleContributor` graph and the CLI writes the final list into
+`wwwroot/index.html`.
+
+This page walks `BundleCommand`, `BundlingService` and the helpers in
+`Volo/Abp/Cli/Bundling/`.
+
+## File inventory
+
+```text
+framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/
+├── Commands/
+│   └── BundleCommand.cs              # IConsoleCommand entry point
+└── Bundling/
+    ├── BundlingService.cs            # The orchestrator
+    ├── BundlingConsts.cs             # WebAssembly, MauiBlazor, HTML placeholders
+    ├── BundleConfig.cs               # Mode, Name, Parameters
+    ├── BundleOptions.cs              # Per-run config passed to bundlers
+    ├── BundleTypeDefinition.cs       # One entry in the contributor graph
+    ├── BundlingMode.cs               # None / Bundle / BundleAndMinify
+    ├── BundlingException.cs
+    ├── IBundlingService.cs           # Single-method service interface
+    ├── IBundler.cs                   # IScriptBundler / IStyleBundler
+    ├── BundlerBase.cs                # Shared minification + write logic
+    ├── PathHelper.cs                 # WebAssembly/MAUI path resolution
+    ├── Scripts/                      # ScriptBundler implementation
+    └── Styles/                       # StyleBundler implementation
+```
+
+## Command class
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/BundleCommand.cs
+public class BundleCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "bundle";
+
+    public ILogger<BundleCommand> Logger { get; set; }
+    public IBundlingService BundlingService { get; set; }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        var workingDirectoryArg = commandLineArgs.Options.GetOrNull(
+            Options.WorkingDirectory.Short, Options.WorkingDirectory.Long);
+
+        var workingDirectory = workingDirectoryArg ?? Directory.GetCurrentDirectory();
+
+        var forceBuild = commandLineArgs.Options.ContainsKey(Options.ForceBuild.Short) ||
+                         commandLineArgs.Options.ContainsKey(Options.ForceBuild.Long);
+
+        var projectType = GetProjectType(commandLineArgs);
+
+        if (!Directory.Exists(workingDirectory))
+        {
+            throw new CliUsageException("Specified directory does not exist." +
+                                        Environment.NewLine + GetUsageInfo());
+        }
+
+        try
+        {
+            await BundlingService.BundleAsync(workingDirectory, forceBuild, projectType);
+        }
+        catch (BundlingException ex)
+        {
+            Logger.LogError(ex.Message);
+        }
+    }
+}
+```
+
+### Flag reference
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `-wd`, `--working-directory <path>` | Current directory | Folder containing the `*.csproj`. |
+| `-t`, `--project-type <type>` | `webassembly` | `webassembly` ↔ `Microsoft.NET.Sdk.BlazorWebAssembly`, `maui-blazor` ↔ `Microsoft.NET.Sdk.Razor`. |
+| `-f`, `--force` | off | Run `dotnet build` before discovering contributors. |
+
+The project-type mapping is enforced in `GetProjectType`:
+
+```csharp
+private string GetProjectType(CommandLineArgs commandLineArgs)
+{
+    var projectType = commandLineArgs.Options.GetOrNull(Options.ProjectType.Short,
+                                                        Options.ProjectType.Long);
+    projectType ??= BundlingConsts.WebAssembly;
+
+    return projectType.ToLower() switch {
+        "webassembly" => BundlingConsts.WebAssembly,
+        "maui-blazor" => BundlingConsts.MauiBlazor,
+        _ => throw new CliUsageException(ExceptionMessageHelper
+            .GetInvalidOptionExceptionMessage("Project Type"))
+    };
+}
+```
+
+### Usage screen
+
+```text
+Usage:
+  abp bundle [options]
+
+Options:
+  -wd|--working-directory <directory-path>      (default: empty)
+  -f | --force                                  (default: false)
+  -t | --project-type                           (default: webassembly)
+```
+
+## BundlingService — the orchestrator
+
+`BundlingService.BundleAsync` is where most of the interesting logic
+lives.
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Bundling/BundlingService.cs
+public async Task BundleAsync(string directory, bool forceBuild,
+                              string projectType = BundlingConsts.WebAssembly)
+{
+    if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) && projectType == BundlingConsts.MauiBlazor)
+    {
+        Logger.LogWarning("ABP bundle command does not support OSX for MAUI Blazor");
+        return;
+    }
+
+    var projectFiles = Directory.GetFiles(directory, "*.csproj");
+    if (!projectFiles.Any())
+        throw new BundlingException("No project file found in the directory. " +
+                                    "The working directory must have a Blazor project file.");
+
+    var projectFilePath = projectFiles[0];
+
+    CheckProjectIsSupportedType(projectFilePath, projectType);
+
+    var config = projectType == BundlingConsts.WebAssembly
+        ? ConfigReader.Read(PathHelper.GetWwwRootPath(directory))
+        : ConfigReader.Read(directory);
+    var bundleConfig = config.Bundle;
+
+    if (forceBuild)
+        DotNetProjectBuilder.BuildProjects(
+            new List<DotNetProjectInfo>
+            {
+                new DotNetProjectInfo(string.Empty, projectFilePath, true)
+            }, string.Empty);
+
+    var frameworkVersion = GetTargetFrameworkVersion(projectFilePath, projectType);
+    var projectName      = Path.GetFileNameWithoutExtension(projectFilePath);
+
+    var assemblyFilePath = projectType == BundlingConsts.WebAssembly
+        ? PathHelper.GetWebAssemblyFilePath(directory, frameworkVersion, projectName)
+        : PathHelper.GetMauiBlazorAssemblyFilePath(directory, projectName);
+    var startupModule    = GetStartupModule(assemblyFilePath);
+
+    var bundleDefinitions = new List<BundleTypeDefinition>();
+    FindBundleContributorsRecursively(startupModule, 0, bundleDefinitions);
+    bundleDefinitions = bundleDefinitions.OrderByDescending(t => t.Level).ToList();
+
+    var styleContext  = GetStyleContext (bundleDefinitions, bundleConfig.Parameters);
+    var scriptContext = GetScriptContext(bundleDefinitions, bundleConfig.Parameters, projectType);
+
+    string styleDefinitions, scriptDefinitions;
+
+    if (bundleConfig.Mode is BundlingMode.Bundle or BundlingMode.BundleAndMinify)
+    {
+        var options = new BundleOptions
+        {
+            Directory       = directory,
+            FrameworkVersion= frameworkVersion,
+            ProjectFileName = projectName,
+            BundleName      = bundleConfig.Name.IsNullOrEmpty() ? "global" : bundleConfig.Name,
+            Minify          = bundleConfig.Mode == BundlingMode.BundleAndMinify,
+            ProjectType     = projectType
+        };
+
+        styleDefinitions  = StyleBundler.Bundle (options, styleContext);
+        scriptDefinitions = ScriptBundler.Bundle(options, scriptContext);
+    }
+    else
+    {
+        styleDefinitions  = GenerateStyleDefinitions (styleContext);
+        scriptDefinitions = GenerateScriptDefinitions(scriptContext);
+    }
+
+    await UpdateDependenciesInHtmlFileAsync(directory, styleDefinitions, scriptDefinitions);
+}
+```
+
+### Pipeline summary
+
+1. **Validate the working directory.** On macOS for `maui-blazor` we
+   short-circuit with a warning — the Razor SDK MAUI flavour does not
+   build cleanly there.
+2. **Find the `.csproj`** and verify its SDK matches the requested
+   project type:
+   - `Microsoft.NET.Sdk.BlazorWebAssembly` for `webassembly`,
+   - `Microsoft.NET.Sdk.Razor` for `maui-blazor`.
+3. **Read `bundleconfig.json`** through `ConfigReader`. For WASM the
+   file lives under `wwwroot/`, for MAUI Blazor it's at the project root.
+4. **Optional `dotnet build`.** When `-f` is set, `IDotNetProjectBuilder`
+   runs a build first so the next step has a fresh assembly to
+   reflect over.
+5. **Resolve the assembly.** `PathHelper.GetWebAssemblyFilePath` walks
+   `bin/Debug/<framework>/wwwroot/_framework/<projectName>.dll`; the
+   MAUI helper handles the `bin/Debug/<framework>/wwwroot/` shape for
+   `wwwroot`-hosted assemblies.
+6. **Inspect the startup module** with `GetStartupModule(assemblyFilePath)`.
+   This loads the assembly and finds the type marked with the ABP
+   `[DependsOn]` graph root (`MainBlazorModule` in the templates).
+7. **Walk the module graph** with `FindBundleContributorsRecursively`,
+   collecting every type that derives from `IBundleContributor`.
+   Definitions are sorted by `Level` descending so contributors from
+   leaf modules win when there are conflicts.
+8. **Build script and style contexts.** For WASM, the script context is
+   pre-seeded with `_framework/blazor.webassembly.js` because that is
+   not provided by any contributor:
+
+   ```csharp
+   if (projectType == BundlingConsts.WebAssembly)
+   {
+       scriptContext.BundleDefinitions.AddIfNotContains(
+           x => x.Source == "_framework/blazor.webassembly.js",
+           () => new BundleDefinition { Source = "_framework/blazor.webassembly.js" });
+   }
+   ```
+9. **Bundle or just reference.** Depending on `bundleConfig.Mode`
+   (`None`, `Bundle`, `BundleAndMinify`):
+   - `None` → emit raw `<link>`/`<script>` tags pointing at each source.
+   - `Bundle` → concatenate into one `bundle.css` / `bundle.js`.
+   - `BundleAndMinify` → same, then minify with NUglify (the host's
+     `IJavascriptMinifier` / `ICssMinifier`).
+10. **Patch `index.html`.** Replace everything between the placeholders
+    with the new definitions:
+    ```html
+    <!--ABP:Styles--> … <!--/ABP:Styles-->
+    <!--ABP:Scripts--> … <!--/ABP:Scripts-->
+    ```
+
+### `bundleconfig.json`
+
+The CLI reads a `BundleConfig` from `wwwroot/bundleconfig.json` (WASM)
+or `<projectRoot>/bundleconfig.json` (MAUI Blazor):
+
+```json
+{
+  "Bundle": {
+    "Mode": "BundleAndMinify",     // None | Bundle | BundleAndMinify
+    "Name": "global",               // becomes /libs/abp/global/global.css|js
+    "Parameters": {
+      "leptonx-style": "dark"       // forwarded to contributors via BundleParameterDictionary
+    }
+  }
+}
+```
+
+`BundleConfig` defaults are sensible:
+
+```csharp
+public class BundleConfig
+{
+    public BundlingMode Mode { get; set; } = BundlingMode.BundleAndMinify;
+    public string Name        { get; set; } = "global";
+    public BundleParameterDictionary Parameters { get; set; } = new();
+}
+```
+
+### `index.html` placeholders
+
+The bundler updates only the marked range, leaving everything else
+intact:
+
+```csharp
+private async Task UpdateDependenciesInHtmlFileAsync(
+    string directory, string styleDefinitions, string scriptDefinitions)
+{
+    var htmlFilePath = Path.Combine(PathHelper.GetWwwRootPath(directory), "index.html");
+    if (!File.Exists(htmlFilePath))
+        throw new BundlingException($"index.html file could not be found in: {htmlFilePath}");
+
+    Encoding fileEncoding;
+    string content;
+    using (var reader = new StreamReader(htmlFilePath, true))
+    {
+        fileEncoding = reader.CurrentEncoding;
+        content      = await reader.ReadToEndAsync();
+    }
+
+    content = UpdatePlaceholders(content, BundlingConsts.StylePlaceholderStart,
+                                BundlingConsts.StylePlaceholderEnd, styleDefinitions);
+    content = UpdatePlaceholders(content, BundlingConsts.ScriptPlaceholderStart,
+                                BundlingConsts.ScriptPlaceholderEnd, scriptDefinitions);
+
+    using (var writer = new StreamWriter(htmlFilePath, false, fileEncoding))
+    {
+        await writer.WriteAsync(content);
+        await writer.FlushAsync();
+    }
+}
+```
+
+A typical `wwwroot/index.html` chunk from a template:
+
+```html
+<!--ABP:Styles-->
+<link rel="stylesheet" href="_content/Volo.Abp.AspNetCore.Components.WebAssembly/libs/bootstrap/css/bootstrap.css" />
+<link rel="stylesheet" href="_content/Volo.Abp.AspNetCore.Components.WebAssembly.LeptonXTheme/libs/abp/global/global.css" />
+<link rel="stylesheet" href="main.css" />
+<!--/ABP:Styles-->
+```
+
+After `abp bundle --mode BundleAndMinify`, that block is rewritten as a
+single bundled reference:
+
+```html
+<!--ABP:Styles-->
+<link rel="stylesheet" href="libs/abp/global/global.css" />
+<!--/ABP:Styles-->
+```
+
+with `libs/abp/global/global.css` written next to `index.html`.
+
+## Contributors and ordering
+
+A bundle contributor is anything implementing `IBundleContributor`:
+
+```csharp
+public class MyAppBundleContributor : BundleContributor
+{
+    public override void AddScripts(BundleContext context)
+    {
+        context.Add("scripts/my-app.js");
+    }
+
+    public override void AddStyles(BundleContext context)
+    {
+        context.Add("styles/my-app.css");
+    }
+}
+```
+
+Contributors register themselves on a module via
+`Configure<AbpBundlingOptions>(o => o.StyleBundles.Configure(StandardBundles.Styles.Global,
+b => b.AddContributors(typeof(MyAppBundleContributor)));`.
+
+The CLI doesn't run that registration code; instead it reflects over the
+module graph, looking for `[DependsOn]` chains and per-module
+`BundleTypeDefinition`s. The `Level` field on each definition is the
+distance from the leaf module — sorting by `Level` descending puts
+project-local contributors *after* framework-level ones, which is what
+you want for CSS-cascade purposes.
+
+## Examples
+
+```bash
+# Default usage inside the WebAssembly project folder
+cd src/Acme.BookStore.Blazor
+abp bundle
+
+# Force a rebuild first (use after bumping module versions)
+abp bundle --force
+
+# Explicit working directory + project type
+abp bundle -wd src/Acme.BookStore.MauiBlazor -t maui-blazor
+
+# After every module bump:
+abp update
+abp bundle --force
+```
+
+## What `NewCommand` does for you
+
+When you create a Blazor WASM solution via `abp new -u blazor`,
+`NewCommand.RunBundleForBlazorWasmOrMauiBlazorTemplateAsync` invokes
+`IBundlingService.BundleAsync` in-process. That means a freshly
+generated solution is already bundled — you only need to re-run
+`abp bundle` after adding modules or changing themes.
+
+## Gotchas
+
+- **WebAssembly path requires a successful build.** Without
+  `wwwroot/_framework/<projectName>.dll`, `GetStartupModule` throws.
+  Run with `-f` once after a clean.
+- **MAUI Blazor not supported on macOS.** The bundler short-circuits
+  with a warning and returns success.
+- **The placeholders must exist verbatim.** If you accidentally delete
+  the `<!--ABP:Styles-->` markers, `UpdatePlaceholders` becomes a no-op
+  and your new contributors will never appear in `index.html`.
+- **`bundleconfig.json` location differs by project type.** WASM reads
+  it from `wwwroot/`; MAUI Blazor reads it from the project root.
+- **Minification uses NUglify.** The CLI depends on
+  `AbpMinifyModule`; any complaints about `IJavascriptMinifier` /
+  `ICssMinifier` resolution come from there.
+- **Bundle level ordering is "leaf wins."** A contributor in your
+  application module overrides any same-source contributor from a
+  framework module.
+- **`forceBuild` does not run `dotnet restore`.** If you just pulled
+  new packages, run `dotnet restore` (or do a full `dotnet build`)
+  before `abp bundle -f`.
+- **`global` is a magic name.** When `BundleConfig.Name` is empty the
+  bundler falls back to `"global"`; if you want named bundles for
+  layouts, set a value explicitly.
+
+## Cross-references
+
+- [CLI host](./cli) — how `BundleCommand` is registered and resolved.
+- [Command registry](./cli-commands) — see the `Name = "bundle"`
+  registration in `AbpCliCoreModule`.
+- [`abp new`](./cli-new-command) — auto-runs `BundleAsync` after
+  scaffolding a Blazor WASM solution.
+- [`abp install-libs`](./cli-install-libs) — the analogous step for
+  MVC/Blazor Server (NPM-driven) projects.
+- ABP bundling primer in the docs:
+  [docs.abp.io/.../UI/AspNetCore/Bundling-Minification](https://docs.abp.io/en/abp/latest/UI/AspNetCore/Bundling-Minification),
+  [docs.abp.io/.../Blazor/Global-Styles-Scripts](https://docs.abp.io/en/abp/latest/Blazor/Global-Styles-Scripts).

@@ -1,0 +1,285 @@
+---
+title: "Aliyun OSS"
+description: "External-service reference for Aliyun (Alibaba Cloud) Object Storage Service — Volo.Abp.BlobStoring.Aliyun provider, endpoints, RAM credentials, STS roles, and operational guidance."
+---
+
+`Volo.Abp.BlobStoring.Aliyun` integrates Alibaba Cloud Object Storage Service (OSS) as an ABP `IBlobProvider`. It supports static RAM-user access keys and STS temporary credentials (with caching via `IDistributedCache`), and accepts the standard OSS endpoint forms. This page covers the **Aliyun OSS** side.
+
+For the ABP-side BLOB abstraction see [Blob Storing](/framework/imaging-blob/blob-storing) and [Blob Storing — Aliyun](/framework/imaging-blob/blob-storing-aliyun).
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.BlobStoring.Aliyun` | `AbpBlobStoringAliyunModule` |
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule), typeof(AbpCachingModule))]
+public class AbpBlobStoringAliyunModule : AbpModule { }
+```
+
+Wire it per container:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseAliyun(aliyun =>
+        {
+            aliyun.AccessKeyId       = "...";
+            aliyun.AccessKeySecret   = "...";
+            aliyun.Endpoint          = "oss-cn-hangzhou.aliyuncs.com";
+            aliyun.RegionId          = "cn-hangzhou";
+            aliyun.ContainerName     = "catalog-blobs";
+            aliyun.CreateContainerIfNotExists = false;
+        });
+    });
+});
+```
+
+## Provider configuration keys
+
+`Volo.Abp.BlobStoring.Aliyun.AliyunBlobProviderConfigurationNames`:
+
+```csharp
+public const string AccessKeyId                  = "Aliyun.AccessKeyId";
+public const string AccessKeySecret              = "Aliyun.AccessKeySecret";
+public const string Endpoint                     = "Aliyun.Endpoint";
+public const string UseSecurityTokenService      = "Aliyun.UseSecurityTokenService";
+public const string RegionId                     = "Aliyun.RegionId";
+public const string RoleArn                      = "Aliyun.RoleArn";
+public const string RoleSessionName              = "Aliyun.RoleSessionName";
+public const string DurationSeconds              = "Aliyun.DurationSeconds";
+public const string Policy                       = "Aliyun.Policy";
+public const string ContainerName                = "Aliyun.ContainerName";
+public const string CreateContainerIfNotExists   = "Aliyun.CreateContainerIfNotExists";
+public const string TemporaryCredentialsCacheKey = "Aliyun.TemporaryCredentialsCacheKey";
+```
+
+| Key | Notes |
+| --- | --- |
+| `Aliyun.AccessKeyId` / `Aliyun.AccessKeySecret` | Long-lived RAM user keys. |
+| `Aliyun.Endpoint` | OSS regional endpoint, **without** scheme. E.g. `oss-cn-hangzhou.aliyuncs.com`. Internal-only endpoints (`oss-cn-hangzhou-internal.aliyuncs.com`) save egress when running inside Aliyun. |
+| `Aliyun.UseSecurityTokenService` | `true` → call STS `AssumeRole` and use temporary creds. |
+| `Aliyun.RegionId` | Required when using STS (e.g. `cn-hangzhou`). |
+| `Aliyun.RoleArn` | RAM role ARN to assume, e.g. `acs:ram::1234567890:role/AbpBlobRole`. |
+| `Aliyun.RoleSessionName` | Friendly session label visible in ActionTrail. |
+| `Aliyun.DurationSeconds` | 900 – 43 200; session lifetime. |
+| `Aliyun.Policy` | Optional inline policy to scope the session down. |
+| `Aliyun.ContainerName` | OSS bucket name. |
+| `Aliyun.CreateContainerIfNotExists` | `true` → `PutBucket` on first use. |
+| `Aliyun.TemporaryCredentialsCacheKey` | Override cache key for STS creds. |
+
+`DefaultOssClientFactory` constructs `Aliyun.OSS.OssClient` from these values; you can replace it with your own `IOssClientFactory` to inject a custom HTTP client or proxy.
+
+## Endpoints
+
+OSS endpoint syntax: `oss-<region>[-internal].aliyuncs.com`. Pick:
+
+| Region | Endpoint |
+| --- | --- |
+| China (Hangzhou) | `oss-cn-hangzhou.aliyuncs.com` |
+| China (Beijing) | `oss-cn-beijing.aliyuncs.com` |
+| China (Shenzhen) | `oss-cn-shenzhen.aliyuncs.com` |
+| Singapore | `oss-ap-southeast-1.aliyuncs.com` |
+| Frankfurt | `oss-eu-central-1.aliyuncs.com` |
+| US (Silicon Valley) | `oss-us-west-1.aliyuncs.com` |
+
+Use the `-internal` variant when both your ECS / ACK workload and the bucket are in the same region — it's faster and free of internet egress. The external endpoint costs outbound bandwidth.
+
+For private link / VPC endpoint setups, use the VPC endpoint hostname provided by Aliyun Private Service.
+
+## RAM permissions
+
+Minimum RAM policy for the service user/role:
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "oss:PutObject",
+        "oss:GetObject",
+        "oss:DeleteObject",
+        "oss:ListObjects",
+        "oss:GetObjectAcl"
+      ],
+      "Resource": [
+        "acs:oss:*:*:catalog-blobs",
+        "acs:oss:*:*:catalog-blobs/*"
+      ]
+    }
+  ]
+}
+```
+
+Add `oss:PutBucket` only when `CreateContainerIfNotExists=true`.
+
+## STS temporary credentials
+
+When `UseSecurityTokenService=true` the provider:
+
+1. Calls `AcsClient.AssumeRoleAsync` with `RoleArn`, `RoleSessionName`, `DurationSeconds`, optional `Policy`.
+2. Caches the credentials (`AccessKeyId`, `AccessKeySecret`, `SecurityToken`, expiry) in ABP's distributed cache under `TemporaryCredentialsCacheKey`.
+3. Refreshes ~5 minutes before expiry.
+
+Use STS for cross-account access, per-tenant role separation, or when handing tokens to client-side uploaders.
+
+## Sample `appsettings.json`
+
+```json
+{
+  "AliyunBlobStorage": {
+    "Endpoint": "oss-cn-hangzhou-internal.aliyuncs.com",
+    "AccessKeyId": "LTAI5t...",
+    "AccessKeySecret": "********",
+    "RegionId": "cn-hangzhou",
+    "ContainerName": "catalog-blobs",
+    "CreateContainerIfNotExists": false,
+    "UseSecurityTokenService": false
+  }
+}
+```
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseAliyun(o =>
+        {
+            o.Endpoint        = configuration["AliyunBlobStorage:Endpoint"];
+            o.AccessKeyId     = configuration["AliyunBlobStorage:AccessKeyId"];
+            o.AccessKeySecret = configuration["AliyunBlobStorage:AccessKeySecret"];
+            o.RegionId        = configuration["AliyunBlobStorage:RegionId"];
+            o.ContainerName   = configuration["AliyunBlobStorage:ContainerName"];
+            o.CreateContainerIfNotExists =
+                bool.Parse(configuration["AliyunBlobStorage:CreateContainerIfNotExists"] ?? "false");
+        });
+    });
+});
+```
+
+## Bucket settings
+
+| Setting | Recommendation |
+| --- | --- |
+| Storage class | **Standard** for hot data, **IA** for warm, **Archive** / **Cold Archive** for cold. ABP doesn't restore Archive automatically. |
+| Versioning | Enable in production. |
+| Cross-region replication (CRR) | Optional, for DR. |
+| Server-side encryption | KMS or OSS-managed. Configure at bucket level. |
+| Bucket policy | Always private; rely on RAM for access. |
+| Object Lock | Optional (WORM). |
+| Lifecycle | Tier or expire by age tag. |
+
+## Container naming
+
+OSS bucket names: 3–63 chars, lowercase letters, digits, hyphens (no underscore), must start with letter or digit, globally unique within Aliyun. The ABP container name (which can be PascalCase) does **not** become the bucket name automatically — set `Aliyun.ContainerName` explicitly.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `InvalidAccessKeyId.NotFound` | Wrong key, or RAM user disabled. | Re-issue key. |
+| `SignatureDoesNotMatch` | Clock skew > 15 min, or wrong secret. | Sync NTP, verify secret. |
+| `NoSuchBucket` | Bucket missing, or wrong region/endpoint. | Verify endpoint matches the bucket's region. |
+| `AccessDenied` | RAM policy missing OSS action. | Update policy; check bucket policy. |
+| `RequestTimeTooSkewed` | Local clock off. | Sync NTP. |
+| `InvalidArgument: RoleArn is invalid` (with STS) | Wrong ARN format. | Must be `acs:ram::<account>:role/<role-name>`. |
+| Internal endpoint returns network error | App not in same region/VPC as bucket. | Switch to public endpoint or move workload. |
+| Multi-tenant data crosses tenants | Tenant resolution misconfigured. | Ensure `ICurrentTenant` is set on the request scope; provider uses tenant id prefix. |
+
+## Observability hints
+
+- **CloudMonitor.** OSS metrics: `BucketStorage`, `GetObjectCount`, `PutObjectCount`, `4xxErrorCount`, `5xxErrorCount`, `AverageE2ELatency`. Set dashboards per bucket.
+- **ActionTrail.** Records API calls; useful for who accessed which object.
+- **Real-time logging.** OSS can deliver access logs to Log Service (SLS) for SQL querying.
+- **Tracing.** The Aliyun SDK uses `HttpClient`; pair with OpenTelemetry HttpClient instrumentation. Spans carry method (`PutObject`) and bucket name as URL.
+
+## Sovereign cloud / on-prem variants
+
+- **Aliyun Finance Cloud**, **Aliyun Gov Cloud** — same SDK, different endpoint domains.
+- **Apsara Stack** (private Aliyun) — works with the public SDK if endpoints are reachable; supply the Apsara endpoint.
+
+## Signed URLs
+
+The Aliyun OSS .NET SDK exposes `GeneratePresignedUri` for direct browser uploads / downloads. ABP doesn't surface it — use the SDK directly:
+
+```csharp
+var ossClient = new OssClient(endpoint, accessKeyId, accessKeySecret);
+var req = new GeneratePresignedUriRequest(bucketName, objectKey, SignHttpMethod.Put)
+{
+    Expiration = DateTime.UtcNow.AddMinutes(15),
+    ContentType = "application/pdf"
+};
+var url = ossClient.GeneratePresignedUri(req);
+```
+
+When using STS credentials the signed URL must include the security token as a query string parameter (`security-token=...`).
+
+## Bucket CORS
+
+For SPA direct upload:
+
+```xml
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>https://app.example.com</AllowedOrigin>
+    <AllowedMethod>PUT</AllowedMethod>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedHeader>*</AllowedHeader>
+    <ExposeHeader>ETag</ExposeHeader>
+    <MaxAgeSeconds>3600</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>
+```
+
+Set via the OSS console or `ossutil bucket-cors`. ABP doesn't manage CORS.
+
+## Cross-region replication (CRR)
+
+Bucket-level setting; OSS replicates writes asynchronously to a destination bucket in another region. RPO usually under 5 minutes. ABP code unchanged — point per-region deployments at their local bucket.
+
+## Transfer Acceleration
+
+OSS Global Acceleration routes uploads through edge POPs. Enable on the bucket and override `Endpoint` to `<bucket>.oss-accelerate.aliyuncs.com`. Useful for users far from the bucket region.
+
+## Image processing
+
+OSS supports server-side image processing via URL query parameters (resize, watermark, format conversion). Avoids the round-trip through your imaging pipeline:
+
+```
+https://catalog-blobs.oss-cn-hangzhou.aliyuncs.com/avatar.jpg?x-oss-process=image/resize,w_200/quality,q_80
+```
+
+For ABP integration, generate signed URLs that include the `x-oss-process` parameter. The OSS pricing for image processing is per-operation.
+
+## CDN integration
+
+Aliyun CDN can front the bucket; users hit the CDN edge, which fetches from OSS on cache miss. Set `Aliyun.Endpoint` to the **internal** endpoint to keep origin traffic free of internet egress, and serve users via the CDN URL.
+
+## ActionTrail and OSS access logging
+
+Two complementary audit sources:
+
+- **ActionTrail** — control-plane events (bucket create, policy change).
+- **OSS access logging** — data-plane events (per-request, written to a logging bucket).
+
+Enable both in production. Access logs go to a separate bucket; configure a lifecycle to delete after 90 days.
+
+## DDoS protection
+
+Aliyun Anti-DDoS Pro and Anti-Bot front the bucket via CDN. ABP code unchanged — Anti-Bot inspects requests for scrapers. Useful for public-bucket scenarios; rare for ABP since most blobs are private.
+
+## Apsara Stack on-prem
+
+Apsara Stack runs the same OSS API on private hardware. Endpoints look like `oss-internal.apsarastack.com`. Configure `Aliyun.Endpoint` accordingly; the SDK works without changes. Some advanced features (Transfer Acceleration, Global Replication) are unavailable.
+
+## Related references
+
+- [Blob Storing](/framework/imaging-blob/blob-storing) — abstraction and provider model.
+- [Blob Storing — Aliyun](/framework/imaging-blob/blob-storing-aliyun) — provider internals.
+- [AWS S3](/reference/integrations/aws-s3) and [Azure Blob](/reference/integrations/azure-blob) — sibling references.

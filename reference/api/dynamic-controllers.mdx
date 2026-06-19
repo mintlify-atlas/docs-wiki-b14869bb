@@ -1,0 +1,323 @@
+---
+title: "Dynamic controllers: app services as HTTP endpoints"
+sidebarTitle: "Dynamic controllers"
+description: "How AbpServiceConvention turns conventional application services into MVC controllers, how routes and HTTP verbs are derived, and the rules clients must know."
+---
+
+ABP's "conventional controllers" feature lets an application service
+become an HTTP API without you writing a controller class. The
+`AbpServiceConvention` walks the registered controller models at startup,
+matches each app-service type that implements `IRemoteService`, derives
+a route and verb from the method name, and inserts the action into the
+MVC pipeline. The hand-written controllers documented in the other
+*-endpoints pages exist only because the module authors wanted explicit
+routes — the framework can generate the same surface automatically.
+
+This page documents the rules `AbpServiceConvention` follows and the
+URL/verb mapping a client should expect.
+
+For the broader picture see
+[Volo.Abp.AspNetCore.Mvc: controllers, conventions and filters](/framework/aspnetcore/aspnetcore-mvc) —
+this page focuses on the **dynamic** part of that pipeline.
+
+## When does it happen?
+
+```csharp framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpAspNetCoreMvcOptions.cs (sketch)
+public class AbpAspNetCoreMvcOptions
+{
+    public AbpConventionalControllerOptions ConventionalControllers { get; }
+    public List<Type> ControllersToRemove { get; }
+    public bool ExposeIntegrationServices { get; set; }
+}
+```
+
+A module opts in by configuring a conventional-controller entry:
+
+```csharp on Configure of an HttpApi module
+Configure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ConventionalControllers.Create(typeof(MyModuleApplicationModule).Assembly,
+        opts => opts.RootPath = "my-module");
+});
+```
+
+From that point any **public** class in the assembly that satisfies one
+of these rules is exposed as a controller:
+
+1. Implements `IRemoteService` (typically inherited via
+   `IApplicationService` → `IRemoteService`).
+2. Is concrete (`!IsAbstract && !IsGenericType`).
+3. Is not annotated with `[RemoteService(IsEnabled = false)]`.
+4. Is not listed in `Options.ControllersToRemove`.
+
+The convention then runs `ConfigureRemoteService` on the controller
+model — that's the pipeline this page documents.
+
+## Controller name (URL segment)
+
+`AbpServiceConvention` strips the well-known suffixes from the type name:
+
+```csharp framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/ApplicationService.cs
+public static string[] CommonPostfixes { get; set; }
+    = { "AppService", "ApplicationService", "IntService", "IntegrationService", "Service" };
+```
+
+Applied with `RemovePostFix`:
+
+| Type name | URL segment |
+| --------- | ----------- |
+| `BookAppService` | `Book` |
+| `OrderApplicationService` | `Order` |
+| `InvoiceIntegrationService` | `Invoice` |
+| `Plain` (no suffix) | `Plain` |
+
+The segment is then run through case normalisation — the default lower
+cases the first character so the URL reads `book`, `order`, …
+
+## Action name (URL segment)
+
+For every action `AbpServiceConvention` resolves the HTTP verb (next
+section) and asks `HttpMethodHelper.RemoveHttpMethodPrefix` to drop the
+matching prefix and `RemovePostFix("Async")` to drop the trailing
+`Async`:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/ConventionalRouteBuilder.cs (excerpt)
+var actionNameInUrl = HttpMethodHelper
+    .RemoveHttpMethodPrefix(action.ActionName, httpMethod)
+    .RemovePostFix("Async");
+```
+
+If the result is empty the action does **not** add a segment to the URL
+— this is why `GetListAsync` and `GetAsync` collapse to the controller's
+root path.
+
+| Method name | Verb | Action segment |
+| ----------- | ---- | -------------- |
+| `GetAsync` | `GET` | _(none)_ |
+| `GetListAsync` | `GET` | _(none)_ |
+| `CreateAsync` | `POST` | _(none)_ |
+| `UpdateAsync` | `PUT` | _(none)_ |
+| `DeleteAsync` | `DELETE` | _(none)_ |
+| `PublishAsync` | `POST` | `Publish` |
+| `GetMineAsync` | `GET` | `Mine` |
+| `RecalcStatsAsync` | `POST` | `RecalcStats` |
+
+## HTTP verb mapping
+
+`HttpMethodHelper` decides the verb from the method name prefix:
+
+```csharp framework/src/Volo.Abp.Http.Abstractions/Volo/Abp/Http/HttpMethodHelper.cs
+public static Dictionary<string, string[]> ConventionalPrefixes { get; set; } = new()
+{
+    {"GET",    new[] {"GetList", "GetAll", "Get"}},
+    {"PUT",    new[] {"Put", "Update"}},
+    {"DELETE", new[] {"Delete", "Remove"}},
+    {"POST",   new[] {"Create", "Add", "Insert", "Post"}},
+    {"PATCH",  new[] {"Patch"}}
+};
+```
+
+`GetConventionalVerbForMethodName` walks the dictionary and returns the
+first match. If nothing matches the method becomes a `POST` (the value
+of `HttpMethodHelper.DefaultHttpVerb`).
+
+| Prefix family | Resulting verb |
+| ------------- | -------------- |
+| `Get*`, `GetList*`, `GetAll*` | `GET` |
+| `Create*`, `Add*`, `Insert*`, `Post*` | `POST` |
+| `Update*`, `Put*` | `PUT` |
+| `Delete*`, `Remove*` | `DELETE` |
+| `Patch*` | `PATCH` |
+| _anything else_ | `POST` |
+
+You override the verb (and the route) with the usual MVC attributes
+(`[HttpGet]`, `[HttpPost("foo")]`, `[Route]`) — every module-controller
+documented in the other pages does this.
+
+## Building the route
+
+`ConventionalRouteBuilder.Build` produces the final URL pattern:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/ConventionalRouteBuilder.cs (excerpt)
+var apiRoutePrefix = GetApiRoutePrefix(action, configuration);            // "api" or "integration-api"
+var controllerNameInUrl = NormalizeUrlControllerName(...);
+var url = $"{apiRoutePrefix}/{rootPath}/{NormalizeControllerNameCase(controllerNameInUrl, configuration)}";
+
+// {id} for primitive id parameters
+var idParameterModel = action.Parameters.FirstOrDefault(p => p.ParameterName == "id");
+if (idParameterModel != null) { url += "/{id}"; }
+
+// /{actionName} (only when not empty)
+var actionNameInUrl = NormalizeUrlActionName(...);
+if (!actionNameInUrl.IsNullOrEmpty())
+{
+    url += $"/{NormalizeActionNameCase(actionNameInUrl, configuration)}";
+
+    // Secondary id: any other parameter whose name ends with "Id"
+    var secondaryIds = action.Parameters.Where(p => p.ParameterName.EndsWith("Id", StringComparison.Ordinal)).ToList();
+    if (secondaryIds.Count == 1) { url += $"/{{{NormalizeSecondaryIdNameCase(secondaryIds[0], configuration)}}}"; }
+}
+
+return url;
+```
+
+The prefix comes from `AbpAspNetCoreConsts`:
+
+```csharp framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/AbpAspNetCoreConsts.cs
+public const string DefaultApiPrefix = "api";
+public const string DefaultIntegrationServiceApiPrefix = "integration-api";
+```
+
+`GetApiRoutePrefix` picks the integration prefix when the controller's
+type is annotated (directly or via the interface) with
+`[IntegrationService]`. That's how `PermissionIntegrationController`
+ends up at `/integration-api/permission-management/permissions`.
+
+### Worked examples
+
+Assume `OrderAppService : IOrderAppService, IApplicationService` is
+registered with `RootPath = "orders"` and lives in module-area `sales`:
+
+| Method signature | Verb | URL |
+| ---------------- | ---- | --- |
+| `Task<OrderDto> GetAsync(Guid id)` | `GET` | `/api/orders/order/{id}` |
+| `Task<PagedResultDto<OrderDto>> GetListAsync(OrderListInput input)` | `GET` | `/api/orders/order` |
+| `Task<OrderDto> CreateAsync(CreateOrderDto input)` | `POST` | `/api/orders/order` |
+| `Task<OrderDto> UpdateAsync(Guid id, UpdateOrderDto input)` | `PUT` | `/api/orders/order/{id}` |
+| `Task DeleteAsync(Guid id)` | `DELETE` | `/api/orders/order/{id}` |
+| `Task PublishAsync(Guid id)` | `POST` | `/api/orders/order/{id}/publish` |
+| `Task<bool> CheckAvailableAsync(Guid productId, Guid warehouseId)` | `GET` | `/api/orders/order/check-available/{warehouseId}` *(see secondary-id rule)* |
+| `Task<List<OrderDto>> GetByCustomerAsync(Guid customerId)` | `GET` | `/api/orders/order/by-customer/{customerId}` |
+
+The framework lower-cases the action segment with a hyphen — `Publish`
+→ `publish`, `CheckAvailable` → `check-available`. Configure
+`UrlControllerNameNormalizer` / `UrlActionNameNormalizer` on the
+`ConventionalControllerSetting` if you need something else.
+
+## Parameter binding
+
+```csharp framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/AbpServiceConvention.cs (excerpt)
+protected virtual void ConfigureParameters(ControllerModel controller)
+{
+    foreach (var action in controller.Actions)
+    foreach (var prm in action.Parameters)
+    {
+        if (prm.BindingInfo != null) continue;
+        if (!TypeHelper.IsPrimitiveExtended(prm.ParameterInfo.ParameterType, includeEnums: true))
+        {
+            if (CanUseFormBodyBinding(action, prm))
+            {
+                prm.BindingInfo = BindingInfo.GetBindingInfo(new[] { new FromBodyAttribute() });
+            }
+        }
+    }
+}
+```
+
+The rules condense to:
+
+- **Primitive parameter named `id`** → route segment `{id}`.
+- **Primitive parameter ending in `Id`** → secondary route segment, only
+  if exactly one such parameter exists on a non-empty action name.
+- **Other primitives** → query string (the default ASP.NET Core fallback).
+- **Complex parameter on a `POST`/`PUT`/`PATCH`** → `[FromBody]` JSON.
+- **Complex parameter on a `GET`/`DELETE`/`HEAD`/`TRACE`** → query
+  string (the convention refuses to apply `[FromBody]`, see
+  `CanUseFormBodyBinding`).
+
+That's why all the GET endpoints across the modules accept their input
+DTO as `?Filter=…&SkipCount=0&MaxResultCount=10` — the model binder
+matches each public property to the query.
+
+## Removing a generated controller
+
+`AbpAspNetCoreMvcOptions.ControllersToRemove` deletes a generated
+controller from the application model — useful when a module exposed a
+service you do **not** want over HTTP:
+
+```csharp
+Configure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ControllersToRemove.Add(typeof(IBlogFeatureAdminAppService));
+});
+```
+
+After this call the matching action models are stripped before MVC
+finishes building its route table.
+
+## Integration vs ordinary services
+
+`[IntegrationService]` flips three behaviours:
+
+1. The route prefix becomes `/integration-api/...` instead of `/api/...`.
+2. The route is hidden from `IApiDescriptionGroupCollectionProvider` —
+   Swagger and ABP's static-proxy generator skip it unless
+   `AbpAspNetCoreMvcOptions.ExposeIntegrationServices = true`.
+3. The authentication scheme expected by middleware is the integration
+   scheme — usually a server-to-server token, not the user cookie.
+
+The Identity, Permission and Feature-management modules ship integration
+services (`IdentityUserIntegrationController`,
+`PermissionIntegrationController`) that demonstrate the pattern.
+
+## Multi-tenancy
+
+Dynamic controllers do not change the tenant-resolution pipeline. ABP
+inserts the standard `MultiTenancyMiddleware` before MVC, so the
+tenant is resolved from one of the following channels regardless of
+whether the controller is hand-written or generated:
+
+| Channel | Example |
+| ------- | ------- |
+| Header  | `__tenant: contoso` |
+| Cookie  | `__tenant=contoso` |
+| Query   | `/api/orders/order?__tenant=contoso` |
+| Token   | `tenantid` claim on the access token |
+| Domain  | `contoso.app.example.com` (when a domain resolver is configured) |
+
+The resolved `ICurrentTenant` is in scope for the entire action — the
+service code sees it through `ICurrentTenant.Id`.
+
+## What the client sees
+
+`AbpAspNetCoreMvcModule` adds an extra controller —
+`AbpApiDefinitionController` (route: `/api/abp/api-definition`) — that
+returns the JSON map of every generated route. ABP's static-proxy
+generator and the JavaScript SDK consume this endpoint to produce typed
+clients without parsing Swagger. The same map drives the dynamic
+TypeScript proxies in the Angular UI: a `book.service.ts` is generated
+from the route table without anyone hand-coding URLs.
+
+## Quick check-list
+
+When you call a route documented elsewhere on the API reference, the
+URL was produced by exactly these rules:
+
+1. Strip `AppService`/`Service`/etc. from the controller type → URL
+   segment.
+2. Strip `Get`/`Create`/… prefix and `Async` suffix from the method →
+   verb + (optional) URL segment.
+3. Add `{id}` if there is a primitive parameter named `id`; add a
+   secondary `{xId}` if exactly one parameter ends in `Id` and the
+   action also contributes a segment.
+4. Bind complex parameters from the body (`POST`/`PUT`/`PATCH`) or from
+   the query string (`GET`/`DELETE`).
+5. Prefix `/api/{rootPath}/...` (or `/integration-api/...` for
+   integration services).
+
+A hand-written controller — like every one documented in the sibling
+endpoint pages — can override any of the above with the usual MVC
+attributes (`[Route]`, `[HttpGet]`, `[FromQuery]`, …). What matters at
+the wire is the URL the framework ultimately registers in the route
+table; the convention exists only to remove boilerplate.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="AspNetCore Mvc" icon="server" href="/framework/aspnetcore/aspnetcore-mvc">
+    The module that hosts AbpServiceConvention plus filters, model binders, and the app-configuration endpoint.
+  </Card>
+  <Card title="Account endpoints" icon="user-plus" href="/reference/api/account-endpoints">
+    A small module whose controllers — hand-written — match exactly what the convention would have produced.
+  </Card>
+</CardGroup>

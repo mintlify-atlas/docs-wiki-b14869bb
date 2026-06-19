@@ -1,0 +1,198 @@
+---
+title: "Domain Project"
+description: "Aggregate roots, domain services, repositories, settings, OpenIddict seed contributor, and the database-agnostic migration service — the heart of the ABP ASP.NET Core template."
+---
+
+`MyCompanyName.MyProjectName.Domain` is the **business core** of the solution. It depends on `Domain.Shared` and adds the actual entities, repositories, domain services, settings and seed contributors. Everything that defines "what the application *is* about" — independent of database, transport or UI — belongs here.
+
+It is the only project (besides `EntityFrameworkCore`/`MongoDB`) that references the *Domain* layer of every ABP module the template ships, so it indirectly compiles in the full server-side runtime.
+
+## When to put code here
+
+Add code to `Domain` when it:
+
+- Encodes business rules (aggregates, value objects, domain events, domain services).
+- Defines a repository interface (`IXxxRepository`) — but **not** its EF Core or MongoDB implementation.
+- Seeds host-level data that must run before any tenant exists (OpenIddict clients, default settings, system roles).
+- Defines settings (`SettingDefinitionProvider`) or feature definitions for the host side.
+
+The project targets `net7.0` only — `netstandard` compatibility is **not** required because no client-side assembly references it.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.Domain/
+├── Data/
+│   ├── IMyProjectNameDbSchemaMigrator.cs
+│   ├── MyProjectNameDbMigrationService.cs
+│   └── NullMyProjectNameDbSchemaMigrator.cs
+├── OpenIddict/
+│   └── OpenIddictDataSeedContributor.cs
+├── Properties/
+│   └── ...
+├── Settings/
+│   ├── MyProjectNameSettingDefinitionProvider.cs
+│   └── MyProjectNameSettings.cs
+├── MyCompanyName.MyProjectName.Domain.csproj
+├── MyProjectNameConsts.cs
+└── MyProjectNameDomainModule.cs
+```
+
+## csproj at a glance
+
+| Property            | Value                                              |
+| ------------------- | -------------------------------------------------- |
+| `TargetFramework`   | `net7.0`                                           |
+| `Nullable`          | `enable`                                           |
+| `RootNamespace`     | `MyCompanyName.MyProjectName`                      |
+
+The project depends on **`Domain.Shared`** plus the `*.Domain` packages of the bundled ABP modules:
+
+| Project reference                                                       | Purpose                                  |
+| ----------------------------------------------------------------------- | ---------------------------------------- |
+| `MyCompanyName.MyProjectName.Domain.Shared`                             | Constants, localization, error codes     |
+| `Volo.Abp.Emailing`                                                     | `IEmailSender` interface + `NullEmailSender` |
+| `Volo.Abp.Identity.Domain`                                              | `IdentityUser`, `IdentityRole`, etc.     |
+| `Volo.Abp.PermissionManagement.Domain.Identity`                         | User/role permission grant provider      |
+| `Volo.Abp.BackgroundJobs.Domain`                                        | `BackgroundJobInfo` aggregate            |
+| `Volo.Abp.AuditLogging.Domain`                                          | `AuditLog` aggregate                     |
+| `Volo.Abp.TenantManagement.Domain`                                      | `Tenant`, `TenantConnectionString`       |
+| `Volo.Abp.FeatureManagement.Domain`                                     | Feature value-management aggregates      |
+| `Volo.Abp.SettingManagement.Domain`                                     | `Setting` aggregate                      |
+| `Volo.Abp.OpenIddict.Domain`                                            | OpenIddict application/scope aggregates  |
+| `Volo.Abp.PermissionManagement.Domain.OpenIddict`                       | Permission grants for OpenIddict clients |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameDomainSharedModule),
+    typeof(AbpAuditLoggingDomainModule),
+    typeof(AbpBackgroundJobsDomainModule),
+    typeof(AbpFeatureManagementDomainModule),
+    typeof(AbpIdentityDomainModule),
+    typeof(AbpOpenIddictDomainModule),
+    typeof(AbpPermissionManagementDomainOpenIddictModule),
+    typeof(AbpPermissionManagementDomainIdentityModule),
+    typeof(AbpSettingManagementDomainModule),
+    typeof(AbpTenantManagementDomainModule),
+    typeof(AbpEmailingModule))]
+public class MyProjectNameDomainModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Languages.Add(new LanguageInfo("ar", "ar", "العربية", "ae"));
+            // ... 17 more LanguageInfo registrations
+            options.Languages.Add(new LanguageInfo("es", "es", "Español"));
+        });
+
+        Configure<AbpMultiTenancyOptions>(options =>
+        {
+            options.IsEnabled = MultiTenancyConsts.IsEnabled;
+        });
+
+#if DEBUG
+        context.Services.Replace(ServiceDescriptor.Singleton<IEmailSender, NullEmailSender>());
+#endif
+    }
+}
+```
+
+Three things happen:
+
+1. **Language registration** — the languages that appear in the localization-switch dropdown of the UI. Removing a `LanguageInfo` here removes the language from the menu (the JSON file in `Domain.Shared` is kept for fallback resolution).
+2. **`AbpMultiTenancyOptions.IsEnabled`** — flipped from the single boolean in `MultiTenancyConsts`. This is the authoritative wire-up; any other module that reads `IAbpMultiTenancyOptions` sees the same value.
+3. **`NullEmailSender` in `DEBUG`** — prevents the framework from accidentally sending real emails during local development. In `RELEASE` builds the real `IEmailSender` registered by `Volo.Abp.MailKit` (or any custom replacement) is used.
+
+## Key types
+
+### MyProjectNameConsts
+
+```csharp
+public static class MyProjectNameConsts
+{
+    public const string DbTablePrefix = "App";
+    public const string DbSchema = null;
+}
+```
+
+Every entity you map in `MyProjectNameDbContext.OnModelCreating` should use `MyProjectNameConsts.DbTablePrefix + "YourTable"` for the table name and `MyProjectNameConsts.DbSchema` for the schema. Changing the prefix in one place renames every application table.
+
+### IMyProjectNameDbSchemaMigrator
+
+```csharp
+public interface IMyProjectNameDbSchemaMigrator
+{
+    Task MigrateAsync();
+}
+```
+
+Database-agnostic abstraction implemented twice in the solution:
+
+- `EntityFrameworkCoreMyProjectNameDbSchemaMigrator` — calls `Database.MigrateAsync()` on the EF Core `DbContext`.
+- `MongoDbMyProjectNameDbSchemaMigrator` — initializes Mongo collections via `InitializeCollections`.
+- `NullMyProjectNameDbSchemaMigrator` — fallback used when no database provider is registered (so the migration service can still run end-to-end seed contributors).
+
+### MyProjectNameDbMigrationService
+
+The orchestrator the `DbMigrator` console app calls. Its `MigrateAsync()` method:
+
+1. (EF Core flavour only) Detects the absence of a `Migrations/` folder and triggers `abp create-migration-and-run-migrator` automatically.
+2. Iterates every registered `IMyProjectNameDbSchemaMigrator` for the **host** database, then runs all `IDataSeedContributor` implementations.
+3. Loops over every tenant from `ITenantRepository.GetListAsync()`, switches `ICurrentTenant` to that tenant's ID, migrates the schema if the tenant has its own connection string, and runs the seed contributors again with the tenant context.
+
+The seed call passes the default admin credentials so the Identity module's `IdentityDataSeedContributor` knows what to create:
+
+```csharp
+await _dataSeeder.SeedAsync(new DataSeedContext(tenant?.Id)
+    .WithProperty(IdentityDataSeedContributor.AdminEmailPropertyName,
+        IdentityDataSeedContributor.AdminEmailDefaultValue)
+    .WithProperty(IdentityDataSeedContributor.AdminPasswordPropertyName,
+        IdentityDataSeedContributor.AdminPasswordDefaultValue));
+```
+
+### OpenIddictDataSeedContributor
+
+Implements `IDataSeedContributor` and seeds:
+
+- The application **scope** named `"MyProjectName"`.
+- Up to five OpenIddict applications (`MyProjectName_Web`, `MyProjectName_Blazor`, `MyProjectName_App`, `MyProjectName_BlazorServerTiered`, `MyProjectName_Swagger`) — but only when the matching entries exist in `appsettings.json:OpenIddict:Applications:*`. Missing or whitespace `ClientId` values short-circuit creation.
+
+The contributor reads URLs and secrets from `IConfiguration` so secrets never get hard-coded. Both **confidential** clients (hybrid flow with secret) and **public** clients (PKCE only) are produced depending on the grant types defined in `commonScopes` + per-client overrides.
+
+### Settings
+
+`MyProjectNameSettings` is a constants container. `MyProjectNameSettingDefinitionProvider` registers them with the framework:
+
+```csharp
+public override void Define(ISettingDefinitionContext context)
+{
+    //context.Add(new SettingDefinition(MyProjectNameSettings.MySetting1));
+}
+```
+
+Read settings later via `ISettingProvider.GetAsync(MyProjectNameSettings.MySetting1)` from any application service.
+
+## Customization points
+
+| Need                                  | File / API                                                  |
+| ------------------------------------- | ----------------------------------------------------------- |
+| New aggregate root                    | New folder `Books/Book.cs` in this project                   |
+| New repository interface              | `IBookRepository` next to `Book.cs`                          |
+| New domain service                    | `BookManager : DomainService`                                |
+| New domain event handler              | Class implementing `ILocalEventHandler<EntityChangedEventData<Book>>` |
+| New host setting                      | Constant in `MyProjectNameSettings`, registration in the provider |
+| Additional OpenIddict client          | New entry in `appsettings.json`, then a `CreateApplicationAsync` call in `OpenIddictDataSeedContributor` |
+| Replace `NullEmailSender`             | Add `Volo.Abp.MailKit` and configure SMTP options (the `#if DEBUG` guard ensures it only affects production) |
+| Add a localization language to the UI | New `LanguageInfo` in `MyProjectNameDomainModule` *and* a matching `.json` file in `Domain.Shared/Localization/MyProjectName/` |
+
+## Gotchas
+
+- **`MyProjectNameDbMigrationService` self-bootstraps EF Core migrations.** The first time it runs without a `Migrations/` folder it shells out to `abp create-migration-and-run-migrator`. If the ABP CLI is not on the developer's `PATH` this fails silently — install it with `dotnet tool install -g Volo.Abp.Cli`.
+- **OpenIddict seed runs inside `[UnitOfWork]`.** If you throw from inside `CreateApplicationsAsync` the whole seed is rolled back; deleting an OpenIddict client manually and re-running the DbMigrator will recreate it — but updates to existing entries are not re-applied unless you change the code path.
+- **Per-tenant schema migration is skipped when a tenant has no connection string.** Tenants that share the host database rely on the global migration run; only tenants with `ConnectionStrings.Any()` get an extra `Database.MigrateAsync()` call. The `migratedDatabaseSchemas` `HashSet` deduplicates so two tenants pointing at the same physical database are migrated once.
+- **`NullEmailSender` is registered only in `DEBUG`.** A production deployment without `Volo.Abp.MailKit` will throw `AbpException: ... No service registered for type 'IEmailSender'` the first time the framework tries to send an email — most commonly during password reset or new-user registration.
+- **`MultiTenancyConsts.IsEnabled = false` does not remove the database tables.** It only stops the framework from filtering by `TenantId`. To delete `AbpTenants`/`AbpTenantConnectionStrings` you must remove the `AbpTenantManagement*Module` dependencies and run a new EF Core migration.
+- **Do not reference `EntityFrameworkCore` or `MongoDB` from here.** That would couple the Domain to a specific database technology and break the dual-provider story of the template.

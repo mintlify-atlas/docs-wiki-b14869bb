@@ -1,0 +1,335 @@
+---
+title: "@abp/core"
+description: "The `abp` browser global — appPath, logging, localization, auth, settings, features, notifications, messages, UI block, event bus, and clock — all in one ~820-line script."
+---
+
+`@abp/core` is the **foundation** of every ABP browser-side stack. It is a single hand-written
+JavaScript file, `src/abp.js`, that defines the `abp` global object and ten or so sub-namespaces. Every
+other `@abp/*` pack — jQuery extensions, Toastr notifications, SweetAlert2 messages, the Razor widget
+manager, the CMS Kit comment widget, the virtual file explorer — assumes `abp.*` is already loaded.
+
+## Package metadata
+
+```json
+{
+    "name": "@abp/core",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "@abp/utils": "~7.4.0"
+    }
+}
+```
+
+The only declared dependency is `@abp/utils`. That dependency is **build-time only**: nothing inside
+`abp.js` `require()`s `@abp/utils`. The relationship exists because `abp install-libs` walks the
+dependency tree to decide which folders to copy into `wwwroot/libs`, and consumers that pull `@abp/core`
+also need the `LinkedList<T>` from `@abp/utils` (used by `abp.ui.extensions.ActionList`).
+
+## Files shipped to the browser
+
+```text
+@abp/core/
+├── src/
+│   ├── abp.js     ← 823 lines, defines the `abp` global
+│   └── abp.css    ← cursors and overlay styles for `abp.ui.block`
+└── abp.resourcemapping.js
+```
+
+The resource-mapping file is one line of meaningful config:
+
+```js
+module.exports = {
+    mappings: {
+        "@node_modules/@abp/core/src/*": "@libs/abp/core/"
+    }
+};
+```
+
+After `abp install-libs` you will find `wwwroot/libs/abp/core/abp.js` and `wwwroot/libs/abp/core/abp.css`
+in your Razor project, ready to be referenced from a bundle contributor.
+
+## The `abp` global, namespace by namespace
+
+`abp.js` is wrapped in an IIFE but does not `'use strict'`. It opens with the canonical guard:
+
+```js
+var abp = abp || {};
+(function () {
+    // ...all extensions go here...
+})();
+```
+
+This pattern means a previously loaded script (a CMS Kit widget shipped before `abp.js` is parsed, or a
+unit test that pre-stubs `abp`) can safely seed `abp` and survive re-loading.
+
+### Application paths
+
+```js
+abp.appPath = abp.appPath || '/';
+abp.pageLoadTime = new Date();
+abp.toAbsAppPath = function (path) {
+    if (path.indexOf('/') == 0) { path = path.substring(1); }
+    return abp.appPath + path;
+};
+```
+
+The C# `IAbpRequestLocalizationOptionsProvider` and the `_Layout.cshtml` `<abp-script>` tag helper
+write `abp.appPath = '/<path-base>/';` into a `<script>` block before `abp.js` runs. That is how a
+deployment under `https://example.com/intranet/` correctly resolves XHR URLs.
+
+### Logging
+
+`abp.log` is a thin wrapper over `console.log` with five levels:
+
+```js
+abp.log.levels = { DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4, FATAL: 5 };
+abp.log.level  = abp.log.levels.DEBUG;
+abp.log.debug(msg); abp.log.info(msg); abp.log.warn(msg);
+abp.log.error(msg); abp.log.fatal(msg);
+```
+
+Setting `abp.log.level = abp.log.levels.WARN` from your own bundle silences debug/info noise in
+production without monkey-patching `console`.
+
+### Localization
+
+```js
+abp.localization.values    = {};   // legacy resource bag (key → value)
+abp.localization.resources = {};   // resourceName → { texts, baseResources }
+
+abp.localization.localize     = function (key, sourceName /*, ...args*/) { ... };
+abp.localization.getResource  = function (name) { /* returns function(key, ...args) */ };
+abp.localization.isLocalized  = function (key, sourceName) { ... };
+abp.localization.defaultResourceName = undefined;
+abp.localization.currentCulture      = { /* set by server */ };
+```
+
+The pattern you will see in every CMS Kit and module Razor view:
+
+```html
+<script>
+    var l = abp.localization.getResource('CmsKit');
+    alert(l('CommentDeleted'));
+</script>
+```
+
+`getResource` returns a curried function over `localize`, with placeholders such as `{0}` substituted
+in via `abp.utils.formatString`. `baseResources` lets one resource inherit keys from another (the same
+way `AbpUi` inherits from `AbpValidation` on the server).
+
+### Auth
+
+```js
+abp.auth.grantedPolicies = {};                       // populated by the server-rendered config
+abp.auth.isGranted       = function (policyName) { return abp.auth.grantedPolicies[policyName] === true; };
+abp.auth.isAnyGranted    = function (...policies)  { ... };
+abp.auth.areAllGranted   = function (...policies)  { ... };
+
+abp.auth.tokenCookieName = 'Abp.AuthToken';
+abp.auth.setToken        = function (authToken, expireDate) { ... };
+abp.auth.getToken        = function () { ... };
+abp.auth.clearToken      = function () { ... };
+```
+
+The grant table is filled by the `/api/abp/application-configuration` endpoint that every ABP layout
+calls during page bootstrap. From a Razor view this lets you hide buttons without round-tripping:
+
+```html
+@if (true) {
+    <button id="deleteAll" hidden>Delete All</button>
+}
+<script>
+    if (abp.auth.isGranted('Posts.Delete')) {
+        document.getElementById('deleteAll').removeAttribute('hidden');
+    }
+</script>
+```
+
+### Settings
+
+```js
+abp.setting.values = {};                           // name → string
+abp.setting.get        = function (name) { return abp.setting.values[name]; };
+abp.setting.getBoolean = function (name) { return abp.setting.values[name].toLowerCase() === 'true'; };
+abp.setting.getInt     = function (name) { return parseInt(abp.setting.values[name]); };
+```
+
+Values originate from the .NET `ISettingProvider`. Booleans are stored as strings (`"true"` /
+`"false"`) so the boolean accessor lower-cases before comparing — do not skip it.
+
+### Features
+
+```js
+abp.features.values    = {};                       // name → string
+abp.features.isEnabled = function (name) { return abp.features.values[name].toLowerCase() === 'true'; };
+abp.features.get       = function (name) { return abp.features.values[name]; };
+
+abp.globalFeatures.enabledFeatures = [];           // array of feature names
+abp.globalFeatures.isEnabled       = function (name) { return abp.globalFeatures.enabledFeatures.indexOf(name) > -1; };
+```
+
+`abp.features.*` is per-tenant; `abp.globalFeatures.*` is the host-wide feature catalog. Both are
+populated from `/api/abp/application-configuration`.
+
+### Notifications
+
+```js
+abp.notify.success(message, title, options);
+abp.notify.info   (message, title, options);
+abp.notify.warn   (message, title, options);
+abp.notify.error  (message, title, options);
+```
+
+**`@abp/core` itself ships no-op implementations** — the methods are defined but their bodies are
+empty. The real bodies are installed by `@abp/toastr`'s `abp-toastr.js`, which is included transitively
+through `@abp/aspnetcore.mvc.ui.theme.shared`. If you load `abp.js` without Toastr, `abp.notify.success`
+silently does nothing.
+
+### Messages and confirmations
+
+```js
+abp.message._showMessage = function (message, title) { /* no-op */ };
+abp.message.info   (message, title);
+abp.message.success(message, title);
+abp.message.warn   (message, title);
+abp.message.error  (message, title);
+abp.message.confirm(message, titleOrCallback, callback);
+```
+
+Same story as `notify`: the bodies are no-ops in `@abp/core`. Loading `@abp/sweetalert2`'s
+`abp-sweetalert2.js` swaps them for SweetAlert2-powered modals, and loading `@abp/jquery`'s
+`abp.jquery.js` swaps them for plain `alert()`/`confirm()` fallbacks (in that order). The last script
+on the page wins.
+
+### UI block / busy
+
+```js
+abp.ui.block  ({ elm: '#editForm' });   // overlay + spinner
+abp.ui.unblock({ elm: '#editForm' });
+abp.ui.setBusy   ({ elm: '#editForm' });
+abp.ui.clearBusy ({ elm: '#editForm' });
+```
+
+`block` overlays an opaque `<div>` over an element (or the whole window if `elm` is omitted),
+`setBusy` sets `aria-busy` and adds CSS classes for spinners. The classes are styled by `src/abp.css`.
+
+### Event bus
+
+`abp.event` is an in-page pub/sub:
+
+```js
+abp.event.on     ('myEvent', function (data) { /* ... */ });
+abp.event.off    ('myEvent', handler);
+abp.event.trigger('myEvent', { value: 42 });
+```
+
+The framework itself fires `abp.dynamicForms.*` and `abp.dom.nodeAdded`/`abp.dom.nodeRemoved` events
+(the latter installed by `@abp/jquery` using a `MutationObserver`).
+
+### Utility helpers
+
+`abp.utils` is a grab-bag of small functions:
+
+| Function                                                    | Purpose                                                  |
+| ----------------------------------------------------------- | -------------------------------------------------------- |
+| `abp.utils.createNamespace(root, 'a.b.c')`                  | Create nested objects safely.                            |
+| `abp.utils.replaceAll(str, search, replacement)`            | No-regex replace.                                        |
+| `abp.utils.formatString(format, arg0, arg1, ...)`           | `{0}`/`{1}` placeholder substitution used by localizers. |
+| `abp.utils.toPascalCase(str)` / `toCamelCase(str)`          | Case conversion.                                         |
+| `abp.utils.truncateString(str, n)`                          | Hard truncate.                                           |
+| `abp.utils.truncateStringWithPostfix(str, n, postfix)`      | Truncate + ellipsis (`postfix` defaults to `'...'`).     |
+| `abp.utils.isFunction(obj)`                                 | Polyfill, overridden by `@abp/jquery` to use `$.isFunction`. |
+| `abp.utils.buildQueryString(parameterInfos, includeQuestionMark)` | Build a typed query string with date / boolean handling. |
+| `abp.utils.setCookieValue / getCookieValue / deleteCookie`  | Cookie helpers.                                          |
+| `abp.utils.htmlEscape(html)`                                | Replace `<>&"'` with entities.                           |
+
+### Security
+
+```js
+abp.security.antiForgery.tokenCookieName = 'XSRF-TOKEN';
+abp.security.antiForgery.tokenHeaderName = 'RequestVerificationToken';
+abp.security.antiForgery.getToken        = function () { return abp.utils.getCookieValue('XSRF-TOKEN'); };
+```
+
+ABP's auto-generated dynamic client proxies set the `RequestVerificationToken` request header from
+this cookie — the same mechanism Razor anti-forgery uses, just driven from JS.
+
+### Clock
+
+```js
+abp.clock.kind = 'Unspecified';                    // 'Utc', 'Local', or 'Unspecified'
+abp.clock.supportsMultipleTimezone = function () { return abp.clock.kind === 'Utc'; };
+abp.clock.now = function () { ... };               // returns a Date adjusted to kind
+```
+
+`abp.clock.kind` is set from C# by the `AbpClockOptions`. `now()` produces the same instant whether
+the server is configured for UTC or local time, which keeps front-end calculations consistent across
+deployments.
+
+## Using `@abp/core` in a Razor view
+
+Typical bundle wiring inside `_Layout.cshtml`:
+
+```html
+<abp-style-bundle name="@BasicThemeBundles.Styles.Global" />
+<abp-script-bundle name="@BasicThemeBundles.Scripts.Global" />
+```
+
+The bundle contributor (in C#) declares `abp.css` and `abp.js` from `wwwroot/libs/abp/core/` near the
+top. From any view you can then assume `abp.*` is loaded and call it directly:
+
+```html
+@page
+@model EditPostModel
+
+<form id="postForm" method="post">
+    @* ... *@
+    <button id="saveBtn" type="submit" class="btn btn-primary">Save</button>
+</form>
+
+<script>
+    var l = abp.localization.getResource('Blog');
+
+    $('#postForm').on('submit', function (e) {
+        e.preventDefault();
+        if (!abp.auth.isGranted('Blog.Edit')) {
+            abp.notify.error(l('NotAuthorized'));
+            return;
+        }
+        abp.ui.setBusy('#postForm');
+        // ...post via fetch / dynamic client proxy...
+        abp.message.success(l('PostSaved'));
+    });
+</script>
+```
+
+## Gotchas
+
+- **Don't ship `@abp/core` to a Blazor WebAssembly host.** Those hosts use `abp.aspnetcore.components`
+  packs and rely on `Blazor.start()` callbacks rather than `abp.js`. The Blazor *Server* hosts do load
+  `@abp/core` (via `@abp/aspnetcore.components.server.theming`).
+- **Notification / message methods are no-ops without their backing pack.** Calling
+  `abp.notify.success('Hi')` on a page that only loaded `abp.js` will appear to do nothing — there is
+  no console warning. Always load `@abp/toastr` and `@abp/sweetalert2` (or accept the jQuery fallback).
+- **`abp.appPath` must end with a slash.** The default `/` is correct for root-hosted apps; for
+  sub-folder hosting set it from C# via `<script>abp.appPath = '@(Url.Content("~/"))';</script>` before
+  loading `abp.js` or accept that `<abp-script>` already does this for you.
+- **`abp.setting.getBoolean` calls `.toLowerCase()` without a null check.** If the setting was never
+  registered on the server (`abp.setting.values[name] === undefined`) you get a TypeError. Always guard
+  with `abp.setting.values.hasOwnProperty(name)` or default via `abp.setting.get(name) || 'false'`.
+- **`abp.utils.formatString` only handles positional `{0}` / `{1}` placeholders**, not named ones like
+  `{userName}`. The localization layer relies on this so don't try to extend it with regex; write a
+  separate helper instead.
+- **`abp.event` does not survive page navigation.** It is in-memory; Blazor Server's circuit-aware
+  events use `DotNet.invokeMethod` directly and bypass `abp.event`.
+- **`abp.auth.grantedPolicies` reflects the state at page load.** Granting a permission server-side
+  during the page lifetime requires re-fetching `/api/abp/application-configuration` (the `abp.start()`
+  helper in `@abp/jquery` does this).
+
+## Related pages
+
+- [`@abp/utils`](/npm/utils) — the Angular library `@abp/core` declares as a dependency.
+- [`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) — the meta-pack that
+  guarantees Toastr/SweetAlert2/jQuery are loaded so the no-op methods above acquire real bodies.
+- [`@abp/third-party-packs`](/npm/third-party-packs) — for the `abp.resourcemapping.js` DSL.

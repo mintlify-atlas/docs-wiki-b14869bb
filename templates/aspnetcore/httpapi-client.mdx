@@ -1,0 +1,136 @@
+---
+title: "HttpApi.Client Project"
+description: "Dynamic C# HTTP client proxies generated from the Application.Contracts interfaces — let any .NET caller use IApplicationService methods as if they were local."
+---
+
+`MyCompanyName.MyProjectName.HttpApi.Client` lets a .NET client — Blazor WebAssembly, MAUI, a console tool, a microservice — call your HTTP API through the **same `IApplicationService` interfaces** the server implements. The framework substitutes a dynamic proxy at runtime that converts each interface method into the matching HTTP request/response.
+
+Because the same DTO classes from `Application.Contracts` are used on both sides, no DTO duplication is required and Swagger schemas remain canonical. The project multi-targets `netstandard2.0`, `netstandard2.1` and `net7.0` so it can be referenced from any .NET-compatible client.
+
+## When to put code here
+
+The project is usually **build-time only** — there is nothing to add unless you want to:
+
+- Customize the HTTP behaviour (custom `DelegatingHandler`, retry policies).
+- Override the remote service URL per-environment from code instead of `appsettings.json`.
+- Wrap the generated proxies with your own caching layer.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.HttpApi.Client/
+├── MyCompanyName.MyProjectName.HttpApi.Client.csproj
+└── MyProjectNameHttpApiClientModule.cs
+```
+
+The directory is intentionally small. Each `*.HttpApi.Client` module of the depended ABP modules carries an embedded `*generate-proxy.json` file describing its action methods; ABP loads these manifests through the virtual file system at startup.
+
+## csproj at a glance
+
+| Property            | Value                                              |
+| ------------------- | -------------------------------------------------- |
+| `TargetFrameworks`  | `netstandard2.0;netstandard2.1;net7.0`             |
+| `Nullable`          | `enable`                                           |
+| `RootNamespace`     | `MyCompanyName.MyProjectName`                      |
+| `EmbeddedResource`  | `**\*generate-proxy.json`                          |
+
+| Project reference                                                              | Purpose                                          |
+| ------------------------------------------------------------------------------ | ------------------------------------------------ |
+| `MyCompanyName.MyProjectName.Application.Contracts`                            | Service interfaces and DTOs to proxy             |
+| `Volo.Abp.Account.HttpApi.Client`                                              | Account proxies                                  |
+| `Volo.Abp.Identity.HttpApi.Client`                                             | Identity proxies                                 |
+| `Volo.Abp.PermissionManagement.HttpApi.Client`                                 | Permission proxies                               |
+| `Volo.Abp.TenantManagement.HttpApi.Client`                                     | Tenant proxies                                   |
+| `Volo.Abp.FeatureManagement.HttpApi.Client`                                    | Feature proxies                                  |
+| `Volo.Abp.SettingManagement.HttpApi.Client`                                    | Setting proxies                                  |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameApplicationContractsModule),
+    typeof(AbpAccountHttpApiClientModule),
+    typeof(AbpIdentityHttpApiClientModule),
+    typeof(AbpPermissionManagementHttpApiClientModule),
+    typeof(AbpTenantManagementHttpApiClientModule),
+    typeof(AbpFeatureManagementHttpApiClientModule),
+    typeof(AbpSettingManagementHttpApiClientModule))]
+public class MyProjectNameHttpApiClientModule : AbpModule
+{
+    public const string RemoteServiceName = "Default";
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClientProxies(
+            typeof(MyProjectNameApplicationContractsModule).Assembly,
+            RemoteServiceName);
+
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<MyProjectNameHttpApiClientModule>();
+        });
+    }
+}
+```
+
+Two important calls:
+
+1. **`AddHttpClientProxies(assembly, RemoteServiceName)`** — scans `Application.Contracts.dll` for every `IApplicationService`-derived interface and registers a transparent client implementation against the named remote service. `Volo.Abp.Http.Client` (transitively pulled in) reads the endpoint metadata from the embedded `generate-proxy.json` files.
+2. **`FileSets.AddEmbedded<MyProjectNameHttpApiClientModule>()`** — the proxy manifest files are embedded resources; this registration exposes them through the virtual file system.
+
+The `const string RemoteServiceName = "Default"` matches the section name under `RemoteServices` in `appsettings.json`. Change it to point a specific assembly at a different remote service:
+
+```json
+"RemoteServices": {
+  "Default":   { "BaseUrl": "https://localhost:44300/" },
+  "Inventory": { "BaseUrl": "https://inventory.example.com/" }
+}
+```
+
+## How clients use the proxies
+
+```csharp
+public class OrdersPage : ComponentBase
+{
+    [Inject] public IBookAppService BookService { get; set; } = default!;
+
+    private List<BookDto> _books = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        var result = await BookService.GetListAsync(new PagedAndSortedResultRequestDto());
+        _books = result.Items.ToList();
+    }
+}
+```
+
+`BookService` is **not** the server-side implementation; it is a `DynamicHttpProxy<IBookAppService>` produced by `Volo.Abp.Http.Client.DynamicProxying`. The call serializes the input DTO to JSON, issues `GET /api/app/book`, deserializes the response, and surfaces ABP `RemoteServiceException`s for non-2xx responses.
+
+## Wiring authentication
+
+In a Blazor WebAssembly project the OIDC handler injected by `MyProjectNameBlazorModule` automatically attaches access tokens to every `HttpClient` request. In a console client you wire it manually:
+
+```csharp
+[DependsOn(typeof(AbpHttpClientIdentityModelModule))]
+public class MyConsoleModule : AbpModule { }
+```
+
+`AbpHttpClientIdentityModelModule` reads `IdentityClientConfiguration` and obtains tokens via the client-credentials grant before every call.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Custom `DelegatingHandler`            | `context.Services.AddHttpClient(...).AddHttpMessageHandler<T>()` |
+| Override the remote service URL       | `appsettings.json` `RemoteServices` section                       |
+| Different timeout / Polly retry       | `context.Services.AddHttpClient("Default").AddPolicyHandler(...)` |
+| Distinct remote service per assembly  | Call `AddHttpClientProxies` with different `RemoteServiceName`   |
+
+## Gotchas
+
+- **The HTTP proxies are dynamic.** There is no generated `BookAppServiceClient.cs` file you can step into; the runtime emits the proxy on first resolution. Errors during proxy build appear as `AbpException` during DI resolution, not at build time.
+- **Embedded `generate-proxy.json` files matter.** Removing the `EmbeddedResource` glob from the csproj breaks the proxies silently — the framework falls back to convention-based routing and may target the wrong URL.
+- **The `RemoteServiceName` is case-insensitive but must match a configuration section.** A typo like `Defualt` produces `AbpException: ... remote service ... not found` only at first call.
+- **Blazor WebAssembly clients pull this assembly through `MyProjectName.Blazor.csproj`.** Don't reference `Microsoft.EntityFrameworkCore` or any server-only NuGet from here or the WASM publish step will reject the build.
+- **`AddHttpClientProxies` is greedy.** Every interface deriving from `IRemoteService` (or `IApplicationService`) in the supplied assembly is wired. If you want to hide an interface from the client surface, add `[RemoteService(IsEnabled = false)]` to the interface declaration in `Application.Contracts`.
+- **`HttpApi.Client` does not reference `HttpApi`.** Bringing in `HttpApi` would load `Volo.Abp.AspNetCore.Mvc` and pollute a client app with server-only dependencies; the client only needs the contracts.

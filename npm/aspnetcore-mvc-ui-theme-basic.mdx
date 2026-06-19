@@ -1,0 +1,205 @@
+---
+title: "@abp/aspnetcore.mvc.ui.theme.basic"
+description: "The Basic theme npm package — depends on theme.shared and adds the `layout.js`/`layout.css` that drive the navbar sub-dropdowns of the default ABP MVC application."
+---
+
+`@abp/aspnetcore.mvc.ui.theme.basic` is the npm side of the **Basic theme**, ABP's free, open-source
+default for MVC/Razor applications. The pack itself is tiny: one dependency on
+[`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) and a `README.md`. The
+actual theme assets (`layout.js`, `layout.css`, SCSS variables, partial views) live in the .NET
+project `Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic` and are served as embedded resources / static files,
+not via npm.
+
+## Package metadata
+
+```json
+{
+    "name": "@abp/aspnetcore.mvc.ui.theme.basic",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "@abp/aspnetcore.mvc.ui.theme.shared": "~7.4.0"
+    }
+}
+```
+
+That is **all** there is in the npm package. One dependency, one purpose: make sure that when a
+consumer's `package.json` lists `@abp/aspnetcore.mvc.ui.theme.basic`, the full theme.shared dependency
+tree (jQuery, Bootstrap, DataTables, Toastr, SweetAlert2, Select2, Luxon, …) is installed and visible
+to `abp install-libs`.
+
+## Files shipped to the browser
+
+The npm tarball contains no `src/`, no `abp.resourcemapping.js`, no JS, no CSS. The Razor-side files
+that *feel* like they belong here come from the .NET project at
+`modules/basic-theme/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic/wwwroot/themes/basic/`:
+
+```text
+themes/basic/
+├── layout.js           ← navbar dropdown-submenu toggle
+└── layout.css          ← cosmetic styling for navbar, cards, modals
+```
+
+These are streamed to the browser via the .NET `IStaticFilesContributor` pipeline, so they appear
+under `wwwroot/themes/basic/layout.js` whether you `abp install-libs` or not. The bundle contributor
+[`BasicThemeBundles.Scripts.Global`](https://github.com/abpframework/abp/tree/dev/modules/basic-theme/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic)
+references them along with every file pulled in by `theme.shared`.
+
+### `layout.js` — the one piece of theme code
+
+The entire file is 16 lines and handles Bootstrap 5's dropdown-submenu behaviour, which Bootstrap
+itself does not ship:
+
+```js
+$(function () {
+    $('.dropdown-menu a.dropdown-toggle').on('click', function (e) {
+        if (!$(this).next().hasClass('show')) {
+            $(this).parents('.dropdown-menu').first()
+                   .find('.show').removeClass('show');
+        }
+
+        var $subMenu = $(this).next('.dropdown-menu');
+        $subMenu.toggleClass('show');
+
+        $(this).parents('li.nav-item.dropdown.show').on('hidden.bs.dropdown', function (e) {
+            $('.dropdown-submenu .show').removeClass('show');
+        });
+
+        return false;
+    });
+});
+```
+
+What it does:
+
+- Intercepts clicks on dropdown items that themselves have `.dropdown-toggle`.
+- Toggles `.show` on the *next sibling* `.dropdown-menu`, allowing a second-level menu to open in
+  place rather than triggering Bootstrap's own dropdown-close behaviour.
+- Cleans up `.show` from sibling sub-menus so only one branch is open at a time.
+- Registers a `hidden.bs.dropdown` listener on the top-level `nav-item` so closing the parent collapses
+  all open sub-menus.
+- Returns `false` to prevent the default `<a>` navigation.
+
+This is the JS that makes the ABP main-navbar look like:
+
+```text
+Administration ▸
+    Identity         ▸
+        Users
+        Roles
+        Organization Units
+    Tenant Management
+    Settings
+```
+
+work on desktop with Bootstrap 5 — without it, sub-menus collapse the parent dropdown on hover.
+
+### `layout.css` — companion stylesheet
+
+`layout.css` defines:
+
+```css
+#main-navbar-tools a.dropdown-toggle { text-decoration: none; color: #fff; }
+
+.navbar .dropdown-submenu          { position: relative; }
+.navbar .dropdown-menu             { margin: 0; padding: 0; }
+.navbar .dropdown-menu a           { font-size: .9em; padding: 10px 15px; ... }
+
+.navbar .dropdown-submenu a::after { transform: rotate(-90deg); position: absolute; ... }
+.navbar .dropdown-submenu .dropdown-menu { top: 0; left: 100%; }
+
+.card-header .btn { padding: 2px 6px; }
+.card-header h5   { margin: 0; }
+```
+
+It styles the sub-dropdown indicator (the rotated caret), the card-header button density (so the
+shipped `<abp-button>` placements in cards look right), and a handful of edge cases for the modal
+footer and table headers. The full file is around 250 lines and ABP intends it to be a starting point
+that themes derived from Basic can override or extend.
+
+## How a Razor app installs the Basic theme
+
+Typical `MyApp.Web/package.json`:
+
+```json
+{
+    "version": "1.0.0",
+    "name":    "my-app",
+    "private": true,
+    "dependencies": {
+        "@abp/aspnetcore.mvc.ui.theme.basic": "~7.4.0"
+    }
+}
+```
+
+After `npm install` followed by `abp install-libs`, every file under `wwwroot/libs` is provisioned —
+not because *this* pack ships them, but because its dependency chain does.
+
+The `.NET` side then needs the corresponding theme NuGet package and `[DependsOn(typeof(AbpAspNetCoreMvcUiBasicThemeModule))]`
+in the app module. Razor pages reference both via:
+
+```html
+@inject IThemeManager ThemeManager
+@{
+    var theme = ThemeManager.CurrentTheme;
+}
+
+<abp-style-bundle name="@theme.GetGlobalStyleBundleName()" />
+<abp-script-bundle name="@theme.GetGlobalScriptBundleName()" />
+```
+
+When `CurrentTheme` is the Basic theme, those bundle names resolve to `BasicThemeBundles.Styles.Global`
+and `BasicThemeBundles.Scripts.Global`, which include `layout.js`, `layout.css`, every file from
+`theme.shared`, and (transitively) every third-party library.
+
+## Razor view example
+
+A typical Basic-themed page does not import anything theme-specific; everything is automatic via the
+`<abp-style-bundle>`/`<abp-script-bundle>` tag helpers. But you can rely on the layout JS, for example,
+to add another level of nav:
+
+```html
+@page
+<ul class="navbar-nav">
+    <li class="nav-item dropdown">
+        <a class="nav-link dropdown-toggle" href="#">Reports</a>
+        <ul class="dropdown-menu">
+            <li class="dropdown-submenu">
+                <a class="dropdown-item dropdown-toggle" href="#">Financials</a>
+                <ul class="dropdown-menu">
+                    <li><a class="dropdown-item" asp-page="/Reports/Revenue">Revenue</a></li>
+                    <li><a class="dropdown-item" asp-page="/Reports/Costs">Costs</a></li>
+                </ul>
+            </li>
+            <li><a class="dropdown-item" asp-page="/Reports/Users">Users</a></li>
+        </ul>
+    </li>
+</ul>
+```
+
+The CSS markers `.dropdown-submenu` and `.dropdown-toggle` are what `layout.js` keys off; no extra
+JavaScript is needed in your page.
+
+## Gotchas
+
+- **The pack ships nothing on its own**, so adding `@abp/aspnetcore.mvc.ui.theme.basic` and forgetting
+  to run `abp install-libs` will not give you Bootstrap. The dependency tree is purely declarative.
+- **`layout.js` is jQuery-dependent.** It uses `$('.dropdown-menu a.dropdown-toggle').on('click', ...)`
+  inside `$(function () { ... })`. If you remove jQuery from your project (e.g. moving to LeptonX),
+  this file becomes dead weight; LeptonX ships its own equivalent.
+- **Click handler returns `false`.** It both prevents default and stops propagation. Don't rely on
+  bubble-up `click` listeners on sub-menu items reaching `document` — attach them to the items directly.
+- **The CSS targets `#main-navbar-tools`** by ID. If you rename or duplicate that section in a custom
+  `_Layout.cshtml`, the colour overrides won't apply.
+- **The version pin (`~7.4.0`) is tilde-range.** Patch releases of `theme.shared` come in automatically,
+  but a minor bump in `theme.shared` requires bumping `theme.basic` too — keep them in lock-step.
+- **There is no `abp.resourcemapping.js`.** If you want to add custom JS that travels with the theme,
+  create one in your project — don't try to add it to this pack.
+
+## Related pages
+
+- [`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) — the meta-package this
+  pack inherits.
+- [`@abp/aspnetcore.components.server.basictheme`](/npm/aspnetcore-components-server-basictheme) —
+  the Blazor Server flavour of the same theme.
+- The .NET-side [Basic theme documentation](/framework/ui/mvc-razor-pages/theme-system/basic-theme).

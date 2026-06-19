@@ -1,0 +1,158 @@
+---
+title: "NPM Packs Overview"
+description: "How ABP ships browser-side JavaScript and CSS through the @abp scoped npm packages, the resource-mapping pipeline, and the dependency graph that wires the MVC/Razor UI together."
+---
+
+ABP applications are .NET on the server, but every Razor page, Blazor Server theme, and CMS Kit widget
+ships a meaningful amount of **browser-side code**. That code is not bundled into the .NET assemblies —
+it lives in a parallel set of **scoped npm packages** under the `@abp/*` organisation, all published
+from the [`npm/packs`](https://github.com/abpframework/abp/tree/dev/npm/packs) folder of the framework
+repository. The 15 pages in this section document every pack a Razor / MVC / Blazor Server developer
+will encounter, what each one exports, and how they slot into the build pipeline.
+
+## Why npm at all
+
+A vanilla ASP.NET Core project usually pulls JavaScript via LibMan, CDNs, or `wwwroot/lib/*`. ABP picks
+npm for three concrete reasons:
+
+1. **Version pinning** — every `@abp/*` package locks the precise upstream version of jQuery, Bootstrap,
+   DataTables, SweetAlert2, Toastr, Luxon, etc. that the framework has been tested against. You update
+   one ABP version and every transitive dependency moves in lockstep.
+2. **Resource mapping** — each pack ships an `abp.resourcemapping.js` file that the `Volo.Abp.Cli`
+   `abp install-libs` command reads to copy only the **needed** files out of `node_modules` and into
+   `wwwroot/libs`. That is how the framework keeps `wwwroot/libs` small without forcing you to write
+   gulp tasks by hand.
+3. **Meta-packages** — `@abp/aspnetcore.mvc.ui.theme.shared` does not contain code of its own; it is a
+   single `package.json` whose `dependencies` block aggregates the 16 third-party packs every MVC UI
+   needs. Installing one package installs the whole UI stack.
+
+## The dependency graph
+
+The packs covered by this section form a directed graph. Arrows mean "depends on":
+
+```
+@abp/utils
+   ▲
+   │
+@abp/core
+   ▲
+   │ (via consumer code, not declared)
+   │
+@abp/aspnetcore.mvc.ui ───────────────► gulp build helpers (publish-time only)
+   ▲
+   │
+@abp/aspnetcore.mvc.ui.theme.shared ──► @abp/bootstrap, @abp/jquery-validation-unobtrusive,
+   ▲                                     @abp/datatables.net-bs5, @abp/sweetalert2,
+   │                                     @abp/toastr, @abp/luxon, @abp/select2, …
+   │
+@abp/aspnetcore.mvc.ui.theme.basic    (basic theme = shared + opinionated SCSS)
+
+@abp/aspnetcore.components.server.theming ──► @abp/bootstrap, @abp/font-awesome
+   ▲
+   │
+@abp/aspnetcore.components.server.basictheme
+
+@abp/cms-kit ───► @abp/cms-kit.admin (jstree, slugify, codemirror, tui-editor, uppy)
+            └──► @abp/cms-kit.public (highlight.js, star-rating-svg)
+
+@abp/blogging              ───► theme.shared + owl.carousel + prismjs + tui-editor
+@abp/virtual-file-explorer ───► clipboard + prismjs
+@abp/vue                   ───► vue (no abp code, only resource mapping)
+```
+
+The dotted line between `@abp/core` and `@abp/aspnetcore.mvc.ui` is real but **declared by the consumer
+project**, not by the pack itself. The MVC UI pack contains only Gulp build helpers (`copy-resources.js`)
+that the framework uses when it publishes new versions of `@abp/*`; it does not require `@abp/core`
+because the consumer always installs `@abp/core` (or one of its transitive ancestors like
+`@abp/jquery`) separately.
+
+## Anatomy of an `@abp/*` package
+
+Every pack ships a tiny, predictable layout. Using `@abp/core@7.4.0` as the canonical example:
+
+```text
+@abp/core/
+├── package.json              ← name, version, dependencies
+├── README.md                 ← marketing blurb, links back to docs
+├── abp.resourcemapping.js    ← glob → wwwroot/libs mapping table
+└── src/
+    ├── abp.js                ← the global `abp` namespace
+    └── abp.css               ← a handful of busy-state and overlay styles
+```
+
+The pieces a Razor/Blazor Server developer cares about are:
+
+- `package.json` → `dependencies` declares which third-party packs come along for the ride.
+- `abp.resourcemapping.js` → tells `abp install-libs` what to copy.
+- `src/*.js` → the actual code that lands in `wwwroot/libs/abp/<package>/` and is referenced from your
+  `_Layout.cshtml` via `<abp-script>` tag helpers.
+
+A few packs ship a **bundled** distribution instead of raw `src/`. `@abp/utils` is the notable example:
+it is an Angular `ng-packagr` library and exposes a `dist/bundles/abp-utils.umd.js` UMD bundle (alongside
+ES module variants for the Angular CLI). See the [utils page](/npm/utils) for the full story.
+
+## How files get from npm into your wwwroot
+
+Three pieces collaborate:
+
+1. **`package.json` in your Razor app** lists the `@abp/*` packs you need. For a typical MVC project
+   that is just `@abp/aspnetcore.mvc.ui.theme.basic` (or `theme.leptonx-lite`), which transitively
+   pulls in everything else.
+2. **`abp install-libs`** (or its Gulp predecessor, `gulp build`) walks every installed package, looks
+   for an `abp.resourcemapping.js`, evaluates the `mappings` table, and copies files from
+   `node_modules/...` into `wwwroot/libs/...`.
+3. **Bundling tag helpers** — `<abp-script-bundle name="...">` and `<abp-style-bundle name="...">`
+   in your `_Layout.cshtml` reference contributors declared in C# (the
+   `BasicThemeBundles.Scripts.Global` / `Styles.Global` constants); those contributors enumerate the
+   files that were copied into `wwwroot/libs`.
+
+The `abp.resourcemapping.js` files follow a single shape. From `@abp/core`:
+
+```js
+module.exports = {
+    mappings: {
+        "@node_modules/@abp/core/src/*": "@libs/abp/core/"
+    }
+};
+```
+
+`@node_modules` and `@libs` are aliases resolved by `abp install-libs` against the project root and
+`wwwroot/libs` respectively. Globs are POSIX; trailing slash on the value means "preserve the original
+filename inside that directory".
+
+## Page-by-page guide
+
+| Page                                                                                                  | What it covers                                                                       |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [`npm/core`](/npm/core)                                                                               | The `abp` global, `abp.localization`, `abp.auth`, `abp.notify`, `abp.message`, more. |
+| [`npm/utils`](/npm/utils)                                                                             | The `@abp/utils` Angular library and its `LinkedList<T>` data structure.             |
+| [`npm/aspnetcore-mvc-ui`](/npm/aspnetcore-mvc-ui)                                                     | Build-time Gulp helpers that copy `wwwroot/libs` (Razor only).                       |
+| [`npm/aspnetcore-mvc-ui-theme-shared`](/npm/aspnetcore-mvc-ui-theme-shared)                           | The meta-pack that aggregates jQuery, Bootstrap, DataTables, Toastr, SweetAlert2…    |
+| [`npm/aspnetcore-mvc-ui-theme-basic`](/npm/aspnetcore-mvc-ui-theme-basic)                             | The Basic theme: layout JS for sub-dropdowns.                                        |
+| [`npm/aspnetcore-components-server-theming`](/npm/aspnetcore-components-server-theming)               | Blazor Server bootstrap + Font Awesome wiring.                                       |
+| [`npm/aspnetcore-components-server-basictheme`](/npm/aspnetcore-components-server-basictheme)         | Blazor Server flavour of the Basic theme.                                            |
+| [`npm/cms-kit`](/npm/cms-kit)                                                                         | CMS Kit umbrella package.                                                            |
+| [`npm/cms-kit-admin`](/npm/cms-kit-admin)                                                             | Admin widgets: jsTree menus, slugify, tag editor, TUI editor, Uppy uploader.         |
+| [`npm/cms-kit-public`](/npm/cms-kit-public)                                                           | Public-facing widgets: commenting, ratings, syntax highlighting.                     |
+| [`npm/blogging`](/npm/blogging)                                                                       | Blogging module UI: Owl Carousel + Prism + TUI editor.                               |
+| [`npm/virtual-file-explorer`](/npm/virtual-file-explorer)                                             | The `/VirtualFileExplorer` admin tree.                                               |
+| [`npm/vue-pack`](/npm/vue-pack)                                                                       | The `@abp/vue` resource-mapping helper.                                              |
+| [`npm/third-party-packs`](/npm/third-party-packs)                                                     | Catalog of every other `@abp/<library>` pack and the `abp.resourcemapping.js` DSL.   |
+
+## What this section is _not_
+
+- It is **not** the documentation for the Angular SDK (`@abp/ng.core`, `@abp/ng.theme.lepton-x`, …).
+  Those live in their own [Angular UI section](/framework/ui/angular/quick-start).
+- It is **not** the documentation for `abp-cli` or `volo`. Those are .NET tools that consume these
+  packs but are documented separately.
+- It is **not** an exhaustive reference for every function inside `abp.js`. The framework's own
+  [JavaScript API reference](/framework/ui/mvc-razor-pages/javascript-api/) is the canonical source of
+  truth for that. These pages instead focus on *which pack ships what* and *how to consume it from a
+  Razor view*.
+
+Use this section when you need to:
+
+- Decide which `@abp/*` package you must add to `package.json` to get a particular API.
+- Trace why a particular file appeared in `wwwroot/libs/...` after `abp install-libs`.
+- Override an ABP-shipped JS component with your own implementation by knowing which file to replace.
+- Slim down a project by removing packs whose features you do not use (and understanding what breaks).

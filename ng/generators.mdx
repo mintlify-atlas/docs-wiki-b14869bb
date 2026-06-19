@@ -1,0 +1,306 @@
+---
+title: "@abp/nx.generators"
+description: "Nx generators that wrap @abp/ng.schematics — generate-proxy, change-theme, and update-version — for Nx monorepos."
+---
+
+`@abp/nx.generators` is the [Nx](https://nx.dev) front-end for `@abp/ng.schematics`. Nx workspaces don't call Angular Devkit schematics directly — they call Nx *generators*, which receive an `nx/devkit` `Tree` instead of the Angular Devkit `Tree`. This package supplies three generators that wrap the underlying schematics with `wrapAngularDevkitSchematic` so they work seamlessly inside an Nx monorepo.
+
+The task at hand mentions a Yeoman `generator-abp` — that historically existed alongside ABP's tooling, but the Angular workspace no longer ships it. The Nx generators in `packages/generators/` are the supported successor.
+
+## File tree
+
+```text
+packages/generators/
+├── package.json            # "@abp/nx.generators" — version 7.4.0
+├── generators.json
+├── jest.config.ts
+├── tsconfig.json
+└── src/
+    ├── index.ts
+    └── generators/
+        ├── generate-proxy/
+        │   ├── generator.ts
+        │   ├── schema.json
+        │   └── schema.d.ts
+        ├── change-theme/
+        │   ├── generator.ts
+        │   ├── schema.json
+        │   ├── schema.d.ts
+        │   ├── theme-options.enum.ts
+        │   └── generator.spec.ts
+        └── update-version/
+            ├── generator.ts
+            ├── schema.json
+            ├── schema.d.ts
+            └── utils.ts
+```
+
+## `generators.json`
+
+The manifest Nx reads:
+
+```json
+{
+  "generators": {
+    "generate-proxy": {
+      "factory":     "./src/generators/generate-proxy/generator",
+      "schema":      "./src/generators/generate-proxy/schema.json",
+      "description": "generate-proxy generator"
+    },
+    "update-version": {
+      "factory":     "./src/generators/update-version/generator",
+      "schema":      "./src/generators/update-version/schema.json",
+      "description": "update-version generator"
+    },
+    "change-theme": {
+      "factory":     "./src/generators/change-theme/generator",
+      "schema":      "./src/generators/change-theme/schema.json",
+      "description": "change-theme generator"
+    }
+  }
+}
+```
+
+## `src/index.ts`
+
+```typescript
+// packages/generators/src/index.ts
+export * from './generators/change-theme';
+export * from './generators/generate-proxy';
+export * from './generators/update-version';
+```
+
+Re-exports the generators so they can be imported programmatically (`runExecutor`-style scenarios), not just from the CLI.
+
+## generate-proxy
+
+The thinnest wrapper of the three — it adapts the schema to `proxy-add` and runs it through Nx's Angular Devkit adapter:
+
+```typescript
+// packages/generators/src/generators/generate-proxy/generator.ts
+import { GenerateProxyGeneratorSchema } from './schema';
+import { Tree } from '@nrwl/devkit';
+import { wrapAngularDevkitSchematic } from '@nx/devkit/ngcli-adapter';
+
+export default async function (host: Tree, schema: GenerateProxyGeneratorSchema) {
+  const runAngularLibrarySchematic = wrapAngularDevkitSchematic('@abp/ng.schematics', 'proxy-add');
+
+  await runAngularLibrarySchematic(host, {
+    ...schema,
+  });
+
+  return () => {
+    console.log(`proxy added '${schema.target}`);
+  };
+}
+```
+
+The returned task callback is invoked by Nx after all generator changes are committed to disk — perfect place for follow-up log lines.
+
+### Schema (mirrors proxy-add)
+
+```json
+{
+  "module":      "app",
+  "apiName":     "default",
+  "source":      "MyApp",
+  "target":      "MyApp",
+  "url":         "https://api.local",
+  "serviceType": "application | integration | all",
+  "entryPoint":  ""
+}
+```
+
+### Running it
+
+```bash
+nx g @abp/nx.generators:generate-proxy --module=identity --apiName=AbpIdentity --target=admin
+```
+
+The CLI also accepts positional arguments:
+
+```bash
+nx g @abp/nx.generators:generate-proxy identity AbpIdentity admin admin
+```
+
+## change-theme
+
+Swaps the styles section of `angular.json` to the chosen theme, delegating the heavy lifting to `@abp/ng.schematics:change-theme`:
+
+```typescript
+// packages/generators/src/generators/change-theme/generator.ts
+import { Tree } from '@nx/devkit';
+import { wrapAngularDevkitSchematic } from '@nx/devkit/ngcli-adapter';
+import { ChangeThemeGeneratorSchema } from './schema';
+import { ThemeOptionsEnum } from './theme-options.enum';
+
+export async function changeThemeGenerator(host: Tree, schema: ChangeThemeGeneratorSchema) {
+  const schematicPath = schema.localPath || '@abp/ng.schematics';
+
+  const runAngularLibrarySchematic = wrapAngularDevkitSchematic(
+    schema.localPath ? `${host.root}${schematicPath}` : schematicPath,
+    'change-theme',
+  );
+
+  await runAngularLibrarySchematic(host, { ...schema });
+
+  return () => {
+    const destTheme = Object.values(ThemeOptionsEnum).find(
+      (theme, index) => index + 1 === schema.name,
+    );
+    console.log(`✅️ Switched to Theme ${destTheme}`);
+  };
+}
+
+export default changeThemeGenerator;
+```
+
+`localPath` is the escape hatch for monorepo contributors that want to run a locally-built `@abp/ng.schematics`. When unset the generator resolves the published package from the workspace `node_modules`.
+
+### Schema
+
+```json
+{
+  "name":          1 | 2 | 3 | 4,
+  "targetProject": "admin",
+  "localPath":     ""
+}
+```
+
+Numeric values map to:
+
+```typescript
+// packages/generators/src/generators/change-theme/theme-options.enum.ts
+export enum ThemeOptionsEnum {
+  Basic       = 1,
+  Lepton      = 2,
+  LeptonXLite = 3,
+  LeptonX     = 4,
+}
+```
+
+This mirrors the C# `Volo.Abp.Cli.ProjectBuilding.Building.Theme` enum, keeping CLI and Angular generator behaviours aligned across language stacks.
+
+### Running it
+
+```bash
+nx g @abp/nx.generators:change-theme --name=4 --targetProject=admin
+```
+
+## update-version
+
+Bulk-bump the ABP / LeptonX versions across every `package.json` in the workspace:
+
+```typescript
+// packages/generators/src/generators/update-version/generator.ts
+import { Tree, updateJson } from '@nx/devkit';
+import { UpdateVersionGeneratorSchema } from './schema';
+import { getPackageJsonList, getVersionByPackageNameFactory, semverRegex } from './utils';
+
+export function updateVersionGenerator(tree: Tree, schema: UpdateVersionGeneratorSchema) {
+  const packageJsonList = getPackageJsonList(tree, schema.packages || []);
+  const getVersionNumberByPackageName = getVersionByPackageNameFactory(
+    schema.abpVersion,
+    schema.leptonXVersion,
+  );
+  packageJsonList.forEach(path => {
+    updateJson(tree, path, pkgJson => {
+      pkgJson.version = getVersionNumberByPackageName(pkgJson.name) || pkgJson.version;
+      console.log('\x1b[32m', `Updated ${pkgJson.name} version to ${pkgJson.version}`);
+
+      Object.keys(pkgJson.dependencies || {}).forEach(key => {
+        const v = getVersionNumberByPackageName(key);
+        if (!v) return;
+        pkgJson.dependencies[key] = pkgJson.dependencies[key].replace(semverRegex, v);
+        console.log('\x1b[32m', `Updated   ${key} version to ${v} in dependencies`);
+      });
+
+      Object.keys(pkgJson.peerDependencies || {}).forEach(key => {
+        const v = getVersionNumberByPackageName(key);
+        if (!v) return;
+        pkgJson.peerDependencies[key] = pkgJson.peerDependencies[key].replace(semverRegex, v);
+        /* … */
+      });
+
+      return pkgJson;
+    });
+  });
+}
+```
+
+It walks every library project (skipping a blocklist of internal packages such as `apex-chart-components`, `bs-components`, `workspace-plugin`) and rewrites the version fields. Both `dependencies` and `peerDependencies` get the SemVer prefix preserved (`^7.3.0` ⇒ `^7.4.0`, not `7.4.0`).
+
+```typescript
+// packages/generators/src/generators/update-version/utils.ts (excerpt)
+export const IGNORED_PROJECT_NAMES = ['apex-chart-components', 'bs-components', 'workspace-plugin'];
+
+export function getPackageJsonList(tree: Tree, packages: string[]): string[] {
+  const project = getProjects(tree);
+  const result = ['/package.json'];
+  project.forEach((value, key) => {
+    if (value.projectType !== 'library') return;
+    if (IGNORED_PROJECT_NAMES.some(x => x === key)) return;
+    const projectConfiguration = readProjectConfiguration(tree, key);
+    if (packages.length && !packages.includes(value.name)) return;
+    result.push(projectConfiguration.root + '/package.json');
+  });
+  return result;
+}
+```
+
+### Schema
+
+```json
+{
+  "abpVersion":     "7.4.0",
+  "leptonXVersion": "2.4.0"
+}
+```
+
+`abpVersion` is required; `leptonXVersion` is optional and only applied to LeptonX packages.
+
+### Running it
+
+```bash
+nx g @abp/nx.generators:update-version --abpVersion=7.4.1 --leptonXVersion=2.4.1
+```
+
+## Package metadata
+
+```json
+// packages/generators/package.json
+{
+  "name":       "@abp/nx.generators",
+  "version":    "7.4.0",
+  "homepage":   "https://abp.io",
+  "generators": "./generators.json",
+  "type":       "commonjs",
+  "publishConfig": { "access": "public" }
+}
+```
+
+`"type": "commonjs"` is required because Nx loads generator factories with `require()`. The schematic counterparts in `@abp/ng.schematics` are also CJS for the same reason.
+
+## When to use which
+
+| Scenario | Use |
+| -------- | --- |
+| Greenfield Angular CLI app | `ng generate @abp/ng.schematics:<command>` |
+| Nx monorepo (single or multi-app) | `nx g @abp/nx.generators:<command>` |
+| ABP CLI (`abp generate-proxy`) | Auto-detects and calls the right one |
+
+The Angular schematics package is the source of truth for behaviour; the Nx generators are mostly thin adapters that handle Nx's project graph and `Tree` differences.
+
+## Gotchas
+
+* `wrapAngularDevkitSchematic('@abp/ng.schematics', 'proxy-add')` resolves the schematics package from the workspace's `node_modules`. If you've linked a local build (`npm link`), pass `--localPath` to point at the linked folder.
+* `update-version` skips three specific libraries by name (`apex-chart-components`, `bs-components`, `workspace-plugin`). Adding your own internal-only libraries to that list requires forking the generator.
+* The `change-theme` generator only modifies `angular.json` and `package.json`. After running it you still need `npm install` (Nx will print a reminder) and you may need to wipe `dist/` before the next build.
+* `generate-proxy` re-runs the API fetch every time — there is no caching layer. CI pipelines that regenerate proxies should grant the runner network access to the backend's metadata endpoint.
+* Generators run synchronously per project; running multiple `nx g @abp/nx.generators:generate-proxy` in parallel against the same project will trample `proxy-config.json`.
+
+## Related pages
+
+* `ng/schematics.mdx` — the schematics that do the actual work.
+* `ng/core.mdx` — `EnvironmentService.getApiUrl` and `RestService` consume the proxies these generators produce.
+* `ng/dev-app.mdx` — the playground used to verify generator output end-to-end.

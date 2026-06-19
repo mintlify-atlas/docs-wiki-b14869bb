@@ -1,0 +1,256 @@
+---
+title: "MinIO"
+description: "External-service reference for MinIO and other S3-compatible on-prem object stores — Volo.Abp.BlobStoring.Minio provider, endpoint and TLS setup, bucket policy, and operational notes."
+---
+
+`Volo.Abp.BlobStoring.Minio` is an ABP `IBlobProvider` for MinIO (and any S3 API-compatible store reachable via the `Minio` .NET SDK). It targets self-hosted deployments — MinIO on Kubernetes, Docker, bare-metal — and exposes path-style addressing out of the box.
+
+For the ABP-side BLOB abstraction see [Blob Storing](/framework/imaging-blob/blob-storing) and the [MinIO provider page](/framework/imaging-blob/blob-storing-minio).
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.BlobStoring.Minio` | `AbpBlobStoringMinioModule` |
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule))]
+public class AbpBlobStoringMinioModule : AbpModule { }
+```
+
+Wire it per container:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseMinio(minio =>
+        {
+            minio.EndPoint   = "minio.internal:9000";
+            minio.AccessKey  = "...";
+            minio.SecretKey  = "...";
+            minio.BucketName = "catalog-blobs";
+            minio.WithSSL    = true;
+            minio.CreateBucketIfNotExists = true;
+        });
+    });
+});
+```
+
+## Provider configuration keys
+
+`Volo.Abp.BlobStoring.Minio.MinioBlobProviderConfigurationNames`:
+
+```csharp
+public const string BucketName             = "Minio.BucketName";
+public const string EndPoint               = "Minio.EndPoint";
+public const string AccessKey              = "Minio.AccessKey";
+public const string SecretKey              = "Minio.SecretKey";
+public const string WithSSL                = "Minio.WithSSL";
+public const string CreateBucketIfNotExists= "Minio.CreateBucketIfNotExists";
+```
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `Minio.EndPoint` | string | Hostname **without** scheme, optional port. E.g. `minio.internal:9000`. |
+| `Minio.AccessKey` | string | MinIO access key (or root user). |
+| `Minio.SecretKey` | string | MinIO secret key. |
+| `Minio.WithSSL` | bool | `true` to use HTTPS. The SDK builds `https://<endpoint>`. |
+| `Minio.BucketName` | string | Bucket name; lowercase, 3–63 chars, S3-compliant. |
+| `Minio.CreateBucketIfNotExists` | bool | `true` → `MakeBucketAsync` on first use. |
+
+## MinIO version requirements
+
+| MinIO release | ABP compatibility |
+| --- | --- |
+| **RELEASE.2023-xx through RELEASE.2024-xx** | ✅ recommended |
+| LTS / Subscription Network builds | ✅ |
+| MinIO Gateway (deprecated) | ❌ — replaced by sidecar replication; use newer mirroring instead. |
+
+The integration uses the `Minio` NuGet (community SDK by MinIO Inc.). It speaks the S3 API; any conforming server (Ceph RGW, OpenIO, Garage, Storj S3 gateway) usually works, but for those the AWS package or a custom factory may be a better fit.
+
+## Distributed deployment
+
+For production:
+
+- Deploy MinIO in **distributed mode** with 4, 8, 12 or 16 nodes (multiples of 4). Erasure-code shards across nodes.
+- Front it with a load balancer (HAProxy, MetalLB, NGINX) that distributes to all nodes; the SDK only needs one stable endpoint.
+- Run the **MinIO Console** on a separate port (default 9001) for admin UI.
+- For Kubernetes, use the **MinIO Operator** — it manages tenants, certificates, and exposed services.
+
+## Sample `appsettings.json`
+
+```json
+{
+  "MinioBlobStorage": {
+    "EndPoint": "minio.internal:9000",
+    "AccessKey": "catalog-service",
+    "SecretKey": "Sup3rS3cret!",
+    "BucketName": "catalog-blobs",
+    "WithSSL": true,
+    "CreateBucketIfNotExists": true
+  }
+}
+```
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseMinio(minio =>
+        {
+            minio.EndPoint   = configuration["MinioBlobStorage:EndPoint"];
+            minio.AccessKey  = configuration["MinioBlobStorage:AccessKey"];
+            minio.SecretKey  = configuration["MinioBlobStorage:SecretKey"];
+            minio.BucketName = configuration["MinioBlobStorage:BucketName"];
+            minio.WithSSL    = bool.Parse(configuration["MinioBlobStorage:WithSSL"] ?? "false");
+            minio.CreateBucketIfNotExists =
+                bool.Parse(configuration["MinioBlobStorage:CreateBucketIfNotExists"] ?? "false");
+        });
+    });
+});
+```
+
+## TLS
+
+Always use TLS in production. Options:
+
+1. **MinIO-managed certs.** Drop a cert chain into `/root/.minio/certs/public.crt` and key into `/root/.minio/certs/private.key`. Restart.
+2. **MinIO Operator + cert-manager.** The operator provisions and rotates certificates automatically.
+3. **TLS termination at the LB.** Set `Minio.WithSSL=true` so the SDK uses HTTPS to the LB; the LB talks plaintext to backends inside the cluster.
+
+If you use a private CA, mount the CA bundle into the pod and trust it system-wide (or set `SSL_CERT_FILE`).
+
+## Bucket policies and users
+
+MinIO supports both built-in **IAM users / groups / policies** and external OIDC / LDAP identity providers. For ABP services, create a dedicated user per service with a policy like:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::catalog-blobs",
+        "arn:aws:s3:::catalog-blobs/*"
+      ]
+    }
+  ]
+}
+```
+
+Attach the policy and use `mc admin user add minio catalog-service ...` + `mc admin policy attach`.
+
+Add `s3:CreateBucket` only if `CreateBucketIfNotExists=true`.
+
+## Bucket configuration
+
+| Setting | Recommendation |
+| --- | --- |
+| Versioning | Enable in production. |
+| Object Lock | Optional (WORM). |
+| Encryption | SSE-S3 (server-side) by default; SSE-KMS via KES for stronger control. |
+| Lifecycle | Use tiering to archive old objects to remote tiers. |
+| Replication | Site replication for HA across data centres. |
+
+## Multipart and limits
+
+| Limit | Value |
+| --- | --- |
+| Object size | up to 5 TiB per object |
+| Single PUT | 5 GiB |
+| Multipart parts | 10 000 parts × 5 GiB each |
+| Bucket name | 3–63 chars, lowercase, no underscores |
+
+The `Minio` SDK switches to multipart automatically for streams larger than 5 GiB.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `MinioException: Unable to connect to the server` | Wrong endpoint, wrong scheme (HTTPS vs HTTP), TLS cert untrusted. | Verify endpoint, set `WithSSL` correctly, trust CA. |
+| `Access Denied` | Policy missing or attached to wrong user. | Use `mc admin policy attach` to verify. |
+| `BucketNotFound` | Bucket missing and `CreateBucketIfNotExists=false`. | Toggle the flag or pre-create with `mc mb`. |
+| `Connection refused` from one pod, works from another | LB health check missing one of the 4 distributed nodes. | Inspect LB health, restart faulty node, ensure quorum (n/2+1). |
+| Slow uploads | Disk healing in progress on MinIO cluster. | `mc admin heal` to inspect; consider scheduling heals. |
+| `Object size exceeds maximum` | Single PUT > 5 GiB without multipart. | Ensure the SDK is current; SDK should auto-multipart. |
+| `403 SignatureDoesNotMatch` | Clock skew between client and server > 5 min. | Sync NTP. |
+| Bucket policy ignored | Policy attached at wrong scope (user vs group). | Use `mc admin policy entities`. |
+
+## Observability hints
+
+- **Prometheus.** MinIO exposes `/minio/v2/metrics/cluster` (cluster-wide) and `/minio/v2/metrics/node` (per node). Key metrics: `minio_cluster_capacity_usable_total_bytes`, `minio_cluster_disk_offline_total`, `minio_s3_requests_total{api}`, `minio_s3_requests_errors_total`.
+- **Console UI.** Visualises buckets, IAM, replication, traffic.
+- **Audit logs.** Enable to a webhook / Elasticsearch / Kafka target via `mc admin config set audit_webhook:1 ...`. Logs every S3 op with user, IP, key.
+- **Tracing.** Add OpenTelemetry instrumentation to the `Minio` HTTP client; spans carry method and bucket name.
+- **Healing.** `mc admin heal -r` should be kept green; persistent healing means a disk is failing.
+
+## Multi-tenant considerations
+
+- The provider writes blobs as `<tenant-id>/<blob-name>` within a single bucket by default — the multi-tenant blob calculator from `Volo.Abp.BlobStoring`.
+- For per-tenant **buckets** (e.g. legal residency), implement `IBlobContainerConfigurationProvider` that picks `Minio.BucketName` based on `ICurrentTenant.Id`. Pre-create buckets via your provisioning step.
+
+## Presigned URLs
+
+The `Minio` .NET SDK exposes `PresignedPutObjectAsync` / `PresignedGetObjectAsync` for browser-direct uploads. ABP's provider doesn't surface them — use the SDK from an application service:
+
+```csharp
+var client = new MinioClient()
+    .WithEndpoint("minio.internal:9000")
+    .WithCredentials("catalog-service", "Sup3rS3cret!")
+    .WithSSL()
+    .Build();
+
+var url = await client.PresignedPutObjectAsync(new PresignedPutObjectArgs()
+    .WithBucket("catalog-blobs")
+    .WithObject($"{tenantId}/{filename}")
+    .WithExpiry(900));
+```
+
+## Bucket policies
+
+For public-read buckets (rare for ABP), set a bucket policy via `mc anonymous set download minio/catalog-blobs`. Most ABP workloads should remain private and use server-signed URLs for sharing.
+
+## Replication
+
+MinIO supports **site replication** (multi-cluster, multi-direction) and **bucket replication** (one-way, similar to S3 CRR). Configure with `mc admin replicate add` and `mc replicate add`. Once enabled, every write is asynchronously copied. Replication uses the same access keys; configure a dedicated replication user with `s3:GetReplicationConfiguration` + `s3:ReplicateObject`.
+
+## KES + KMS
+
+For SSE-KMS, deploy **KES** (Key Encryption Service) alongside MinIO. KES brokers requests to HashiCorp Vault, AWS KMS, GCP KMS, Azure Key Vault, Thales CipherTrust. Set the bucket default encryption to `SSE-KMS` and MinIO will fetch data-encryption keys from KES on each PUT. ABP code unchanged — encryption is transparent.
+
+## Multi-tenant deployments via Operator
+
+The MinIO Operator's `Tenant` CRD provisions an isolated MinIO cluster (4+ pods) per logical tenant — usually overkill for ABP per-app-tenant isolation. Use one MinIO tenant for the whole platform and rely on prefix isolation or per-customer-bucket isolation.
+
+## Erasure-code overhead
+
+In distributed mode with `EC:4` (4 parity blocks out of 16 drives), usable storage is ~75% of raw. Plan capacity with that in mind. `mc admin info` shows usable vs raw.
+
+## Migration from filesystem provider
+
+For deployments moving from `Volo.Abp.BlobStoring.FileSystem` to MinIO:
+
+1. Spin up MinIO with the same bucket layout (`mc mb minio/catalog-blobs`).
+2. Use `mc mirror` to upload the existing files: `mc mirror ./blobs minio/catalog-blobs`.
+3. Switch ABP configuration; restart.
+4. Run a parallel verification (count + checksum) before deleting the source.
+
+## Console SSO
+
+The MinIO Console can use OIDC against your ABP OpenIddict (or any OIDC provider). Set `mc admin config set minio/identity_openid` with your provider URL — admins can then log in with the same identity as the rest of the platform.
+
+## Related references
+
+- [Blob Storing](/framework/imaging-blob/blob-storing) — container/abstractions.
+- [Blob Storing — MinIO](/framework/imaging-blob/blob-storing-minio) — provider internals.
+- [AWS S3](/reference/integrations/aws-s3) — managed-cloud sibling.

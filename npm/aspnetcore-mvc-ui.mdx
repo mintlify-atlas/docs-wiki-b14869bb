@@ -1,0 +1,253 @@
+---
+title: "@abp/aspnetcore.mvc.ui"
+description: "The Gulp build helper at the root of the MVC UI npm stack. Ships `gulp/copy-resources.js`, the engine behind every `abp.resourcemapping.js` file consumed by `abp install-libs`."
+---
+
+`@abp/aspnetcore.mvc.ui` is a peculiar pack — it ships **no browser-side code at all**. Its purpose is
+to provide the **Gulp task** that walks every `abp.resourcemapping.js` file under `node_modules/` and
+copies the listed files into `wwwroot/libs`. Modern projects rarely call this Gulp task directly
+because the `abp install-libs` CLI command supersedes it, but the underlying algorithm — globs, alias
+substitution, `clean` patterns — is identical.
+
+## Package metadata
+
+```json
+{
+    "name": "@abp/aspnetcore.mvc.ui",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "ansi-colors":   "^4.1.1",
+        "extend-object": "^1.0.0",
+        "glob":          "^7.1.6",
+        "gulp":          "^4.0.2",
+        "merge-stream":  "^2.0.0",
+        "micromatch":    "^4.0.2"
+    }
+}
+```
+
+Every dependency is a **build-time tool**: Gulp itself, `glob`/`micromatch` for resolving patterns,
+`merge-stream` for parallel piping, `extend-object` for the `clean`/`mappings` merge, and
+`ansi-colors` for log output.
+
+Notice: there is no dependency on `@abp/core` and no `main` field. Requiring this package from a Node
+script gives you exactly one function.
+
+## Files shipped
+
+```text
+@abp/aspnetcore.mvc.ui/
+├── package.json
+├── gulp/
+│   └── copy-resources.js       ← the only meaningful file
+└── README.md
+```
+
+No `src/`, no CSS, no `abp.resourcemapping.js` of its own. The package is a Gulp library.
+
+## What `copy-resources.js` does
+
+The exported function:
+
+```js
+// gulp/copy-resources.js
+"use strict";
+(function () {
+    var gulp         = require("gulp"),
+        merge        = require("merge-stream"),
+        fs           = require('fs'),
+        glob         = require('glob'),
+        micromatch   = require('micromatch'),
+        path         = require("path"),
+        extendObject = require('extend-object');
+
+    // ... internal helpers ...
+
+    function copyResourcesTask(rootPath) {
+        resourceMapping = normalizeResourceMapping(buildResourceMapping(rootPath));
+        cleanDirsAndFiles(resourceMapping.clean);
+
+        var tasks = [];
+        if (resourceMapping.mappings) {
+            for (var mapping in resourceMapping.mappings) {
+                if (resourceMapping.mappings.hasOwnProperty(mapping)) {
+                    var destination = replaceAliases(resourceMapping.mappings[mapping]);
+                    if (fs.existsSync(destination)) continue;
+
+                    var source = replaceAliases(mapping);
+                    tasks.push(gulp.src(source).pipe(gulp.dest(destination)));
+                }
+            }
+        }
+        return merge(tasks);
+    }
+
+    module.exports = copyResourcesTask;
+})();
+```
+
+The algorithm in plain English:
+
+1. **Walk `node_modules`** starting at `rootPath`. For every package, look for a top-level
+   `abp.resourcemapping.js`. If present, `require()` it and `extend-object` its `clean` and `mappings`
+   into a global resource map. Recurse into the package's own `node_modules` so transitive deps with
+   their own mappings are picked up.
+2. **Resolve aliases** — by convention, `@node_modules` is replaced with the absolute path to the
+   project's `node_modules` folder and `@libs` with the absolute path to `wwwroot/libs`. The aliases
+   table itself is merged from each pack so a custom theme can declare its own.
+3. **Clean** — every glob in `resourceMapping.clean` is enumerated and `unlink`ed. This is how the
+   default Bootstrap CSS in `wwwroot/libs/bootstrap/` is wiped before the LeptonX-styled version is
+   written.
+4. **Copy** — for each source → destination pair in `mappings`, run `gulp.src(source).pipe(gulp.dest(destination))`.
+   `gulp.src` honours globs (`*`, `**`, `?`). If the destination file already exists, the copy is
+   skipped (`if (fs.existsSync(destination)) continue;`).
+5. **Merge** all the gulp streams into a single returned task so the caller can `await` completion.
+
+## Authoring a Gulpfile (legacy)
+
+Pre-CLI projects used to ship a top-level `gulpfile.js`:
+
+```js
+// gulpfile.js
+const gulp          = require('gulp');
+const copyResources = require('@abp/aspnetcore.mvc.ui/gulp/copy-resources');
+
+gulp.task('build', () => copyResources(__dirname));
+
+gulp.task('default', gulp.series('build'));
+```
+
+Then `npx gulp build` walked every pack in `node_modules/@abp/*` and produced `wwwroot/libs`. The
+`abp install-libs` command from the .NET CLI re-implements the same logic in C# (using `Microsoft.JSInterop`
+to evaluate `abp.resourcemapping.js`) so you no longer need Gulp at runtime, but the file format and
+semantics are unchanged.
+
+## What `abp.resourcemapping.js` files look like
+
+Three real examples shipped by sibling packs:
+
+```js
+// @abp/core
+module.exports = {
+    mappings: {
+        "@node_modules/@abp/core/src/*": "@libs/abp/core/"
+    }
+};
+```
+
+```js
+// @abp/bootstrap
+module.exports = {
+    mappings: {
+        "@node_modules/bootstrap/dist/css/bootstrap.css*":     "@libs/bootstrap/css/",
+        "@node_modules/bootstrap/dist/css/bootstrap.min.css*": "@libs/bootstrap/css/",
+        "@node_modules/bootstrap/dist/css/bootstrap.rtl.css*": "@libs/bootstrap/css/",
+        "@node_modules/bootstrap/dist/css/bootstrap.rtl.min.css*": "@libs/bootstrap/css/",
+        "@node_modules/bootstrap/dist/js/bootstrap.bundle*":   "@libs/bootstrap/js/",
+        "@node_modules/@abp/bootstrap/src/*.*":                "@libs/bootstrap/js/"
+    }
+};
+```
+
+```js
+// @abp/font-awesome
+module.exports = {
+    mappings: {
+        "@node_modules/@fortawesome/fontawesome-free/css/all.css":        "@libs/@fortawesome/fontawesome-free/css/",
+        "@node_modules/@fortawesome/fontawesome-free/css/v4-shims.css":   "@libs/@fortawesome/fontawesome-free/css/",
+        "@node_modules/@fortawesome/fontawesome-free/webfonts/*.*":       "@libs/@fortawesome/fontawesome-free/webfonts/"
+    }
+};
+```
+
+A few rules emerge:
+
+- `@node_modules/` and `@libs/` are the standard aliases. Don't hard-code absolute paths.
+- The destination must end in `/` for the matched files' original basenames to be preserved. Without
+  the trailing slash the entire glob result is concatenated into one file.
+- Glob `*.*` matches files with an extension; `*` matches everything including directories. Inside
+  the Gulp pipeline directories are walked recursively only if you write `**/*`.
+- `.css*` includes `.css` and `.css.map` in one rule.
+- Multiple keys with the same value-prefix get merged — there is no de-duplication, just append.
+
+## What gets copied for a default Razor project
+
+After `abp install-libs` in a basic MVC/Razor project the relevant slice of `wwwroot/libs/` looks like:
+
+```text
+wwwroot/libs/
+├── abp/
+│   ├── core/                       ← from @abp/core
+│   │   ├── abp.css
+│   │   └── abp.js
+│   ├── utils/                      ← from @abp/utils
+│   │   ├── abp-utils.umd.js
+│   │   └── abp-utils.umd.min.js
+│   ├── jquery/abp.jquery.js        ← from @abp/jquery
+│   ├── luxon/abp.luxon.js          ← from @abp/luxon
+│   └── aspnetcore-mvc-ui-theme-shared/
+│       ├── jquery/widget-manager.js
+│       ├── jquery/jquery-extensions.js
+│       ├── bootstrap/modal-manager.js
+│       ├── bootstrap/dom-event-handlers.js
+│       ├── jquery-form/jquery-form-extensions.js
+│       ├── datatables/datatables-extensions.js
+│       ├── toastr/abp-toastr.js
+│       ├── sweetalert2/abp-sweetalert2.js
+│       └── ui-extensions.js
+├── bootstrap/
+│   ├── css/bootstrap.min.css
+│   └── js/bootstrap.bundle.min.js
+├── @fortawesome/fontawesome-free/{css,webfonts}/
+└── jquery/jquery.min.js
+```
+
+That layout is what the `BasicThemeBundles.Scripts.Global` and `Styles.Global` contributors reference
+from C#.
+
+## Razor view considerations
+
+You never reference `@abp/aspnetcore.mvc.ui` from a `.cshtml` file. The pack lives in `package.json`
+exclusively as a build-time dependency:
+
+```json
+{
+    "name": "MyApp.Web",
+    "version": "1.0.0",
+    "dependencies": {
+        "@abp/aspnetcore.mvc.ui.theme.basic": "~7.4.0"
+    }
+}
+```
+
+`@abp/aspnetcore.mvc.ui.theme.basic` depends on `@abp/aspnetcore.mvc.ui.theme.shared`, which depends
+on `@abp/aspnetcore.mvc.ui`, so the Gulp helper ends up under `node_modules/@abp/aspnetcore.mvc.ui/`
+without your project listing it explicitly.
+
+## Gotchas
+
+- **Existence check skips re-copy.** `if (fs.existsSync(destination)) continue;` means subsequent
+  `install-libs` runs will not overwrite files that already exist. If you upgrade `@abp/bootstrap` and
+  your bundled CSS does not change, run `abp install-libs --force` (or `npx gulp build` after wiping
+  `wwwroot/libs`) — the `clean` rules from your project's `abp.resourcemapping.js` cover this in
+  normal flows.
+- **Globs are file-only by default.** `@node_modules/foo/dist/*` will not recurse into subdirectories;
+  you need `@node_modules/foo/dist/**/*` for that. Most ABP packs are deliberately flat so this rarely
+  matters.
+- **The Gulp task is synchronous to your build, asynchronous to Node.** Returning the merged stream
+  is mandatory; if you forget `return merge(tasks);` Gulp 4 will warn `task did not complete`.
+- **Alias replacement is regex-based.** `replaceAliases` uses `new RegExp(alias, 'g')`. If you add a
+  custom alias that contains regex meta-characters (`@my$lib`) you will get surprising results — keep
+  aliases alphanumeric.
+- **Don't import `@abp/aspnetcore.mvc.ui` from a Razor `<script>`.** It is Node-only; loading it in a
+  browser blows up at the `require('gulp')` line. The pack contains nothing the browser needs.
+
+## Related pages
+
+- [`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) — the immediate
+  consumer; its dependency tree pulls in every third-party pack the MVC UI uses.
+- [`@abp/third-party-packs`](/npm/third-party-packs) — a catalog of every `@abp/<library>` shim and
+  the `abp.resourcemapping.js` they ship.
+- The .NET-side [`abp install-libs` CLI command](/framework/cli/) for the modern alternative to
+  `npx gulp build`.

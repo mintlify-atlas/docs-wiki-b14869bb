@@ -1,0 +1,262 @@
+---
+title: "Blazor.Server.Tiered Project"
+description: "Tiered Blazor Server host that consumes the HTTP API and AuthServer through OpenID Connect — the UI tier when --tiered is specified for blazor-server solutions."
+---
+
+`MyCompanyName.MyProjectName.Blazor.Server.Tiered` is the **tiered** flavour of the Blazor Server host, generated when you run `abp new ... -u blazor-server --tiered`. Like [Web.Host](/templates/aspnetcore/web-host), it does **not** reference the Application or EntityFrameworkCore projects — application services are reached over HTTP through `HttpApi.Client`, and authentication is delegated to a separate [AuthServer](/templates/aspnetcore/authserver).
+
+The architecture is:
+
+```
+Browser  ⇄  Blazor.Server.Tiered (this project, port 44309)  [SignalR circuit + server-rendered UI]
+                    ⇄ AuthServer (port 44301)  via OpenID Connect (Hybrid + PKCE)
+                    ⇄ HttpApi.Host (port 44300) via HTTP, access token forwarded
+```
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.Blazor.Server.Tiered/
+├── Components/
+│   └── ...
+├── Controllers/
+│   └── ...
+├── Menus/
+│   ├── MyProjectNameMenuContributor.cs
+│   └── MyProjectNameMenus.cs
+├── Pages/
+│   └── ...
+├── Properties/
+│   └── launchSettings.json
+├── wwwroot/
+│   └── ...
+├── MyCompanyName.MyProjectName.Blazor.Server.Tiered.csproj
+├── MyProjectNameBlazorModule.cs
+├── MyProjectNameBrandingProvider.cs
+├── MyProjectNameComponentBase.cs
+├── Program.cs
+├── _Imports.razor
+├── abp.resourcemapping.js
+├── appsettings.Development.json
+├── appsettings.json
+├── package.json
+└── web.config
+```
+
+The `Components/` and `Controllers/` folders exist because tiered Blazor Server runs additional MVC controllers — typically a sign-in callback controller required by the OIDC handler.
+
+## csproj at a glance
+
+| Property                        | Value                                              |
+| ------------------------------- | -------------------------------------------------- |
+| `Sdk`                           | `Microsoft.NET.Sdk.Web`                            |
+| `TargetFramework`               | `net7.0`                                           |
+| `PreserveCompilationReferences` | `true`                                             |
+
+| Project / Package reference                                                                 | Purpose                                |
+| ------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `Blazorise.Bootstrap5` (`1.3.1`)                                                            | Component library                      |
+| `Blazorise.Icons.FontAwesome` (`1.3.1`)                                                     | Icons                                  |
+| `Microsoft.AspNetCore.DataProtection.StackExchangeRedis` (`7.0.10`)                         | Shared keyring                         |
+| `DistributedLock.Redis` (`1.0.2`)                                                           | Distributed lock primitive             |
+| `MyCompanyName.MyProjectName.HttpApi.Client`                                                | HTTP proxies for app services          |
+| `Volo.Abp.Caching.StackExchangeRedis`                                                       | Distributed cache                      |
+| `Volo.Abp.DistributedLocking`                                                               | Distributed lock provider              |
+| `Volo.Abp.AspNetCore.Mvc.Client`                                                            | MVC client integration                 |
+| `Volo.Abp.AspNetCore.Authentication.OpenIdConnect`                                          | OIDC client middleware                 |
+| `Volo.Abp.Http.Client.IdentityModel.Web`                                                    | Token-acquisition helpers              |
+| `Volo.Abp.Autofac`                                                                          | Property-injection DI                  |
+| `Volo.Abp.Swashbuckle`                                                                      | Swagger UI                             |
+| `Volo.Abp.AspNetCore.Serilog`                                                               | Logging                                |
+| `Volo.Abp.Identity.Blazor.Server`                                                           | User/role admin components             |
+| `Volo.Abp.TenantManagement.Blazor.Server`                                                   | Tenant admin components                |
+| `Volo.Abp.SettingManagement.Blazor.Server`                                                  | Settings components                    |
+| `Volo.Abp.AspNetCore.Components.Server.LeptonXLiteTheme` (`2.4.*-*`)                        | Blazor theme                           |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite` (`2.4.*-*`)                                  | MVC + Account UI theme                 |
+
+There is **no** reference to `Application`, `EntityFrameworkCore`, or `Domain`. Doing so would re-introduce the same in-process coupling the tiered split is designed to avoid.
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameHttpApiClientModule),
+    typeof(AbpCachingStackExchangeRedisModule),
+    typeof(AbpDistributedLockingModule),
+    typeof(AbpAspNetCoreMvcClientModule),
+    typeof(AbpAspNetCoreAuthenticationOpenIdConnectModule),
+    typeof(AbpHttpClientIdentityModelWebModule),
+    typeof(AbpAspNetCoreComponentsServerLeptonXLiteThemeModule),
+    typeof(AbpAspNetCoreMvcUiLeptonXLiteThemeModule),
+    typeof(AbpAutofacModule),
+    typeof(AbpSwashbuckleModule),
+    typeof(AbpAspNetCoreSerilogModule),
+    typeof(AbpIdentityBlazorServerModule),
+    typeof(AbpTenantManagementBlazorServerModule),
+    typeof(AbpSettingManagementBlazorServerModule))]
+public class MyProjectNameBlazorModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+        {
+            options.AddAssemblyResource(
+                typeof(MyProjectNameResource),
+                typeof(MyProjectNameDomainSharedModule).Assembly,
+                typeof(MyProjectNameApplicationContractsModule).Assembly,
+                typeof(MyProjectNameBlazorModule).Assembly);
+        });
+    }
+}
+```
+
+The `AddAssemblyResource` list omits `Domain` and `Application` because those assemblies are not referenced — only `Domain.Shared` and `Application.Contracts` flow through `HttpApi.Client`.
+
+### Authentication
+
+```csharp
+context.Services.AddAuthentication(options =>
+    {
+        options.DefaultScheme = "Cookies";
+        options.DefaultChallengeScheme = "oidc";
+    })
+    .AddCookie("Cookies", options =>
+    {
+        options.ExpireTimeSpan = TimeSpan.FromDays(365);
+        options.IntrospectAccessToken();
+    })
+    .AddAbpOpenIdConnect("oidc", options =>
+    {
+        options.Authority = configuration["AuthServer:Authority"];
+        options.RequireHttpsMetadata = Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+        options.ResponseType = OpenIdConnectResponseType.CodeIdToken;
+        options.ClientId = configuration["AuthServer:ClientId"];
+        options.ClientSecret = configuration["AuthServer:ClientSecret"];
+        options.SaveTokens = true;
+        options.GetClaimsFromUserInfoEndpoint = true;
+        options.Scope.Add("roles");
+        options.Scope.Add("email");
+        options.Scope.Add("phone");
+        options.Scope.Add("MyProjectName");
+    });
+```
+
+Three differences from the WASM flavour:
+
+- **Hybrid flow** (`CodeIdToken`) — a confidential client with a secret.
+- **`IntrospectAccessToken()`** on the cookie — periodically validates the access token against the AuthServer; revoked tokens kick the user out the next request.
+- **`SaveTokens = true`** — the access token is persisted inside the cookie so `Volo.Abp.Http.Client.IdentityModel.Web` can forward it to the HttpApi.Host on every API call.
+
+### Bundles
+
+```csharp
+options.StyleBundles.Configure(
+    LeptonXLiteThemeBundles.Styles.Global,
+    bundle => bundle.AddFiles("/global-styles.css"));
+
+options.StyleBundles.Configure(
+    BlazorLeptonXLiteThemeBundles.Styles.Global,
+    bundle =>
+    {
+        bundle.AddFiles("/blazor-global-styles.css");
+        bundle.AddFiles("/MyCompanyName.MyProjectName.Blazor.Server.Tiered.styles.css");
+    });
+```
+
+Two bundles, one for MVC (login page renders MVC) and one for Blazor components.
+
+### Cache, multi-tenancy, URLs
+
+```csharp
+Configure<AbpDistributedCacheOptions>(options => { options.KeyPrefix = "MyProjectName:"; });
+Configure<AbpMultiTenancyOptions>(options => { options.IsEnabled = MultiTenancyConsts.IsEnabled; });
+Configure<AppUrlOptions>(options => { options.Applications["MVC"].RootUrl = configuration["App:SelfUrl"]; });
+```
+
+### Data protection + distributed lock
+
+Same Redis-backed pattern as the other hosts. Required when scaling horizontally so SignalR circuits and cookies can survive a node failover.
+
+## Program.cs
+
+Same Serilog + `WebApplicationBuilder` + Autofac + `AddApplicationAsync<MyProjectNameBlazorModule>()` pattern as the other Blazor Server hosts.
+
+## appsettings.json
+
+```json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44309"
+  },
+  "RemoteServices": {
+    "Default": { "BaseUrl": "https://localhost:44300/" }
+  },
+  "Redis": { "Configuration": "127.0.0.1" },
+  "AuthServer": {
+    "Authority": "https://localhost:44301",
+    "RequireHttpsMetadata": "true",
+    "ClientId": "MyProjectName_BlazorServerTiered",
+    "ClientSecret": "1q2w3e*"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+Notice the three URLs and the confidential client credentials. Replace `ClientSecret` with a generated value in production.
+
+The matching seed entry lives in `DbMigrator/appsettings.json`:
+
+```json
+"MyProjectName_BlazorServerTiered": {
+  "ClientId": "MyProjectName_BlazorServerTiered",
+  "ClientSecret": "1q2w3e*",
+  "RootUrl": "https://localhost:44309"
+}
+```
+
+The `OpenIddictDataSeedContributor` picks up the secret and registers the client as confidential with Hybrid flow.
+
+## OnApplicationInitialization
+
+```csharp
+app.UseAbpRequestLocalization();
+if (!env.IsDevelopment()) app.UseErrorPage();
+app.UseCorrelationId();
+app.UseStaticFiles();
+app.UseRouting();
+app.UseAuthentication();
+if (MultiTenancyConsts.IsEnabled) app.UseMultiTenancy();
+app.UseUnitOfWork();
+app.UseAuthorization();
+app.UseSwagger();
+app.UseAbpSwaggerUI(...);
+app.UseAuditing();
+app.UseAbpSerilogEnrichers();
+app.UseConfiguredEndpoints();
+```
+
+There is no `UseAbpOpenIddictValidation()` — this host is a client, not an issuer.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Custom page                           | `Pages/MyPage.razor` with `@page "/my-page"`                     |
+| Custom menu                           | `MyProjectNameMenuContributor`                                    |
+| Custom branding                       | `MyProjectNameBrandingProvider`                                  |
+| Add a CSS file                        | `BlazorLeptonXLiteThemeBundles.Styles.Global` configuration       |
+| Extra scope                           | `options.Scope.Add("...")` in `ConfigureAuthentication`           |
+| Different remote API base URL         | `RemoteServices.Default.BaseUrl` in `appsettings.json`           |
+
+## Gotchas
+
+- **`IntrospectAccessToken()` requires a network call every request.** Disable it (`CheckTokenExpiration()` instead) in latency-sensitive scenarios; you trade real-time revocation for response speed.
+- **Cookies carry the access token thanks to `SaveTokens = true`.** That makes the cookie large — ensure your reverse proxy allows headers >8 KB and consider a Redis-backed ticket store (`ITicketStore`) for very large claim sets.
+- **`ClientSecret` is committed to `appsettings.json` by default.** Move it to User Secrets locally and to a vault in production. The seed contributor reads from `DbMigrator/appsettings.json`, so both files should be kept in sync.
+- **No `Application`/`EntityFrameworkCore` references means no `IRepository<T>` here.** Components inject application service interfaces from `Application.Contracts`; the runtime substitutes HTTP proxies via `MyProjectNameHttpApiClientModule`.
+- **SignalR circuit + OIDC handshake.** The OIDC login redirects break the SignalR connection; the framework reconnects automatically once the user lands back on the host. Long-running components must handle `OnAfterRenderAsync` re-runs without duplicating side effects.
+- **`Redis:Configuration` is mandatory.** Without Redis the distributed cache falls back to in-memory and `IDistributedLockProvider` cannot be resolved at startup — `ConfigureDistributedLocking` throws.
+- **The OIDC callback path is `/signin-oidc` by default.** Make sure this is allowed by the AuthServer's `RedirectAllowedUrls` — the seed configures `https://localhost:44309/signin-oidc` implicitly via the `RootUrl + "signin-oidc"` convention.
+- **Account pages do NOT exist here.** Trying to navigate to `/Account/Login` returns 404; the browser is redirected to the AuthServer instead. The Login link in the menu contributor uses the OIDC challenge URL, not a direct route.

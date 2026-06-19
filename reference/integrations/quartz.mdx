@@ -1,0 +1,300 @@
+---
+title: "Quartz.NET"
+description: "External-library reference for Quartz.NET — Volo.Abp.Quartz and the job/worker integrations, configuration properties, persistent stores, and clustering."
+---
+
+[Quartz.NET](https://www.quartz-scheduler.net/) is a feature-rich job-scheduling library. ABP wraps it with `Volo.Abp.Quartz`, which configures an `IScheduler`, and two consumer modules — `Volo.Abp.BackgroundJobs.Quartz` and `Volo.Abp.BackgroundWorkers.Quartz` — that respectively implement `IBackgroundJobManager` and run ABP `IBackgroundWorker`s as Quartz jobs.
+
+For the ABP-side abstractions see [Background Jobs](/framework/background/background-jobs), [Background Workers](/framework/background/background-workers), and the [Quartz deep-dive](/framework/background/quartz).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.Quartz` | Configures `IScheduler`, exposes `AbpQuartzOptions`. |
+| `Volo.Abp.BackgroundJobs.Quartz` | Implements `IBackgroundJobManager` over Quartz. |
+| `Volo.Abp.BackgroundWorkers.Quartz` | Runs ABP `IBackgroundWorker`s as Quartz jobs. |
+
+Base module:
+
+```csharp
+public class AbpQuartzModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var options = context.Services.ExecutePreConfiguredActions<AbpQuartzOptions>();
+
+        context.Services.AddQuartz(options.Properties, build =>
+        {
+            // defaults if not configured
+            if (options.Properties[StdSchedulerFactory.PropertySchedulerJobFactoryType] == null)
+                build.UseMicrosoftDependencyInjectionScopedJobFactory();
+
+            if (options.Properties[StdSchedulerFactory.PropertySchedulerTypeLoadHelperType] == null)
+                build.UseSimpleTypeLoader();
+
+            if (options.Properties[StdSchedulerFactory.PropertyJobStoreType] == null)
+                build.UseInMemoryStore();
+
+            if (options.Properties[StdSchedulerFactory.PropertyThreadPoolType] == null)
+                build.UseDefaultThreadPool(tp => tp.MaxConcurrency = 10);
+
+            if (options.Properties["quartz.plugin.timeZoneConverter.type"] == null)
+                build.UseTimeZoneConverter();
+
+            options.Configurator?.Invoke(build);
+        });
+
+        context.Services.AddSingleton(sp =>
+            AsyncHelper.RunSync(() => sp.GetRequiredService<ISchedulerFactory>().GetScheduler()));
+    }
+
+    public override async Task OnApplicationInitializationAsync(...)
+    {
+        await options.StartSchedulerFactory.Invoke(_scheduler);
+    }
+
+    public override async Task OnApplicationShutdownAsync(...)
+    {
+        if (_scheduler.IsStarted) await _scheduler.Shutdown();
+    }
+}
+```
+
+Three defaults to remember: **scoped DI activator**, **in-memory job store**, **10-thread pool**, **TimeZoneConverter plugin enabled**.
+
+## Options model
+
+```csharp
+public class AbpQuartzOptions
+{
+    public NameValueCollection Properties { get; set; }
+    public Action<IServiceCollectionQuartzConfigurator>? Configurator { get; set; }
+    public TimeSpan StartDelay { get; set; }
+    public Func<IScheduler, Task> StartSchedulerFactory { get; set; }
+}
+```
+
+- `Properties` — raw `quartz.*` property keys (see Quartz's `StdSchedulerFactory`). Same as `quartz.config` file.
+- `Configurator` — fluent configurator (`build.UsePersistentStore<T>(...)`, `build.UseDefaultThreadPool(...)`).
+- `StartDelay` — wait time before starting the scheduler. Useful to let other modules initialise.
+- `StartSchedulerFactory` — replace if you want fully custom start logic (e.g. only on a leader).
+
+## Quartz version requirements
+
+| Package | Minimum | Notes |
+| --- | --- | --- |
+| `Quartz` | 3.x | Pure async API; targets .NET Standard 2.0 and net6.0+. |
+| `Quartz.Extensions.DependencyInjection` | 3.x | Provides `AddQuartz`. |
+| `Quartz.Plugins.TimeZoneConverter` | 3.x | Required by ABP default. |
+| `Quartz.Serialization.Json` / `.Newtonsoft` | 3.x | Needed by persistent stores for `JobDataMap`. |
+
+ABP pins to Quartz 3.x throughout.
+
+## Persistent stores
+
+In-memory is the default and is fine for single-node deployments where lost recurring jobs are acceptable across restarts. For HA or audit, switch to a persistent ADO.NET store:
+
+```csharp
+PreConfigure<AbpQuartzOptions>(options =>
+{
+    options.Configurator = configurator =>
+    {
+        configurator.UsePersistentStore(store =>
+        {
+            store.UseProperties = true;
+            store.UseClustering(c =>
+            {
+                c.CheckinInterval = TimeSpan.FromSeconds(10);
+            });
+            store.UseSqlServer(ado =>
+            {
+                ado.ConnectionString = "Server=...;Database=Quartz;TrustServerCertificate=true";
+                ado.TablePrefix = "QRTZ_";
+            });
+            store.UseJsonSerializer();
+        });
+    };
+});
+```
+
+Run the **Quartz SQL schema** (from `tables_sqlServer.sql` shipped with Quartz) once per database. Equivalent scripts exist for Postgres, MySQL, Oracle and SQLite.
+
+## Clustering
+
+Quartz clustering is opt-in (`UseClustering`). With it:
+
+- All nodes share the same DB.
+- Each `quartz.scheduler.instanceName` is the cluster name; `quartz.scheduler.instanceId=AUTO` assigns a unique node id.
+- Triggers fire on exactly one node (whichever acquires the row lock first).
+- Failed nodes are recovered after `checkinInterval`.
+
+Without clustering each node runs its own scheduler — duplicate triggers fire.
+
+## Sample `appsettings.json` + module
+
+```json
+{
+  "ConnectionStrings": {
+    "Quartz": "Server=sql-prod;Database=Quartz;User Id=svc;Password=...;TrustServerCertificate=true"
+  },
+  "Quartz": {
+    "InstanceName": "CatalogCluster",
+    "StartDelaySeconds": 5
+  }
+}
+```
+
+```csharp
+PreConfigure<AbpQuartzOptions>(options =>
+{
+    options.Properties = new NameValueCollection
+    {
+        ["quartz.scheduler.instanceName"] = configuration["Quartz:InstanceName"],
+        ["quartz.scheduler.instanceId"] = "AUTO",
+        ["quartz.threadPool.maxConcurrency"] = "20"
+    };
+    options.StartDelay = TimeSpan.FromSeconds(
+        int.Parse(configuration["Quartz:StartDelaySeconds"] ?? "0"));
+    options.Configurator = configurator =>
+    {
+        configurator.UsePersistentStore(store =>
+        {
+            store.UseProperties = true;
+            store.UseClustering();
+            store.UseSqlServer(ado =>
+            {
+                ado.ConnectionString = configuration.GetConnectionString("Quartz");
+            });
+            store.UseJsonSerializer();
+        });
+    };
+});
+```
+
+## Job activator and scope
+
+ABP wires `UseMicrosoftDependencyInjectionScopedJobFactory()`. Each job gets an `IServiceScope` per execution — `IDbContext`, `ICurrentUser`, `IUnitOfWorkManager` are scoped and disposed correctly. Tenant context is **not** automatically restored; if a job needs a tenant, persist tenant id in the `JobDataMap` and call `ICurrentTenant.Change(tenantId)` inside the job.
+
+## Cron syntax
+
+Quartz uses 6/7-field cron (seconds first, plus optional year):
+
+```text
+0 0 12 ? * MON-FRI     # 12:00 every weekday
+0 */15 * * * ?         # every 15 minutes
+0 0 0 1 1 ? *          # midnight on Jan 1st
+```
+
+ABP's `IBackgroundWorker.Period` (milliseconds) is converted to a simple trigger; for cron, expose your own `Configurator` that schedules `JobBuilder.Create<...>().WithCronSchedule(...)`.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `SchedulerConfigException: Failure occurred during job recovery` | Job DLL renamed; persisted `JobDetail` references a missing type. | Keep job class names + assembly stable, or delete `QRTZ_JOB_DETAILS` rows for orphans before deploy. |
+| `JobPersistenceException: Couldn't acquire next trigger` | Cluster nodes lost DB connectivity. | Stabilise DB; raise `quartz.jobStore.acquireTriggersWithinLock=true` only as a last resort. |
+| Duplicate trigger fires across nodes | Clustering not enabled. | Enable `UseClustering`. |
+| Misfire bursts after deploy | Misfire policy `FireOnceNow`. | Choose per trigger (`WithMisfireHandlingInstructionDoNothing` for skip). |
+| Trigger fires in wrong timezone | Trigger built without timezone. | Use `.InTimeZone(TimeZoneInfo.FindSystemTimeZoneById("Europe/London"))` — TimeZoneConverter handles IANA/Windows mismatch. |
+| `Threadpool exhaustion` symptoms (jobs late) | `maxConcurrency` too low. | Raise; consider sharding jobs across schedulers. |
+| Memory leak | Job leaks IDisposable. | Quartz scope disposes per execution — your job is holding a reference. |
+| Long shutdown (60s pause) | Default `waitForJobsToComplete=true` and a long-running job. | Set timeout on shutdown; ensure job respects `CancellationToken`. |
+
+## Observability hints
+
+- **Scheduler metrics.** `IScheduler.GetMetaData()` returns counters: `NumberOfJobsExecuted`, `RunningSince`, `ThreadPoolSize`, `JobStoreClustered`. Surface as gauges/counters.
+- **Job listeners.** Implement `IJobListener` to emit per-execution metrics: success/failure/duration. Register via `Configurator`.
+- **Misfire alerts.** Misfired triggers are visible in `QRTZ_TRIGGERS.NEXT_FIRE_TIME` vs `PREV_FIRE_TIME`. Alert when the gap exceeds expected period.
+- **Tracing.** Quartz exposes `Activity` instrumentation for jobs (recent 3.x); add `OpenTelemetry.Instrumentation.Quartz` (community).
+- **Cluster health.** `QRTZ_SCHEDULER_STATE` shows each node's `LAST_CHECKIN_TIME`. Watch for nodes missing heartbeats.
+
+## Sizing
+
+- **Thread pool.** Start with `maxConcurrency = 10–20`. Quartz jobs typically wait on I/O; CPU-bound jobs should run elsewhere.
+- **DB throughput.** Each fire writes a few rows. With clustering + 1k triggers/sec you'll want fast SSD and a small-but-tuned SQL/Postgres instance.
+- **Misfire threshold.** `quartz.jobStore.misfireThreshold` defaults to 60 s. Lower for low-latency schedules.
+
+## Job data and serialization
+
+`JobDataMap` is the only way to pass parameters to a Quartz job — fields are stored as columns (or a binary blob with `useProperties=true`). ABP recommends `useProperties=true` so the map is `string → string`, which:
+
+- Avoids cross-version deserialization issues.
+- Plays well with the JSON serializer.
+
+Keep DTOs small. Don't put domain entities into `JobDataMap` — pass IDs and let the job re-load.
+
+## Misfire policies
+
+Each trigger declares how to behave when it "misfired" (e.g. process restarted):
+
+| Policy | Behaviour |
+| --- | --- |
+| `WithMisfireHandlingInstructionDoNothing` | Skip the missed fires. Default for periodic jobs that shouldn't catch up. |
+| `WithMisfireHandlingInstructionFireAndProceed` | Fire once now, resume schedule. |
+| `WithMisfireHandlingInstructionIgnoreMisfires` | Fire all missed instances back-to-back. Dangerous on long outages. |
+
+ABP's `IBackgroundWorker` adapter uses `FireAndProceed` for simple triggers. Override per-trigger when registering via custom `Configurator`.
+
+## Listeners and history
+
+Quartz has three listener interfaces: `IJobListener`, `ITriggerListener`, `ISchedulerListener`. Register through the configurator:
+
+```csharp
+configurator.AddJobListener<MetricsJobListener>(GroupMatcher<JobKey>.AnyGroup());
+```
+
+Combined with a small `IMetrics` shim you get per-job duration histograms, success/fail counters, and per-trigger latency.
+
+For historical execution data, persist your own `JobExecutionRecord` table — Quartz's tables track only schedule state, not history.
+
+## Calendars (blackout windows)
+
+`ICalendar` instances express "don't fire on" rules — holidays, maintenance windows. Register before triggers:
+
+```csharp
+configurator.UseInMemoryStore(); // or persistent
+var calendar = new HolidayCalendar();
+calendar.AddExcludedDate(new DateTime(2025, 12, 25));
+await scheduler.AddCalendar("holidays", calendar, true, true);
+
+var trigger = TriggerBuilder.Create()
+    .WithCronSchedule("0 0 9 * * ?")
+    .ModifiedByCalendar("holidays")
+    .Build();
+```
+
+Quartz with ADO storage persists calendars too.
+
+## Long-running jobs and shutdown
+
+Jobs should observe `IJobExecutionContext.CancellationToken`. On `IScheduler.Shutdown(waitForJobsToComplete: true)` Quartz signals the token and waits. Without graceful handling, you get a 60–120 s pause as pods stop.
+
+For Kubernetes, set `terminationGracePeriodSeconds: 120` to give Quartz time to drain.
+
+## RAMJobStore vs ADO
+
+| Aspect | RAMJobStore (in-memory) | ADO (SQL) |
+| --- | --- | --- |
+| Speed | Fastest | DB round-trip per fire |
+| Durability | None | Persistent |
+| Clustering | No | Yes |
+| Triggers limit | Memory-bound | DB-bound |
+| Use | Single-node, lossy OK | Multi-node, audit |
+
+ABP's default is `UseInMemoryStore`. Switch only when you need clustering or restart durability.
+
+## Schedule export / debugging
+
+For a quick "what's scheduled?" diagnostic, query Quartz's tables (`QRTZ_TRIGGERS`, `QRTZ_CRON_TRIGGERS`) or call `scheduler.GetTriggerKeys(GroupMatcher<TriggerKey>.AnyGroup())` + `GetTrigger`. Surface as an admin endpoint guarded by ABP authorisation.
+
+## Time zone gotchas
+
+Quartz uses `TimeZoneInfo`. On Linux, IDs come from the IANA database (`Europe/London`); on Windows from Microsoft IDs (`GMT Standard Time`). The `TimeZoneConverter` plugin (ABP enables by default) bridges both — so `Europe/London` resolves correctly on Windows servers too.
+
+## Related references
+
+- [Quartz deep-dive](/framework/background/quartz) — ABP module internals.
+- [Background Jobs — Quartz](/framework/background/background-jobs-quartz) — `IBackgroundJobManager` adapter.
+- [Background Workers — Quartz](/framework/background/background-workers-quartz) — recurring-job adapter.
+- [Hangfire](/reference/integrations/hangfire) — alternative scheduler.

@@ -1,0 +1,271 @@
+---
+title: "Hangfire"
+description: "External-library reference for Hangfire — Volo.Abp.HangFire and the job/worker integrations, supported storage providers, dashboard authorization, and operational guidance."
+---
+
+[Hangfire](https://www.hangfire.io/) is a job-scheduling library that runs a persistent queue in a relational/document database. ABP layers two integrations on top of it: the background-job module (`Volo.Abp.BackgroundJobs.HangFire`) and the background-worker module (`Volo.Abp.BackgroundWorkers.Hangfire`). They both depend on the base `Volo.Abp.HangFire` package, which configures the Hangfire server and authorisation hooks.
+
+For the ABP-side abstractions see [Background Jobs](/framework/background/background-jobs), [Background Workers](/framework/background/background-workers), and the [Hangfire deep-dive](/framework/background/hangfire).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.HangFire` | Configures the Hangfire server, exposes `AbpHangfireOptions`, integrates auth for the dashboard. |
+| `Volo.Abp.BackgroundJobs.HangFire` | Implements `IBackgroundJobManager` on top of Hangfire. |
+| `Volo.Abp.BackgroundWorkers.Hangfire` | Runs ABP `IBackgroundWorker`s as Hangfire recurring jobs. |
+
+Base module:
+
+```csharp
+[DependsOn(typeof(AbpAuthorizationAbstractionsModule))]
+public class AbpHangfireModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var preActions = context.Services.GetPreConfigureActions<IGlobalConfiguration>();
+        context.Services.AddHangfire(configuration =>
+        {
+            preActions.Configure(configuration);
+        });
+
+        context.Services.AddSingleton(serviceProvider =>
+        {
+            var options = serviceProvider.GetRequiredService<IOptions<AbpHangfireOptions>>().Value;
+            return new AbpHangfireBackgroundJobServer(options.BackgroundJobServerFactory.Invoke(serviceProvider));
+        });
+    }
+}
+```
+
+## Options model
+
+```csharp
+public class AbpHangfireOptions
+{
+    public BackgroundJobServerOptions? ServerOptions { get; set; }
+    public IEnumerable<IBackgroundProcess>? AdditionalProcesses { get; set; }
+    public JobStorage? Storage { get; set; }
+    public Func<IServiceProvider, BackgroundJobServer?> BackgroundJobServerFactory { get; set; }
+}
+```
+
+- `ServerOptions` — Hangfire's `BackgroundJobServerOptions`. Sets `WorkerCount`, `Queues`, `ServerName`, `StopTimeout`, etc.
+- `AdditionalProcesses` — extra background processes (custom queue monitors, schedulers).
+- `Storage` — `JobStorage` instance. If `null`, the module resolves whatever Hangfire storage extension you wired (SQL Server, Postgres, Redis, Mongo).
+- `BackgroundJobServerFactory` — replace if you need full control over `BackgroundJobServer` construction.
+
+You pre-configure Hangfire's global configuration through `PreConfigure<IGlobalConfiguration>`:
+
+```csharp
+PreConfigure<IGlobalConfiguration>(config =>
+{
+    config
+        .UseSqlServerStorage(configuration.GetConnectionString("Default"))
+        .UseSerilogLogProvider()
+        .UseFilter(new AbpJobAuthorizationFilter()); // example
+});
+```
+
+This runs **before** `AddHangfire`, ensuring storage is configured.
+
+## Hangfire version requirements
+
+| Component | Minimum | Recommended |
+| --- | --- | --- |
+| `Hangfire.Core` | 1.8 | 1.8.x — actively maintained LTS line. |
+| Storage extension | matches core | Pin together to avoid serialization mismatches. |
+| Hangfire Pro (optional) | n/a | Adds batches, continuations across batches, Redis Pro storage. |
+
+ABP's own packages target `Hangfire.AspNetCore` 1.8.x.
+
+## Storage providers
+
+| Provider | NuGet | Notes |
+| --- | --- | --- |
+| SQL Server | `Hangfire.SqlServer` | Most common; supports schema isolation. |
+| PostgreSQL | `Hangfire.PostgreSql` | Community; widely used. |
+| MySQL | `Hangfire.MySqlStorage` | Multiple community ports. |
+| Redis (Pro) | `Hangfire.Pro.Redis` | Paid; fastest. |
+| Redis (OSS) | `Hangfire.Redis.StackExchange` | Community option. |
+| MongoDB | `Hangfire.Mongo` | Community. |
+| In-memory | `Hangfire.MemoryStorage` | Dev only. |
+
+ABP doesn't ship a Hangfire storage choice — you reference one yourself and configure it via `PreConfigure<IGlobalConfiguration>`. For SQL Server, the Hangfire schema is named `HangFire` by default and contains tables `Job`, `State`, `Server`, `JobQueue`, `Schedule`, `Hash`, `List`, `Set`. Run `SqlServerStorageOptions.PrepareSchemaIfNecessary = true` once, then disable.
+
+## Sample `appsettings.json` + module
+
+```json
+{
+  "ConnectionStrings": {
+    "Hangfire": "Server=sql-prod;Database=AbpJobs;User Id=svc;Password=...;TrustServerCertificate=true"
+  },
+  "Hangfire": {
+    "Dashboard": {
+      "Path": "/hangfire",
+      "RequiredPermission": "AbpHangfire.Dashboard"
+    }
+  }
+}
+```
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<IGlobalConfiguration>(config =>
+    {
+        config.UseSqlServerStorage(
+            context.Services.GetConfiguration().GetConnectionString("Hangfire"));
+    });
+}
+
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpHangfireOptions>(options =>
+    {
+        options.ServerOptions = new BackgroundJobServerOptions
+        {
+            WorkerCount = Environment.ProcessorCount * 5,
+            Queues = new[] { "default", "critical", "email" },
+            ServerName = $"{Environment.MachineName}:catalog"
+        };
+    });
+}
+
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var app = context.GetApplicationBuilder();
+    app.UseHangfireDashboard("/hangfire", new DashboardOptions
+    {
+        Authorization = new[] { new AbpHangfireAuthorizationFilter("AbpHangfire.Dashboard") }
+    });
+}
+```
+
+`AbpHangfireAuthorizationFilter` (in `Volo.Abp.HangFire`) integrates with ABP authorisation — pass the permission name and only users holding it can open the dashboard.
+
+## Dashboard
+
+`UseHangfireDashboard` exposes `/hangfire` by default. Public exposure is dangerous — anyone reaching the URL can see job parameters (which may include PII) and trigger reruns. Always:
+
+- Protect with an authorisation filter (ABP's `AbpHangfireAuthorizationFilter` or a custom `IDashboardAuthorizationFilter`).
+- Restrict by IP at the ingress.
+- Disable on public-facing pods entirely (only the worker pods, behind a VPN, should serve the UI).
+
+## Server topology
+
+A typical layout:
+
+- **Web pods**: `UseHangfireDashboard` only. No server (set `AbpHangfireOptions.BackgroundJobServerFactory` to return `null` or set `Storage` and skip `BackgroundJobServer` construction by replacing the singleton). Or remove the package on the web project entirely.
+- **Worker pods**: include `Volo.Abp.BackgroundJobs.HangFire`; the Hangfire server runs as a hosted service.
+- **Single instance for crons**: only one server should process recurring jobs (Hangfire handles this automatically via storage locks).
+
+`ServerName` should embed pod hostname + role so the Servers view shows them all.
+
+## Recurring jobs
+
+`Volo.Abp.BackgroundWorkers.Hangfire` registers ABP `IBackgroundWorker` instances as Hangfire `RecurringJob`s. They get a stable id (`<TypeName>`) and a cron expression from the worker's `Period`.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Dashboard 404 | `UseHangfireDashboard` not called or auth filter rejecting. | Verify pipeline; check claims. |
+| `JobStorageException: There is no IJobStorage registered` | Storage extension not referenced. | Add `Hangfire.SqlServer` / `Hangfire.PostgreSql` etc. + call `UseXxxStorage`. |
+| `SqlException: Invalid object name 'HangFire.Schema'` | First run before schema bootstrap. | Enable `PrepareSchemaIfNecessary=true` on first deploy. |
+| Jobs run twice across nodes | Multiple servers all listen on same queue (expected) but no idempotency in job. | Make jobs idempotent or use distributed lock inside. |
+| `JobLoadException: Could not load type 'MyApp.MyJob'` | Job DLL renamed/removed between deploy. | Keep job class names stable; avoid moving namespaces; or purge old jobs first. |
+| Memory growth on worker | Workers holding `IServiceScope` open due to circular DI. | Audit job dependencies; ABP uses scoped activator that disposes per job. |
+| Cron jobs late/skipped | Storage CPU saturated, lock contention. | Move to Redis Pro storage; reduce worker count per server. |
+| `503` from dashboard | `AbpHangfireAuthorizationFilter` throws because no current user. | Sign-in middleware not running before dashboard map; reorder pipeline. |
+
+## Observability hints
+
+- **Server metrics.** Hangfire exposes counters via `IMonitoringApi` — count of `enqueued`, `processing`, `failed`, `scheduled`, `succeeded`. Expose them as Prometheus gauges with a hosted service.
+- **Dashboard metrics endpoint.** `Hangfire.MissionControl` (paid) adds rich metrics; for OSS, scrape `IMonitoringApi.GetStatistics()` periodically.
+- **Failed jobs alert.** Alert on `Failed > N` or jobs stuck in `Awaiting` for > X minutes.
+- **Server liveness.** Hangfire shows last heartbeat per server in the `Server` table. If a pod dies without graceful shutdown, the server entry lingers until a sweeper removes it — usually 5 min. Tune `ServerHeartbeatInterval` and `ServerTimeout` in `BackgroundJobServerOptions`.
+- **Tracing.** Hangfire ships an `Activity` source (`Hangfire.JobsServer`) with newer versions; wire to OpenTelemetry to see enqueue→execute traces.
+
+## Sizing
+
+- **Workers per pod.** Start with `Environment.ProcessorCount * 5` for I/O-bound jobs; lower (`* 1` or `* 2`) for CPU-bound. Hangfire workers are lightweight (one thread + scoped DI per job).
+- **Storage rows.** SQL Server `Job` table can grow large; configure `JobExpirationCheckInterval` and ensure `History` is pruned. Watch index fragmentation on `JobQueue` and `State`.
+- **Redis storage.** Sized by ops/sec — 30 k enqueue/sec is easy on a Redis Pro instance.
+
+## Schema and DB sizing
+
+`Hangfire.SqlServer` ships its schema in `Hangfire.SqlServer.SqlServerObjectsInstaller`. Key tables:
+
+| Table | Purpose | Growth driver |
+| --- | --- | --- |
+| `Job` | Job definitions + serialized args | One row per enqueue. |
+| `State` | History of state transitions | Multiple rows per job. |
+| `JobQueue` | Currently queued jobs | Drained as workers pick up. |
+| `Server` | Live worker servers | One row per `BackgroundJobServer` instance. |
+| `Schedule` | Future / scheduled jobs | Recurring + delayed jobs. |
+| `Set`, `List`, `Hash`, `Counter` | Recurring jobs, statistics. | Stable size. |
+
+Expired jobs are deleted by the `ExpirationManager` (every 30 min). Tune via `SqlServerStorageOptions.JobExpirationCheckInterval`. For very high throughput, lower the **queue poll interval** (default 15 s) to 1-2 s — at the cost of more SQL traffic.
+
+Index maintenance: `IX_HangFire_JobQueue_QueueAndFetchedAt` fragments quickly under heavy enqueue/dequeue. Rebuild weekly.
+
+## Filters and authentication
+
+ABP wires `AbpHangfireAuthorizationFilter` for the dashboard. For per-job authorisation, register a `JobFilterAttribute`:
+
+```csharp
+public class TenantContextFilter : JobFilterAttribute, IServerFilter
+{
+    public void OnPerforming(PerformingContext filterContext)
+    {
+        if (filterContext.BackgroundJob.Job.Args.LastOrDefault() is Guid tenantId)
+        {
+            var currentTenant = filterContext.Connection
+                .GetJobParameter<ICurrentTenant>(...);
+            // ABP doesn't auto-restore tenant; do it here.
+        }
+    }
+    public void OnPerformed(PerformedContext filterContext) { }
+}
+```
+
+Register via `GlobalJobFilters.Filters.Add(new TenantContextFilter())` or `PreConfigure<IGlobalConfiguration>`.
+
+## Retries
+
+Hangfire retries failed jobs 10 times by default with exponential back-off. Override:
+
+```csharp
+GlobalJobFilters.Filters.Add(new AutomaticRetryAttribute { Attempts = 3, DelaysInSeconds = new[] { 60, 300, 900 } });
+```
+
+Once exhausted the job moves to the **Failed** state and shows in the dashboard. Hangfire does **not** delete failed jobs automatically — accumulating failures bloat the DB. Either fix them, manually move to `Deleted`, or set a custom `IElectStateFilter` to enforce TTL.
+
+## Continuations and batches
+
+`BackgroundJob.ContinueJobWith(parentId, () => ...)` runs a job after another succeeds. ABP's `IBackgroundJobManager` doesn't expose this — call `IBackgroundJobClient` (Hangfire) directly when you need it.
+
+Batches and batch continuations require **Hangfire Pro** (commercial). For free OSS, chain manually.
+
+## Concurrency control
+
+Hangfire's per-job concurrency uses `MutexAttribute` or `DisableConcurrentExecutionAttribute`:
+
+```csharp
+[DisableConcurrentExecution(timeoutInSeconds: 600)]
+public Task SendNewsletterAsync(int batchId) { ... }
+```
+
+Useful for jobs touching shared external resources (a webhook with rate limits). Implementation uses Hangfire's distributed lock — same DB as the storage.
+
+## Migrating off in-memory
+
+If you start with `Hangfire.MemoryStorage` and switch to SQL Server / Redis, your scheduled jobs are lost. Re-seed recurring jobs in `OnApplicationInitialization` via `RecurringJob.AddOrUpdate(...)` so deploys are deterministic.
+
+## Related references
+
+- [Hangfire deep-dive](/framework/background/hangfire) — ABP module internals.
+- [Background Jobs — Hangfire](/framework/background/background-jobs-hangfire) — `IBackgroundJobManager` adapter.
+- [Background Workers — Hangfire](/framework/background/background-workers-hangfire) — recurring-job adapter.
+- [Quartz](/reference/integrations/quartz) — alternative scheduler.

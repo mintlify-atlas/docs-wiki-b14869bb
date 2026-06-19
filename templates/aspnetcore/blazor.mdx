@@ -1,0 +1,251 @@
+---
+title: "Blazor (WebAssembly) Project"
+description: "Client-side Blazor WebAssembly UI that talks to the HTTP API through dynamic OpenID Connect-authenticated proxies — the standalone SPA flavour of ABP."
+---
+
+`MyCompanyName.MyProjectName.Blazor` is the **Blazor WebAssembly** UI generated when you create the solution with `abp new ... -u blazor`. It runs entirely in the browser as a downloaded SPA, authenticates the user against a separately-hosted [AuthServer](/templates/aspnetcore/authserver) (or `HttpApi.HostWithIds`), and calls application services through `MyProjectNameHttpApiClientModule`.
+
+This is **WebAssembly**, not Blazor Server — the runtime lives in the browser, the UI does not maintain a persistent SignalR connection, and every service must be safe to instantiate inside the WASM sandbox.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.Blazor/
+├── Menus/
+│   └── MyProjectNameMenuContributor.cs
+├── Pages/
+│   ├── Index.razor
+│   └── ...
+├── Properties/
+│   └── launchSettings.json
+├── wwwroot/
+│   ├── appsettings.json
+│   ├── index.html
+│   └── ...
+├── MyCompanyName.MyProjectName.Blazor.csproj
+├── MyProjectNameBlazorAutoMapperProfile.cs
+├── MyProjectNameBlazorModule.cs
+├── MyProjectNameBrandingProvider.cs
+├── MyProjectNameBundleContributor.cs
+├── MyProjectNameComponentBase.cs
+├── Program.cs
+└── _Imports.razor
+```
+
+## csproj at a glance
+
+| Property                                            | Value                                              |
+| --------------------------------------------------- | -------------------------------------------------- |
+| `Sdk`                                               | `Microsoft.NET.Sdk.BlazorWebAssembly`              |
+| `TargetFramework`                                   | `net7.0`                                           |
+| `Nullable`                                          | `enable`                                           |
+| `BlazorWebAssemblyLoadAllGlobalizationData`         | `true`                                             |
+| `ServiceWorkerAssetsManifest` *(PWA only)*          | `service-worker-assets.js`                         |
+
+| Package reference                                                              | Version  | Purpose                          |
+| ------------------------------------------------------------------------------ | -------- | -------------------------------- |
+| `Blazorise.Bootstrap5`                                                         | `1.3.1`  | UI component library             |
+| `Blazorise.Icons.FontAwesome`                                                  | `1.3.1`  | Icons                            |
+| `Microsoft.AspNetCore.Components.WebAssembly`                                  | `7.0.10` | WASM runtime                     |
+| `Microsoft.AspNetCore.Components.WebAssembly.DevServer`                        | `7.0.10` | Dev server                       |
+
+| Project / Package reference                                                                          | Purpose                              |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `Volo.Abp.AspNetCore.Components.WebAssembly.Theming`                                                 | Theme contracts for WASM             |
+| `Volo.Abp.Http.Client.IdentityModel.WebAssembly`                                                     | OIDC token-acquisition for WASM      |
+| `Volo.Abp.AspNetCore.Components.Web.Theming`                                                         | Shared theming components            |
+| `Volo.Abp.AspNetCore.Components.WebAssembly.LeptonXLiteTheme` (`2.4.*-*`)                            | Default theme                        |
+| `Volo.Abp.Autofac.WebAssembly`                                                                       | Autofac DI inside WASM               |
+| `Volo.Abp.Identity.Blazor.WebAssembly`                                                               | User/role admin UI                   |
+| `Volo.Abp.TenantManagement.Blazor.WebAssembly`                                                       | Tenant admin UI                      |
+| `Volo.Abp.SettingManagement.Blazor.WebAssembly`                                                      | Settings UI                          |
+| `MyCompanyName.MyProjectName.HttpApi.Client`                                                         | HTTP proxy implementations            |
+
+`MyCompanyName.MyProjectName.HttpApi.Client` is the **only** server-side project this WASM app references; it pulls `Application.Contracts` and `Domain.Shared` transitively. Anything more (Application, Domain, EntityFrameworkCore) would fail the WASM publish.
+
+For PWA builds, a service worker is registered:
+
+```xml
+<ServiceWorker Include="wwwroot\service-worker.js"
+               PublishedContent="wwwroot\service-worker.published.js" />
+```
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(AbpAutofacWebAssemblyModule),
+    typeof(MyProjectNameHttpApiClientModule),
+    typeof(AbpAspNetCoreComponentsWebAssemblyLeptonXLiteThemeModule),
+    typeof(AbpIdentityBlazorWebAssemblyModule),
+    typeof(AbpTenantManagementBlazorWebAssemblyModule),
+    typeof(AbpSettingManagementBlazorWebAssemblyModule))]
+public class MyProjectNameBlazorModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var environment = context.Services.GetSingletonInstance<IWebAssemblyHostEnvironment>();
+        var builder = context.Services.GetSingletonInstance<WebAssemblyHostBuilder>();
+
+        ConfigureAuthentication(builder);
+        ConfigureHttpClient(context, environment);
+        ConfigureBlazorise(context);
+        ConfigureRouter(context);
+        ConfigureUI(builder);
+        ConfigureMenu(context);
+        ConfigureAutoMapper(context);
+    }
+    // ...
+}
+```
+
+### Authentication (OIDC silent renew)
+
+```csharp
+private static void ConfigureAuthentication(WebAssemblyHostBuilder builder)
+{
+    builder.Services.AddOidcAuthentication(options =>
+    {
+        builder.Configuration.Bind("AuthServer", options.ProviderOptions);
+        options.UserOptions.NameClaim = OpenIddictConstants.Claims.Name;
+        options.UserOptions.RoleClaim = OpenIddictConstants.Claims.Role;
+
+        options.ProviderOptions.DefaultScopes.Add("MyProjectName");
+        options.ProviderOptions.DefaultScopes.Add("roles");
+        options.ProviderOptions.DefaultScopes.Add("email");
+        options.ProviderOptions.DefaultScopes.Add("phone");
+    });
+}
+```
+
+The `Microsoft.AspNetCore.Components.WebAssembly.Authentication` package handles the redirect/silent-renew flow. The `AuthServer:Authority` URL in `wwwroot/appsettings.json` points at the OpenID provider; the `DefaultScopes` list mirrors the scopes the AuthServer's `OpenIddictDataSeedContributor` granted to the `MyProjectName_Blazor` client.
+
+The `NameClaim` / `RoleClaim` overrides are mandatory because OpenIddict uses different default claim names than the standard `ClaimTypes.Name` / `ClaimTypes.Role` Blazor expects.
+
+### Router, HttpClient, UI
+
+```csharp
+Configure<AbpRouterOptions>(options =>
+{
+    options.AppAssembly = typeof(MyProjectNameBlazorModule).Assembly;
+});
+
+context.Services.AddTransient(sp => new HttpClient
+{
+    BaseAddress = new Uri(environment.BaseAddress)
+});
+
+builder.RootComponents.Add<App>("#ApplicationContainer");
+```
+
+- `AppAssembly` lets ABP's routing module discover `[Route]`-decorated components in this assembly.
+- The transient `HttpClient` uses the host's base address so static asset requests stay relative; API calls override the URL through `MyProjectNameHttpApiClientModule.RemoteServiceName`.
+
+### Menu, AutoMapper, Blazorise
+
+```csharp
+Configure<AbpNavigationOptions>(options =>
+{
+    options.MenuContributors.Add(new MyProjectNameMenuContributor(context.Services.GetConfiguration()));
+});
+
+Configure<AbpAutoMapperOptions>(options =>
+{
+    options.AddMaps<MyProjectNameBlazorModule>();
+});
+
+context.Services.AddBootstrap5Providers().AddFontAwesomeIcons();
+```
+
+The menu contributor accepts `IConfiguration` so it can read environment-specific flags (e.g. show admin links only when the AuthServer URL contains `localhost`).
+
+## Program.cs
+
+```csharp
+public class Program
+{
+    public async static Task Main(string[] args)
+    {
+        var builder = WebAssemblyHostBuilder.CreateDefault(args);
+
+        var application = await builder.AddApplicationAsync<MyProjectNameBlazorModule>(options =>
+        {
+            options.UseAutofac();
+        });
+
+        var host = builder.Build();
+        await application.InitializeApplicationAsync(host.Services);
+        await host.RunAsync();
+    }
+}
+```
+
+`WebAssemblyHostBuilder.CreateDefault` reads `wwwroot/appsettings.json` and `wwwroot/appsettings.{Environment}.json` automatically. `options.UseAutofac()` swaps the default `ServiceProvider` for an Autofac container so property injection works inside `AbpComponentBase`.
+
+## Key types
+
+### MyProjectNameComponentBase
+
+```csharp
+public abstract class MyProjectNameComponentBase : AbpComponentBase
+{
+    protected MyProjectNameComponentBase()
+    {
+        LocalizationResource = typeof(MyProjectNameResource);
+    }
+}
+```
+
+Inherit your `.razor` components from this class to receive injected `IStringLocalizer`, `IAuthorizationService`, `IUiNotificationService`, `IUiMessageService` and the standard ABP component cross-cutters.
+
+### MyProjectNameBrandingProvider
+
+Same `IBrandingProvider` implementation as the other UI hosts; returns the application name shown in the header.
+
+### MyProjectNameBundleContributor
+
+Inserts the project's CSS files into the LeptonX Lite bundle so the WASM client picks them up at boot.
+
+### MyProjectNameBlazorAutoMapperProfile
+
+Empty by default — register UI view-model maps here that are only needed in the browser.
+
+## wwwroot/appsettings.json
+
+A typical configuration:
+
+```json
+{
+  "RemoteServices": {
+    "Default": { "BaseUrl": "https://localhost:44305/" }
+  },
+  "AuthServer": {
+    "Authority": "https://localhost:44305",
+    "ClientId": "MyProjectName_Blazor",
+    "ResponseType": "code"
+  }
+}
+```
+
+Both URLs commonly point at `HttpApi.HostWithIds` (port `44305`) because the WASM template's default deployment is the *non-tiered* flavour. If you run the tiered solution, point `RemoteServices.Default.BaseUrl` at `HttpApi.Host` (44300) and `AuthServer.Authority` at `AuthServer` (44301).
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Custom page                           | `Pages/MyPage.razor` with a `@page "/my-page"` directive          |
+| Custom menu item                      | `Menus/MyProjectNameMenuContributor.ConfigureMenuAsync`           |
+| Replace branding                      | `MyProjectNameBrandingProvider`                                  |
+| Add a CSS file to the bundle          | `MyProjectNameBundleContributor`                                 |
+| Add an AutoMapper map                 | Profile class anywhere in this assembly                          |
+| Add a Blazorise theme override        | `BlazoriseConfig` in `Program.cs`                                |
+
+## Gotchas
+
+- **The WASM publish step rejects net7.0-only references.** Adding `Microsoft.EntityFrameworkCore` or any server-side ABP module (`Application`, `Domain`, `EntityFrameworkCore`) will break `dotnet publish` with `NETSDK1080`. Stay on the `*.HttpApi.Client` boundary.
+- **`AddOidcAuthentication` does NOT support cookies.** Blazor WASM is a static SPA — tokens live in browser storage. Logout requires explicit redirect to the AuthServer's `/connect/endsession` (ABP does this automatically through the menu contributor's Logout item).
+- **Silent renew relies on an iframe** loaded from the AuthServer. Same-origin policy blocks the renew if your CORS policy on the AuthServer is too restrictive — make sure the Blazor URL is in `App:RedirectAllowedUrls` and the `MyProjectName_Blazor` client has the matching `RootUrl` in the seed file.
+- **`BlazorWebAssemblyLoadAllGlobalizationData` doubles the payload size.** It is on by default so `IStringLocalizer` can format dates/numbers in any culture. Set it to `false` if you only target English to shave ~3 MB off the download.
+- **PWA service worker caches the entire app.** A new deployment requires the user to close every browser tab serving the previous version or they will keep loading the cached JS. The published `service-worker.published.js` already implements a version check; do not delete it.
+- **`NameClaim`/`RoleClaim` overrides are mandatory.** Without them `@attribute [Authorize(Roles = "admin")]` returns false because OpenIddict puts roles into `role` claims (lowercase), not `ClaimTypes.Role`.
+- **The `Configuration.Bind("AuthServer", options.ProviderOptions)` call ignores unknown keys silently.** Typos in `wwwroot/appsettings.json` (e.g. `Authoryti` instead of `Authority`) lead to immediate redirect-to-login loops with no error displayed.

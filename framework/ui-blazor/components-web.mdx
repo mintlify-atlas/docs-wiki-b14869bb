@@ -1,0 +1,292 @@
+---
+title: "Components.Web: cross-host primitives for ABP Blazor UIs"
+sidebarTitle: "Components.Web"
+description: "Volo.Abp.AspNetCore.Components.Web — cookie service, HTTP message handler, default message service, server URL provider and component activator."
+---
+
+`Volo.Abp.AspNetCore.Components.Web` is the **renderer-agnostic** middle layer that Server, WebAssembly and MAUI all reference. It contains the pieces that every Blazor host needs but that don't depend on a specific transport: a cookie wrapper over `IJSRuntime`, the `AbpBlazorClientHttpMessageHandler` that stamps anti-forgery and language headers, a `SimpleUiMessageService` fallback, and the `ServiceProviderComponentActivator` that makes `[Inject]` resolve from ABP's container instead of the default minimal one.
+
+Reading this package is the cheapest way to understand the *shape* of ABP's Blazor stack — there are roughly 25 files and almost everything else is built on top of them.
+
+## Package layout
+
+```text framework/src/Volo.Abp.AspNetCore.Components.Web/
+Volo/Abp/AspNetCore/Components/Web/
+  AbpAspNetCoreApplicationCreationOptions.cs
+  AbpAspNetCoreComponentsWebModule.cs
+  AbpBlazorClientHttpMessageHandler.cs
+  AbpBlazorMessageLocalizerHelper.cs
+  AbpUtilsService.cs
+  Alerts/AlertManager.cs
+  Configuration/
+    ICurrentApplicationConfigurationCacheResetService.cs
+    NullCurrentApplicationConfigurationCacheResetService.cs
+  CookieOptions.cs
+  CookieService.cs
+  DefaultServerUrlProvider.cs
+  DependencyInjection/ComponentsClientScopeServiceProviderAccessor.cs
+  ExceptionHandling/{AbpExceptionHandlingLogger,AbpExceptionHandlingLoggerProvider,UserExceptionInformer}.cs
+  Extensibility/{EntityActions,TableColumns,ILookupApiRequestService}.cs
+  IAbpUtilsService.cs
+  ICookieService.cs
+  IServerUrlProvider.cs
+  Messages/SimpleUiMessageService.cs
+  Security/{AbpComponentsClaimsCache,ApplicationConfigurationChangedService}.cs
+```
+
+## Module bootstrap
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Web/AbpAspNetCoreComponentsWebModule.cs
+[DependsOn(
+    typeof(AbpUiModule),
+    typeof(AbpAspNetCoreComponentsModule)
+    )]
+public class AbpAspNetCoreComponentsWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.Replace(
+            ServiceDescriptor.Transient<IComponentActivator, ServiceProviderComponentActivator>());
+    }
+}
+```
+
+The single line replaces Microsoft's default `DefaultComponentActivator` — which uses `Activator.CreateInstance` — with one that resolves components from the DI container. That's what makes `[Inject]` work for services registered through ABP's conventional registrars (including transient ones), and what enables constructor injection in components.
+
+## Key abstractions
+
+| Type | Lifetime | Purpose |
+|------|----------|---------|
+| `ICookieService` / `CookieService` | Transient (replace) | Read/write cookies via `abp.utils.*` JS helpers. |
+| `AbpBlazorClientHttpMessageHandler` | Transient | Page-progress, `Accept-Language`, `RequestVerificationToken` on outgoing HTTP calls. |
+| `IServerUrlProvider` / `DefaultServerUrlProvider` | Singleton | Resolve the API base URL — returns `"/"` by default. |
+| `IUiMessageService` / `SimpleUiMessageService` | Transient (fallback) | Browser `alert`/`confirm` fallback if no UI theme is registered. |
+| `IAlertManager` / `AlertManager` | Scoped | Backing store for the per-page `AlertList`. |
+| `AbpBlazorMessageLocalizerHelper<T>` | Transient | Localize Blazorise validation messages including `DisplayName:` prefix. |
+| `AbpComponentsClaimsCache` | Scoped | Hold the current `ClaimsPrincipal` for the circuit. |
+| `ApplicationConfigurationChangedService` | Scoped | Subscribe to the reset event and refresh `ICachedApplicationConfigurationClient`. |
+| `IAbpUtilsService` / `AbpUtilsService` | Transient | Thin wrapper over `abp.utils` JS helpers (add/remove body class, etc.). |
+| `ILookupApiRequestService` | Transient (per-host impl.) | Lookup-property HTTP requests for navigation properties. |
+| `ComponentsClientScopeServiceProviderAccessor` / `IClientScopeServiceProviderAccessor` | Scoped | Access the *client* root scope from within a component scope. |
+
+## CookieService
+
+`ICookieService` is a small abstraction over the `abp.utils` JS helpers:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Web/CookieService.cs
+[Dependency(ReplaceServices = true)]
+public class CookieService : ICookieService, ITransientDependency
+{
+    public IJSRuntime JsRuntime { get; }
+
+    public async ValueTask SetAsync(string key, string value, CookieOptions? options)
+    {
+        await JsRuntime.InvokeVoidAsync(
+            "abp.utils.setCookieValue",
+            key, value,
+            options?.ExpireDate?.ToString("r"),
+            options?.Path,
+            options?.Secure);
+    }
+
+    public async ValueTask<string> GetAsync(string key)
+    {
+        return await JsRuntime.InvokeAsync<string>("abp.utils.getCookieValue", key);
+    }
+
+    public async ValueTask DeleteAsync(string key, string? path = null)
+    {
+        await JsRuntime.InvokeVoidAsync("abp.utils.deleteCookie", key);
+    }
+}
+```
+
+The `abp.utils` helpers are shipped with the LeptonX/basic theme. If you self-host without one of those themes, register your own `ICookieService` (the `[Dependency(ReplaceServices = true)]` attribute means you must use the same to override).
+
+## The HTTP handler
+
+Every typed proxy client (`AbpHttpClientModule.PreConfigure`) gets `AbpBlazorClientHttpMessageHandler` plugged in. It does three things:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Web/AbpBlazorClientHttpMessageHandler.cs
+protected override async Task<HttpResponseMessage> SendAsync(
+    HttpRequestMessage request, CancellationToken cancellationToken)
+{
+    try
+    {
+        await _uiPageProgressService.Go(null, options => options.Type = UiPageProgressType.Info);
+        await SetLanguageAsync(request, cancellationToken);
+        await SetAntiForgeryTokenAsync(request);
+        return await base.SendAsync(request, cancellationToken);
+    }
+    finally
+    {
+        await _uiPageProgressService.Go(-1);
+    }
+}
+
+private async Task SetLanguageAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+{
+    var selectedLanguage = await _jsRuntime.InvokeAsync<string>(
+        "localStorage.getItem", cancellationToken, "Abp.SelectedLanguage");
+
+    if (!selectedLanguage.IsNullOrWhiteSpace())
+    {
+        request.Headers.AcceptLanguage.Clear();
+        request.Headers.AcceptLanguage.Add(new StringWithQualityHeaderValue(selectedLanguage));
+    }
+}
+
+private async Task SetAntiForgeryTokenAsync(HttpRequestMessage request)
+{
+    if (request.Method == HttpMethod.Get || request.Method == HttpMethod.Head ||
+        request.Method == HttpMethod.Trace || request.Method == HttpMethod.Options)
+    {
+        return;
+    }
+
+    var selfUri = new Uri(_navigationManager.Uri);
+    if (request.RequestUri!.Host != selfUri.Host || request.RequestUri.Port != selfUri.Port)
+    {
+        return;
+    }
+
+    var token = await _cookieService.GetAsync("XSRF-TOKEN");
+    if (!token.IsNullOrWhiteSpace())
+    {
+        request.Headers.Add("RequestVerificationToken", token);
+    }
+}
+```
+
+Important details:
+
+- The anti-forgery header is added only for **mutating verbs** to **same-origin** URLs. Cross-origin calls (typical in tiered mode) are unaffected.
+- Language comes from `localStorage` keyed `"Abp.SelectedLanguage"` — the same key used by the language switcher in the UI themes.
+- The page progress service is called twice with `try/finally` so spinners always retract, even on exceptions.
+
+## Default message service (browser fallback)
+
+If no UI theme is registered, `SimpleUiMessageService` is the fallback — it uses raw `alert`/`confirm`:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Web/Messages/SimpleUiMessageService.cs
+public class SimpleUiMessageService : IUiMessageService, ITransientDependency
+{
+    public async Task Info(string message, string? title = null, Action<UiMessageOptions>? options = null)
+        => await JsRuntime.InvokeVoidAsync("alert", message);
+
+    public async Task<bool> Confirm(string message, string? title = null, Action<UiMessageOptions>? options = null)
+        => await JsRuntime.InvokeAsync<bool>("confirm", message);
+
+    // Success/Warn/Error all defer to alert
+}
+```
+
+When `Volo.Abp.BlazoriseUI` is referenced, `BlazoriseUiMessageService` replaces this via `[Dependency(ReplaceServices = true)]`. See [Modal services](/framework/ui-blazor/blazor-modal-services) for the dispatch flow.
+
+## Validation message localization
+
+`AbpBlazorMessageLocalizerHelper<T>` is what makes Blazorise validation messages display localized field names:
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Web/AbpBlazorMessageLocalizerHelper.cs
+public string Localize(string message, IEnumerable<string>? arguments)
+{
+    try
+    {
+        return arguments?.Count() > 0
+            ? stringLocalizer[message, LocalizeMessageArguments(arguments)?.ToArray()!]
+            : stringLocalizer[message];
+    }
+    catch
+    {
+        return stringLocalizer[message];
+    }
+}
+
+private IEnumerable<string> LocalizeMessageArguments(IEnumerable<string> arguments)
+{
+    foreach (var argument in arguments)
+    {
+        // first try to localize with "DisplayName:{Name}"
+        var localization = stringLocalizer[$"DisplayName:{argument}"];
+
+        if (localization.ResourceNotFound)
+        {
+            // then try to localize with just "{Name}"
+            localization = stringLocalizer[argument];
+        }
+
+        yield return localization;
+    }
+}
+```
+
+A validation message like `"The {0} field is required."` gets the argument `"Name"` looked up first as `"DisplayName:Name"`, then as `"Name"` — letting you keep separate display-name resources without breaking standard string keys.
+
+## Server URL provider
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Web/DefaultServerUrlProvider.cs
+public class DefaultServerUrlProvider : IServerUrlProvider, ISingletonDependency
+{
+    public Task<string> GetBaseUrlAsync(string? remoteServiceName = null)
+    {
+        return Task.FromResult("/");
+    }
+}
+```
+
+`/` is correct for non-tiered Blazor Server (the API lives in the same process). WebAssembly and MAUI replace this with implementations that resolve from `RemoteServices` configuration.
+
+## Alert manager
+
+```csharp framework/src/Volo.Abp.AspNetCore.Components.Web/Alerts/AlertManager.cs
+public class AlertManager : IAlertManager, IScopedDependency
+{
+    public AlertList Alerts { get; }
+
+    public AlertManager()
+    {
+        Alerts = new AlertList();
+    }
+}
+```
+
+Scoped — one `AlertList` per component scope, which means per `AbpComponentBase`-derived component instance. Inline alerts (top-of-page banners) are added with `Alerts.Add(new AlertMessage(AlertType.Warning, "..."))` and rendered by themed `AlertList` views.
+
+## Cross-host extension points
+
+| Interface | Why it exists |
+|-----------|---------------|
+| `ICurrentApplicationConfigurationCacheResetService` | Lets Server publish a local event, Wasm/MAUI just clear the in-memory cache. |
+| `ILookupApiRequestService` | Lets Server fall back to in-process headers and Wasm/MAUI hit the configured remote base URL. |
+| `IClientScopeServiceProviderAccessor` | Resolves the **client root** scope from within a per-component scope (where `ScopedServices` would otherwise return the component's nested scope). |
+
+## Gotchas
+
+<Warning>
+  `AbpBlazorClientHttpMessageHandler` is added to the proxy `IHttpClientBuilder` in `PreConfigureServices`. If you register your own typed clients outside the proxy generator (raw `AddHttpClient<T>`) the handler is not attached — call `.AddHttpMessageHandler<AbpBlazorClientHttpMessageHandler>()` yourself.
+</Warning>
+
+<Warning>
+  The language read by the handler is the *user-selected* language stored in `localStorage`, not the thread culture. If you set culture via code without writing the localStorage key, outgoing HTTP calls won't carry it.
+</Warning>
+
+<Note>
+  `IClientScopeServiceProviderAccessor` is the seam to use whenever you need a service that should be **per circuit / per host** but you're in a per-component scope: `Accessor.ServiceProvider.GetRequiredService<T>()` skips the component's child scope.
+</Note>
+
+## Cross-links
+
+<CardGroup cols={2}>
+  <Card title="Message services" icon="comment" href="/framework/ui-blazor/blazor-message-services">
+    IUiMessageService deep dive across Blazorise and Simple.
+  </Card>
+  <Card title="Modal services" icon="window-restore" href="/framework/ui-blazor/blazor-modal-services">
+    Modal hosts, event dispatch, and confirm dialogs.
+  </Card>
+  <Card title="Localization" icon="globe" href="/framework/ui-blazor/blazor-localization">
+    L localizer, language switcher and Accept-Language flow.
+  </Card>
+  <Card title="Server circuits" icon="bolt" href="/framework/ui-blazor/blazor-server-circuits">
+    Scope model that backs the providers above.
+  </Card>
+</CardGroup>

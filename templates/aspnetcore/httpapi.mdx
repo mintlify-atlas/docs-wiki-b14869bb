@@ -1,0 +1,151 @@
+---
+title: "HttpApi Project"
+description: "Manual MVC controllers, conventional controllers' base class, and the HTTP-side localization wiring that joins application services to HTTP transport."
+---
+
+`MyCompanyName.MyProjectName.HttpApi` is the **MVC layer**: a thin assembly that hosts the manually-written controllers for your application. In the default template most endpoints are produced automatically from `IApplicationService` interfaces (see [Auto API Controllers](https://docs.abp.io/en/abp/latest/API/Auto-API-Controllers)), but anything that needs custom routing, file upload, server-sent events, or a non-standard return type lives here.
+
+This project is referenced by both the HTTP API host and the MVC/Blazor Server hosts so a controller written here is exposed through every host that runs the API.
+
+## When to put code here
+
+Add a file here when it is:
+
+- A controller that does **not** map cleanly to an `IApplicationService` method (file streaming, model-binding sources, custom auth headers).
+- A controller that needs to override the auto-API route convention.
+- A view-model or request model that is *only* used by HTTP transport (not by the application service).
+
+Auto-generated CRUD endpoints do **not** require any code here; declaring `IBookAppService` in `Application.Contracts` and implementing it in `Application` is enough.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.HttpApi/
+├── Controllers/
+│   └── MyProjectNameController.cs
+├── Models/
+│   └── Test/
+│       └── ...
+├── MyCompanyName.MyProjectName.HttpApi.csproj
+└── MyProjectNameHttpApiModule.cs
+```
+
+## csproj at a glance
+
+| Property            | Value                                              |
+| ------------------- | -------------------------------------------------- |
+| `TargetFramework`   | `net7.0`                                           |
+| `Nullable`          | `enable`                                           |
+| `RootNamespace`     | `MyCompanyName.MyProjectName`                      |
+
+| Project reference                                                       | Purpose                                  |
+| ----------------------------------------------------------------------- | ---------------------------------------- |
+| `MyCompanyName.MyProjectName.Application.Contracts`                     | Service interfaces, DTOs, permissions     |
+| `Volo.Abp.Account.HttpApi`                                              | Account API endpoints                    |
+| `Volo.Abp.Identity.HttpApi`                                             | Identity user/role API                   |
+| `Volo.Abp.PermissionManagement.HttpApi`                                 | Permission grants API                    |
+| `Volo.Abp.TenantManagement.HttpApi`                                     | Tenant management API                    |
+| `Volo.Abp.FeatureManagement.HttpApi`                                    | Feature management API                   |
+| `Volo.Abp.SettingManagement.HttpApi`                                    | Setting management API                   |
+
+The project references **`Application.Contracts`** — not `Application` — because controllers only need the interfaces and DTOs, never the server-side implementation. Keeping the dependency narrow makes it easy to host the API in a tiered deployment where the controllers run on one machine and the application services on another.
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameApplicationContractsModule),
+    typeof(AbpAccountHttpApiModule),
+    typeof(AbpIdentityHttpApiModule),
+    typeof(AbpPermissionManagementHttpApiModule),
+    typeof(AbpTenantManagementHttpApiModule),
+    typeof(AbpFeatureManagementHttpApiModule),
+    typeof(AbpSettingManagementHttpApiModule))]
+public class MyProjectNameHttpApiModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        ConfigureLocalization();
+    }
+
+    private void ConfigureLocalization()
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources
+                .Get<MyProjectNameResource>()
+                .AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+The single responsibility of this module is to extend `MyProjectNameResource` with `AbpUiResource` as a base type. That gives every controller (and every DTO validation message) access to UI-level localization keys (`Volo.Abp.AspNetCore.Mvc:0001`, etc.) without having to copy them into the application resource.
+
+## Key types
+
+### MyProjectNameController
+
+```csharp
+public abstract class MyProjectNameController : AbpControllerBase
+{
+    protected MyProjectNameController()
+    {
+        LocalizationResource = typeof(MyProjectNameResource);
+    }
+}
+```
+
+The base class your custom controllers should inherit from. It gives you:
+
+- `IStringLocalizer L` scoped to `MyProjectNameResource`.
+- Property injection for `ICurrentUser`, `ICurrentTenant`, `IGuidGenerator`, `ILogger`.
+- The `[Area("api")]` and route-prefix conventions inherited from `AbpControllerBase`.
+
+### Models/Test
+
+The template ships an empty `Models/Test` folder as a placeholder. Group your request/response models by feature here (`Models/Books/CreateBookRequest.cs`) or directly under `Models/`.
+
+## How to add a manual controller
+
+```csharp
+[RemoteService]
+[Route("api/app/files")]
+public class FileController : MyProjectNameController
+{
+    private readonly IBlobContainer _blobContainer;
+
+    public FileController(IBlobContainer blobContainer)
+    {
+        _blobContainer = blobContainer;
+    }
+
+    [HttpPost("upload")]
+    public async Task UploadAsync(IFormFile file)
+    {
+        await using var stream = file.OpenReadStream();
+        await _blobContainer.SaveAsync(file.FileName, stream, overrideExisting: true);
+    }
+}
+```
+
+The `[RemoteService]` attribute tells the ABP framework to expose the controller through the standard `/api` pipeline and include it in the auto-generated client proxies if the controller's interface is in `Application.Contracts`.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| File upload endpoint                  | New controller deriving from `MyProjectNameController`           |
+| Route prefix override                 | `[Route("api/foo")]` on the controller                            |
+| Disable auto-API for a service        | `[RemoteService(IsEnabled = false)]` on the application service  |
+| Extra localization base type          | `options.Resources.Get<MyProjectNameResource>().AddBaseTypes(...)` in this module |
+| Custom HTTP exception filter          | Implement `IAsyncExceptionFilter` and register globally          |
+
+## Gotchas
+
+- **Auto API controllers are generated from `Application.Contracts`, not from here.** The host registers `ConventionalControllers.Create(typeof(MyProjectNameApplicationModule).Assembly)` — referencing the *Application* assembly's interfaces. Controllers declared in this project run alongside the generated ones.
+- **The `IFormFile` parameter binding requires `[FromForm]` for multi-part requests** when the controller has more than one parameter. Forgetting it produces a confusing `415 Unsupported Media Type`.
+- **Don't reference `Application` from this project.** The interfaces in `Application.Contracts` are enough. Pulling in `Application` defeats the tiered deployment scenario where this DLL is published with the API host but the application services live elsewhere.
+- **`AddBaseTypes(typeof(AbpUiResource))` is required for validation messages.** Removing it breaks the `Volo.Abp.AspNetCore.Mvc:DefaultMessage` translations and your `[Required]`/`[StringLength]` attributes will produce English-only error text.
+- **`MyProjectNameController` does NOT inherit from `ControllerBase`** directly — it inherits from `AbpControllerBase`, which wires unit-of-work, audit logging, and unified exception handling. Bypassing it with a raw `ControllerBase` removes the cross-cutting concerns.
+- **Routes are case-insensitive but logged with the configured casing.** Use kebab-case (`api/app/books/by-author`) for consistency with the rest of the ABP-generated endpoints.

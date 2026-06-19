@@ -1,0 +1,268 @@
+---
+title: "@abp/ng.account-core"
+description: "Headless services shared between the default Bootstrap account UI and the LeptonX account layout — AuthWrapperService and TenantBoxService."
+---
+
+`@abp/ng.account-core` is a thin, *theme-agnostic* package. It exposes two services that any account UI (the default `@abp/ng.account` pages, the LeptonX `@abp/ng.theme.lepton-x/account` layout, or your own custom screens) can consume to drive the surrounding chrome: the auth wrapper around the form and the tenant-switch box.
+
+By design it has no template / styling code — that lives in whichever theme renders the actual buttons and modals.
+
+## File tree
+
+```text
+packages/account-core/
+├── package.json            # "@abp/ng.account-core" — version 7.4.0
+├── ng-package.json
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── auth-wrapper.service.ts
+        └── tenant-box.service.ts
+```
+
+That's it — two services, one public-api barrel, no templates, no module.
+
+## `public-api.ts`
+
+```typescript
+// packages/account-core/src/public-api.ts
+/*
+ * Public API Surface of account-core
+ */
+
+export * from './lib/auth-wrapper.service';
+export * from './lib/tenant-box.service';
+```
+
+Because there is no `NgModule`, both services are `@Injectable()` *without* `providedIn`. Consumers register them inside the theme's account layout module.
+
+## AuthWrapperService
+
+Drives the auth-shell template — decides whether self-registration links should be shown, whether the *Login locally* toggle is visible (`Abp.Account.EnableLocalLogin` setting), and whether the tenant-switch box is rendered for the current route.
+
+```typescript
+// packages/account-core/src/lib/auth-wrapper.service.ts
+@Injectable()
+export class AuthWrapperService {
+  isMultiTenancyEnabled$ = this.configState.getDeep$('multiTenancy.isEnabled');
+
+  get enableLocalLogin$(): Observable<boolean> {
+    return this.configState
+      .getSetting$('Abp.Account.EnableLocalLogin')
+      .pipe(map(value => value?.toLowerCase() !== 'false'));
+  }
+
+  tenantBoxKey = 'Account.TenantBoxComponent';
+  route: ActivatedRoute;
+
+  get isTenantBoxVisibleForCurrentRoute() {
+    return this.getMostInnerChild().data.tenantBoxVisible ?? true;
+  }
+
+  get isTenantBoxVisible() {
+    return this.isTenantBoxVisibleForCurrentRoute && this.multiTenancy.isTenantBoxVisible;
+  }
+
+  constructor(
+    public readonly multiTenancy: MultiTenancyService,
+    private configState: ConfigStateService,
+    injector: Injector,
+  ) {
+    this.route = injector.get(ActivatedRoute);
+  }
+
+  private getMostInnerChild() {
+    let child = this.route.snapshot;
+    let depth = 0;
+    const depthLimit = 10;
+    while (child.firstChild && depth < depthLimit) {
+      child = child.firstChild;
+      depth++;
+    }
+    return child;
+  }
+}
+```
+
+### What it observes
+
+| Stream / getter | Source | Used to |
+| --------------- | ------ | ------- |
+| `isMultiTenancyEnabled$` | `ConfigStateService.getDeep$('multiTenancy.isEnabled')` | hide/show the tenant box wholesale |
+| `enableLocalLogin$` | `ConfigStateService.getSetting$('Abp.Account.EnableLocalLogin')` | hide/show the local login form |
+| `isTenantBoxVisibleForCurrentRoute` | `route.snapshot.data.tenantBoxVisible` | route-level opt-out (set `data: { tenantBoxVisible: false }` to hide for a single page) |
+| `isTenantBoxVisible` | combination of the two above + `MultiTenancyService.isTenantBoxVisible` | the value the template binds to |
+
+### Why `getMostInnerChild`
+
+The account layout sits at the top of the lazy module — the `ActivatedRoute` it receives is the *outer* one. Walking the snapshot tree (capped at depth 10 to prevent runaway loops) finds the leaf route whose `data.tenantBoxVisible` matters.
+
+### Wiring
+
+The LeptonX account layout (and the basic theme's `AccountLayoutComponent`) provides the service in its own module:
+
+```typescript
+@NgModule({
+  declarations: [AuthWrapperComponent /* template that uses the service */],
+  providers: [AuthWrapperService],
+})
+export class AccountLayoutModule {}
+```
+
+The template typically looks like:
+
+```html
+<div class="card auth-card">
+  <abp-tenant-box *ngIf="auth.isTenantBoxVisible"></abp-tenant-box>
+
+  <ng-container *ngIf="auth.enableLocalLogin$ | async">
+    <ng-content></ng-content>
+  </ng-container>
+
+  <div *ngIf="(auth.isMultiTenancyEnabled$ | async) === false">
+    <small>{{ '::SingleTenantWarning' | abpLocalization }}</small>
+  </div>
+</div>
+```
+
+## TenantBoxService
+
+Drives the *Switch tenant* modal. It reads/writes the current tenant via `SessionStateService` and refreshes the application configuration after each switch:
+
+```typescript
+// packages/account-core/src/lib/tenant-box.service.ts
+@Injectable()
+export class TenantBoxService {
+  currentTenant$ = this.sessionState.getTenant$();
+  name?: string;
+  isModalVisible!: boolean;
+  modalBusy!: boolean;
+
+  constructor(
+    private toasterService: ToasterService,
+    private tenantService: AbpTenantService,
+    private sessionState: SessionStateService,
+    private configState: ConfigStateService,
+  ) {}
+
+  onSwitch() {
+    const tenant = this.sessionState.getTenant();
+    this.name = tenant?.name || '';
+    this.isModalVisible = true;
+  }
+
+  save() {
+    if (!this.name) {
+      this.setTenant(null);
+      this.isModalVisible = false;
+      return;
+    }
+
+    this.modalBusy = true;
+    this.tenantService
+      .findTenantByName(this.name)
+      .pipe(finalize(() => (this.modalBusy = false)))
+      .subscribe(({ success, tenantId: id, ...tenant }) => {
+        if (!success) { this.showError(); return; }
+        this.setTenant({ ...tenant, id, isAvailable: true });
+        this.isModalVisible = false;
+      });
+  }
+
+  private setTenant(tenant: CurrentTenantDto | null) {
+    this.sessionState.setTenant(tenant);
+    this.configState.refreshAppState();
+  }
+
+  private showError() { /* toaster.error(...) */ }
+}
+```
+
+### Flow
+
+1. Template binds a button to `tenantBox.onSwitch()` — opens the modal and pre-fills `name` with the current tenant.
+2. User edits the name and clicks *Save*.
+3. `save()` calls `AbpTenantService.findTenantByName()` (the auto-generated proxy under `proxy/pages/abp/multi-tenancy`).
+4. If the response's `success` flag is true, the tenant is written to `SessionStateService`, and `ConfigStateService.refreshAppState()` re-fetches application configuration with the new `__tenant` header in scope (permissions, features and settings may all change).
+5. If `name` is empty, the host (the "Not a tenant?" path) is selected by writing `null` to session state.
+
+### Template (basic theme)
+
+The default basic theme renders the modal like this (excerpt from `theme-basic`):
+
+```html
+<button class="btn btn-link" (click)="service.onSwitch()">
+  {{ (service.currentTenant$ | async)?.name || ('::NotASelectedTenant' | abpLocalization) }}
+</button>
+
+<abp-modal [(visible)]="service.isModalVisible" [busy]="service.modalBusy">
+  <ng-template #abpHeader>{{ '::SwitchTenant' | abpLocalization }}</ng-template>
+  <ng-template #abpBody>
+    <input class="form-control" [(ngModel)]="service.name"
+           placeholder="{{ '::Name' | abpLocalization }}" />
+  </ng-template>
+  <ng-template #abpFooter>
+    <button class="btn btn-primary" (click)="service.save()">
+      {{ 'AbpUi::Save' | abpLocalization }}
+    </button>
+  </ng-template>
+</abp-modal>
+```
+
+## Why a separate package?
+
+Before `account-core` existed, both the basic theme and LeptonX duplicated this logic. Promoting the services to their own package means:
+
+* No theme has a runtime dependency on another theme.
+* Custom themes can reuse the same logic without pulling in Bootstrap-styled templates.
+* The `@abp/ng.account` page components stay focused on the form itself — the surrounding chrome lives in the theme.
+
+## Usage in a custom theme
+
+```typescript
+import { NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { CoreModule } from '@abp/ng.core';
+import { ThemeSharedModule } from '@abp/ng.theme.shared';
+import { AuthWrapperService, TenantBoxService } from '@abp/ng.account-core';
+
+@Component({
+  selector: 'my-auth-wrapper',
+  template: `<!-- your branded shell using authWrapperService.* -->`,
+})
+export class MyAuthWrapperComponent {
+  constructor(public authWrapperService: AuthWrapperService) {}
+}
+
+@NgModule({
+  imports: [CommonModule, CoreModule, ThemeSharedModule],
+  declarations: [MyAuthWrapperComponent],
+  providers: [AuthWrapperService, TenantBoxService],
+  exports: [MyAuthWrapperComponent],
+})
+export class MyAccountLayoutModule {}
+```
+
+Then register the wrapper as the replacement for `eAccountComponents.AuthWrapper` so the default account pages render it instead of the basic theme's version:
+
+```typescript
+constructor(replaceable: ReplaceableComponentsService) {
+  replaceable.add({
+    key: 'Account.AuthWrapperComponent',
+    component: MyAuthWrapperComponent,
+  });
+}
+```
+
+## Gotchas
+
+* Neither service is `providedIn: 'root'`. Forgetting to add them to the layout module's `providers` array yields `NullInjectorError` at the first injection.
+* `TenantBoxService.save()` mutates session state only when `success === true`. If your backend returns a custom shape, you may need to wrap `AbpTenantService` rather than this service.
+* `AuthWrapperService` looks up `route.snapshot.data.tenantBoxVisible` — that key is only honoured when the consuming app's route declaration provides it. If you swap the routing module, propagate that data key or the box will always be visible.
+* `ConfigStateService.refreshAppState()` returns an Observable; `TenantBoxService.setTenant` calls it but doesn't subscribe. The internal store is updated regardless because `ConfigStateService` itself subscribes to its own subject — but if you wrap or replace `setTenant` and rely on the result, remember to subscribe.
+
+## Related pages
+
+* `ng/account.mdx` — the page components that consume the AuthWrapper slot.
+* `ng/theme-basic.mdx` — concrete templates that render `AuthWrapperService` / `TenantBoxService`.
+* `ng/core.mdx` — `MultiTenancyService`, `SessionStateService` and `ConfigStateService` semantics.

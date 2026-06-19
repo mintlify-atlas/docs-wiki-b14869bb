@@ -1,0 +1,155 @@
+---
+title: "@abp/vue"
+description: "Resource-mapping helper for Vue 2.6 inside ABP MVC projects. Copies `vue.min.js` from `node_modules` into `wwwroot/libs/vue/` so Razor pages can sprinkle Vue components without a bundler."
+---
+
+`@abp/vue` is the smallest, simplest pack documented in this section. It does **one thing**: tell
+`abp install-libs` to copy `node_modules/vue/dist/vue.min.js` into `wwwroot/libs/vue/`. ABP itself
+does not build a Vue-based UI; this pack exists for the rare Razor pages that embed Vue components
+inline via `<script>` tags rather than a build pipeline.
+
+## Package metadata
+
+From `npm/packs/vue/package.json`:
+
+```json
+{
+    "name": "@abp/vue",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "vue": "~2.6.12"
+    }
+}
+```
+
+The pinned Vue version is **2.6.12** — Vue 2's last minor before the Vue 3 cutover. ABP did not
+upgrade the pack to Vue 3 because the use case (load `vue.min.js` from a CDN-style local copy and
+sprinkle `new Vue({ ... })` in a Razor view) is uncommon enough that doing so would more likely break
+existing customers than help them.
+
+## Files shipped
+
+```text
+@abp/vue/
+├── package.json
+├── README.md
+└── abp.resourcemapping.js
+```
+
+The full resource mapping:
+
+```js
+// npm/packs/vue/abp.resourcemapping.js
+module.exports = {
+    mappings: {
+        "@node_modules/vue/dist/vue.min.js": "@libs/vue/"
+    }
+};
+```
+
+Result on disk:
+
+```text
+wwwroot/libs/vue/vue.min.js
+```
+
+The pack does **not** ship `vue.runtime.min.js`, `vue.common.js`, or any of the other Vue 2
+distributions — only `vue.min.js`, the full browser build including the template compiler. That is the
+right choice for inline use because it lets you write template strings directly in HTML.
+
+## Using Vue from a Razor view
+
+A Razor view component that hosts a small Vue island:
+
+```html
+@page
+@model CartModel
+
+<div id="cart-app">
+    <h2>{{ "{{" }} items.length {{ "}}" }} items in cart</h2>
+    <ul>
+        <li v-for="item in items" :key="item.id">
+            {{ "{{" }} item.name {{ "}}" }} — {{ "{{" }} item.price | currency {{ "}}" }}
+        </li>
+    </ul>
+    <button @@click="checkout" :disabled="!items.length">Checkout</button>
+</div>
+
+@section Scripts {
+    <script src="~/libs/vue/vue.min.js"></script>
+    <script>
+        new Vue({
+            el: '#cart-app',
+            data: { items: @Html.Raw(Json.Serialize(Model.Items)) },
+            filters: {
+                currency: function (v) { return '$' + v.toFixed(2); }
+            },
+            methods: {
+                checkout: function () {
+                    fetch('/api/cart/checkout', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'RequestVerificationToken': abp.security.antiForgery.getToken()
+                        },
+                        body: JSON.stringify({ items: this.items })
+                    }).then(() => abp.notify.success('Checked out'));
+                }
+            }
+        });
+    </script>
+}
+```
+
+Note the `@@click` escape — Razor needs that to emit a literal `@click` for Vue. The
+`abp.security.antiForgery.getToken()` call comes from [`@abp/core`](/npm/core); the `abp.notify.success`
+body is installed by `@abp/toastr` via
+[`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared).
+
+## When you would actually use this
+
+The pack covers a narrow but real niche:
+
+- **Marketing pages** that need richer interactivity than jQuery but where you don't want to scaffold
+  a Vue CLI / Vite project for a single page.
+- **Admin diagnostic dashboards** where a small reactive widget (e.g. a live-updating job queue) is
+  cleaner than imperative jQuery.
+- **Custom themes** that want to render a small Vue island inside the layout — the language picker or
+  cart count, say.
+
+If you are building a full Vue SPA against ABP, **use the ABP Angular SDK or the standalone HTTP API
+plus a regular Vue CLI / Vite project**, not this pack. The pack is intentionally minimal.
+
+## Vue 3 / Pinia / Vuex
+
+There is no `@abp/vue3` pack. If you need Vue 3:
+
+- Reference Vue 3 directly from a CDN or your own bundler.
+- Do not list `@abp/vue` in `package.json` — it would still install the Vue 2 binary alongside, which
+  is confusing.
+
+## Gotchas
+
+- **Vue 2 only**, and `^2.6.12` specifically. Newer 2.7.x releases are not pinned.
+- **`vue.min.js` is the *full* build**, ~33 KB gzipped. The runtime-only build (~22 KB gzipped) is
+  not shipped because the inline-template use case would break without the template compiler.
+- **CSP `unsafe-eval`.** The full Vue 2 build runs `new Function(renderFn)` internally. If your CSP
+  forbids `unsafe-eval`, switch to the runtime-only build manually (you'll need to compile templates
+  ahead of time) — `@abp/vue` does not help here.
+- **No `abp.*` shim.** There is no `abp.vue.*` namespace and no Vue plugin that auto-wires
+  `abp.localization` etc. Reference `abp.localization.getResource(...)` directly inside computed
+  properties.
+- **Vue's `$delete` and `$set`** are needed for adding new keys to a reactive object in Vue 2. If you
+  forget and just assign `this.items[3] = newItem`, Vue won't react.
+- **The package would also work with Razor pages in Blazor Server**, but mixing Vue islands with
+  Blazor's render tree is a recipe for state drift — prefer Blazor's own components.
+
+## Related pages
+
+- [`@abp/core`](/npm/core) — provides `abp.notify`, `abp.security.antiForgery`, `abp.appPath` that
+  Vue islands reach into.
+- [`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) — provides the
+  Toastr-backed notification implementation behind `abp.notify.success`.
+- The ABP framework's [Angular UI documentation](/framework/ui/angular/quick-start) for the supported
+  SPA stack.

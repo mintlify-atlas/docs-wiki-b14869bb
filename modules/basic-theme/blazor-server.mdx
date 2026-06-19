@@ -1,0 +1,301 @@
+---
+title: "Basic Theme — Blazor Server"
+sidebarTitle: "Blazor Server"
+description: "Walkthrough of Volo.Abp.AspNetCore.Components.Server.BasicTheme — the server-side circuit theme that wires the shared Blazor MainLayout into an ASP.NET Core host with cookie / OpenIddict authentication."
+---
+
+`Volo.Abp.AspNetCore.Components.Server.BasicTheme` is the Blazor Server flavour of the [Basic Theme](/modules/basic-theme/overview). It is intentionally tiny: the visible chrome (`MainLayout`, `NavMenu`, `Branding`, `NavToolbar`, `PageAlert`, `FirstLevelNavMenuItem`, `SecondLevelNavMenuItem`, `App.razor`) lives in `Volo.Abp.AspNetCore.Components.Web.BasicTheme` — the shared Razor Class Library described in [blazor-web.mdx](/modules/basic-theme/blazor-web). The server package adds two server-only Razor components (`LoginDisplay`, `LanguageSwitch`), a toolbar contributor, and two bundle contributors.
+
+## Module wiring
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebBasicThemeModule),
+    typeof(AbpAspNetCoreComponentsServerThemingModule)
+)]
+public class AbpAspNetCoreComponentsServerBasicThemeModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpToolbarOptions>(options =>
+        {
+            options.Contributors.Add(new BasicThemeToolbarContributor());
+        });
+
+        Configure<AbpBundlingOptions>(options =>
+        {
+            options.StyleBundles.Add(BlazorBasicThemeBundles.Styles.Global, bundle =>
+            {
+                bundle
+                    .AddBaseBundles(BlazorStandardBundles.Styles.Global)
+                    .AddContributors(typeof(BlazorBasicThemeStyleContributor));
+            });
+
+            options.ScriptBundles.Add(BlazorBasicThemeBundles.Scripts.Global, bundle =>
+            {
+                bundle
+                    .AddBaseBundles(BlazorStandardBundles.Scripts.Global)
+                    .AddContributors(typeof(BlazorBasicThemeScriptContributor));
+            });
+        });
+    }
+}
+```
+
+The dependency chain is the key detail:
+
+- `AbpAspNetCoreComponentsWebBasicThemeModule` brings in the shared layout / nav components and registers `BasicTheme` as the default theme.
+- `AbpAspNetCoreComponentsServerThemingModule` brings in the server-side hosting glue — the `_Host.cshtml` discovery, the `MapBlazorHub` extensions, and the `AbpRouterOptions` server defaults.
+
+Together they make the server host renderable. The server package itself contributes the auth-aware toolbar items and the global bundles for static assets served from `wwwroot`.
+
+## File inventory
+
+Under `modules/basic-theme/src/Volo.Abp.AspNetCore.Components.Server.BasicTheme/`:
+
+| Path | Role |
+| --- | --- |
+| `AbpAspNetCoreComponentsServerBasicThemeModule.cs` | Module class. |
+| `BasicThemeToolbarContributor.cs` | Adds `LoginDisplay` and `LanguageSwitch` to `StandardToolbars.Main`. |
+| `Bundling/BlazorBasicThemeBundles.cs` | Bundle name constants (`Blazor.BasicTheme.Global`). |
+| `Bundling/BlazorBasicThemeStyleContributor.cs` | Adds `theme.css` from the shared web package's RCL. |
+| `Bundling/BlazorBasicThemeScriptContributor.cs` | Currently empty — kept for forward-compatible registration. |
+| `Themes/Basic/LoginDisplay.razor(.cs)` | Authenticated user dropdown using `AuthorizeView` and `IMenuManager`. |
+| `Themes/Basic/LanguageSwitch.razor` | Language picker that round-trips through the MVC `Abp/Languages/Switch` endpoint. |
+| `Themes/Basic/_Imports.razor` | Shared Razor `@using` declarations. |
+
+## Bundle contributors
+
+```csharp
+public class BlazorBasicThemeStyleContributor : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.AddIfNotContains(
+            "/_content/Volo.Abp.AspNetCore.Components.Web.BasicTheme/libs/abp/css/theme.css");
+    }
+}
+
+public class BlazorBasicThemeScriptContributor : BundleContributor
+{
+}
+```
+
+`theme.css` is shipped inside the shared `Volo.Abp.AspNetCore.Components.Web.BasicTheme` Razor Class Library, hence the `/_content/...` static-web-assets prefix. This is the only theme-owned CSS the Blazor Server host loads — the rest of the styling comes from the inherited `BlazorStandardBundles.Styles.Global` (which already includes Bootstrap, FontAwesome, the Blazorise CSS layer, and the framework's `abp-blazor.css`).
+
+The script contributor is intentionally empty. The shared web library publishes no theme-specific JS — Blazorise dropdowns and modals handle the interactive bits, and the framework's `blazor.server.js` is added automatically by the standard bundle.
+
+`BlazorBasicThemeBundles` is the constants holder:
+
+```csharp
+public class BlazorBasicThemeBundles
+{
+    public static class Styles  { public static string Global = "Blazor.BasicTheme.Global"; }
+    public static class Scripts { public static string Global = "Blazor.BasicTheme.Global"; }
+}
+```
+
+Notice these are `public static string` rather than `public const string` — the Blazor bundle names are intentionally mutable to allow host overrides in extreme customisation scenarios, though no template does this.
+
+## Toolbar contributor
+
+```csharp
+public class BasicThemeToolbarContributor : IToolbarContributor
+{
+    public Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name == StandardToolbars.Main)
+        {
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LoginDisplay)));
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LanguageSwitch)));
+        }
+        return Task.CompletedTask;
+    }
+}
+```
+
+There is no `is BasicTheme` guard — in Blazor the contributor is the only place this happens, and a host that swaps to LeptonX would also swap out the toolbar contributor at registration time. There is also no `ICurrentUser.IsAuthenticated` check; `LoginDisplay` itself uses an `<AuthorizeView>` to switch between "Login" link and user dropdown, so it is safe to register unconditionally.
+
+## `LoginDisplay.razor`
+
+This is the headline component of the server package. It listens for `AuthorizeView` state and renders one of two things:
+
+```razor
+<AuthorizeView>
+    <Authorized>
+        <Dropdown RightAligned="true">
+            <DropdownToggle Color="Color.Default">
+                @if (CurrentTenant.Name != null)
+                {
+                    <span><i>@CurrentTenant.Name</i>\@CurrentUser.UserName</span>
+                }
+                else
+                {
+                    <span>@CurrentUser.UserName</span>
+                }
+            </DropdownToggle>
+            <DropdownMenu>
+                @if (Menu != null)
+                {
+                    @foreach (var menuItem in Menu.Items)
+                    {
+                        <a class="dropdown-item"
+                           href="@menuItem.Url?.TrimStart('/', '~')"
+                           target="@menuItem.Target">
+                           @menuItem.DisplayName
+                        </a>
+                    }
+                }
+            </DropdownMenu>
+        </Dropdown>
+    </Authorized>
+    <NotAuthorized>
+        <a class="nav-link" href="Account/Login">@L["Login"]</a>
+    </NotAuthorized>
+</AuthorizeView>
+```
+
+When authenticated:
+
+- The dropdown toggle shows `tenantName\userName` (with `\` separator, matching Windows-style domain conventions) or just `userName` for the host tenant.
+- The dropdown items come from `IMenuManager.GetAsync(StandardMenus.User)` — populated by Identity, Account, and other modules with "My account", "Manage your settings", "Sign out", etc.
+- Each item's URL is trimmed of leading `/` and `~` because the dropdown renders inside a Blazor circuit; clicking `Account/Logout` performs a full page navigation through the standard ASP.NET Core auth flow.
+
+When unauthenticated:
+
+- A plain `<a href="Account/Login">` link is shown. This is again a full page navigation — Blazor Server cannot trigger an OIDC sign-in flow from within the circuit, so it intentionally falls back to the MVC `Account/Login` Razor Page.
+
+The code-behind subscribes to `NavigationManager.LocationChanged` and calls `StateHasChanged` on every navigation:
+
+```csharp
+public partial class LoginDisplay : IDisposable
+{
+    [Inject] protected IMenuManager MenuManager { get; set; }
+    protected ApplicationMenu Menu { get; set; }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Menu = await MenuManager.GetAsync(StandardMenus.User);
+        Navigation.LocationChanged += OnLocationChanged;
+    }
+
+    protected virtual void OnLocationChanged(object sender, LocationChangedEventArgs e)
+    {
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => Navigation.LocationChanged -= OnLocationChanged;
+}
+```
+
+The `LocationChanged` re-render is important: when a user logs out, the framework redirects to `/`, the circuit reconnects, and `AuthorizeView` needs a hint to re-evaluate. Without this subscription the dropdown can briefly continue to show the previous user's name.
+
+## `LanguageSwitch.razor`
+
+Uses Blazorise's `BarDropdown` component (different from `LoginDisplay`'s `Dropdown` — `BarDropdown` is specifically styled for navbar use).
+
+```razor
+@if (_otherLanguages != null && _otherLanguages.Any())
+{
+    <BarDropdown RightAligned="true">
+        <BarDropdownToggle>@_currentLanguage.DisplayName</BarDropdownToggle>
+        <BarDropdownMenu>
+            @foreach (var language in _otherLanguages)
+            {
+                <BarDropdownItem Clicked="() => ChangeLanguage(language)">
+                    @language.DisplayName
+                </BarDropdownItem>
+            }
+        </BarDropdownMenu>
+    </BarDropdown>
+}
+```
+
+Language change goes through the MVC `Abp/Languages/Switch` endpoint via a force-load navigation:
+
+```csharp
+private void ChangeLanguage(LanguageInfo language)
+{
+    var relativeUrl = NavigationManager.Uri
+        .RemovePreFix(NavigationManager.BaseUri)
+        .EnsureStartsWith('/')
+        .EnsureStartsWith('~');
+
+    NavigationManager.NavigateTo(
+        $"Abp/Languages/Switch?culture={language.CultureName}&uiCulture={language.UiCultureName}&returnUrl={relativeUrl}",
+        forceLoad: true);
+}
+```
+
+`forceLoad: true` is essential: the language-switch endpoint writes a culture cookie, and the cookie must apply to the next request so the Blazor circuit re-bootstraps under the new culture. A normal Blazor navigation would keep the circuit alive and the cookie write would not take effect until the next page reload.
+
+The current language fallback mirrors the MVC `LanguageSwitchViewComponent` — three tiers: the `LanguageProvider`'s exact match, then `RequestLocalizationOptionsProvider.DefaultRequestCulture`, then `CultureInfo.CurrentCulture`/`CurrentUICulture`. This three-tier fallback exists because in minimal Linux containers the framework default culture may not be in the `LanguageProvider` list (the operator forgot to register it), but the user has still made it the current request culture via the request pipeline.
+
+## How everything composes at request time
+
+A Blazor Server request lifecycle through the Basic theme:
+
+1. Browser hits `/foo` on the host. The host's `App.razor` (from `Volo.Abp.AspNetCore.Components.Web.BasicTheme`) wraps a `CascadingAuthenticationState` around the `Router`.
+2. The router resolves `RouterOptions.AppAssembly` and `AdditionalAssemblies`, finds the page, and renders it inside `AuthorizeRouteView` with `DefaultLayout = typeof(MainLayout)`.
+3. `MainLayout` (also in the shared package) renders the dark navbar containing `<Branding />`, `<NavMenu />`, and `<NavToolbar />`. The `NavToolbar` iterates `AbpToolbarOptions.Contributors` and produces `<LoginDisplay />` and `<LanguageSwitch />` in order.
+4. The page body renders inside `<div class="container">`. `<PageAlert />` reads `IAlertManager`. `<DynamicLayoutComponent />` adds the dynamic claims toast surface. `<UiMessageAlert />`, `<UiNotificationAlert />`, `<UiPageProgress />` are framework-level interactive layers.
+5. `BlazorBasicThemeBundles.Styles.Global` is emitted by the server theming module's `_Host.cshtml` integration; the bundle includes Bootstrap, Blazorise, the framework's blazor CSS, plus this package's `theme.css`.
+
+## Authentication wiring
+
+The Blazor Server template wires authentication outside the theme — typically with OpenIddict, cookie auth, and a fallback `MapBlazorHub` policy. The theme makes only one authentication assumption: a registered `AuthenticationStateProvider`. Without it, `<AuthorizeView>` will throw at render time. The template uses `AddServerSideBlazor()` which registers the default `RevalidatingServerAuthenticationStateProvider`, and the Account/OpenIddict modules supply the actual identity backends.
+
+The `Account/Login` link in `LoginDisplay`'s `NotAuthorized` branch is **literal**: it expects a Razor Page at that path. The Account module supplies this page; if you replace Account with a custom auth UI, override `LoginDisplay` (drop a file at `Themes/Basic/LoginDisplay.razor` in your host project — virtual file system override).
+
+## Customisation recipes
+
+### Replace the LoginDisplay
+
+Create `Themes/Basic/LoginDisplay.razor` in your host project. Set the `@namespace` to `Volo.Abp.AspNetCore.Components.Server.BasicTheme.Themes.Basic` so the virtual path matches. ABP's RCL discovery will prefer the host file. The code-behind needs to be a `partial class` with the same name in the same namespace.
+
+### Add a third toolbar item between Language and Login
+
+Write your own `IToolbarContributor` and register it **after** the basic theme:
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    Configure<AbpToolbarOptions>(options =>
+    {
+        var basicContributor = options.Contributors.OfType<BasicThemeToolbarContributor>().FirstOrDefault();
+        var index = basicContributor != null ? options.Contributors.IndexOf(basicContributor) + 1 : options.Contributors.Count;
+        options.Contributors.Insert(index, new MyExtraToolbarContributor());
+    });
+}
+```
+
+The `Toolbar.Items` collection is ordered. Items inside a single contributor render in insertion order; multiple contributors render in registration order.
+
+### Disable the language switch
+
+Skip the language module (`Volo.Abp.LocalizationManagement`) so only one language remains — `_otherLanguages.Any()` will be `false` and the component renders nothing. Or remove the toolbar item:
+
+```csharp
+Configure<AbpToolbarOptions>(options =>
+{
+    options.Contributors.RemoveAll(c => c is BasicThemeToolbarContributor);
+    options.Contributors.Add(new LoginOnlyToolbarContributor());
+});
+```
+
+## Gotchas
+
+- **`LoginDisplay`'s `OnInitializedAsync` calls `IMenuManager.GetAsync(StandardMenus.User)`** once at component construction. If a host adds a `User` menu item conditionally based on a runtime claim that changes (e.g. after a tenant switch), the dropdown will not reflect the change until the user navigates. The `LocationChanged` handler triggers `StateHasChanged` but does not re-fetch the menu — that is a deliberate trade-off (menu fetch is expensive and rarely changes).
+- **`BlazorBasicThemeScriptContributor` is empty** — do not register additional JS by adding `context.Files.Add(...)` to this class in your host project unless you have first checked the file is not already in `BlazorStandardBundles.Scripts.Global`. Duplicates cause Blazorise dropdowns to bind twice.
+- **`LanguageSwitch` uses `forceLoad: true`** — every language change tears down the circuit. If you rely on circuit-scoped state (e.g. a long-running grid pagination), that state is lost. The behaviour is intentional but worth flagging in your support docs.
+- **The `Dropdown` and `BarDropdown` components come from Blazorise**, registered by `AbpAspNetCoreComponentsServerThemingModule`. If you have replaced Blazorise with another component library at the host level, both `LoginDisplay` and `LanguageSwitch` must be re-implemented; there is no Blazorise-free fallback shipped.
+- **`AuthorizeView` in Blazor Server with `RevalidatingServerAuthenticationStateProvider`** revalidates on a timer (default 30 minutes). After a logout from another tab, the dropdown can show a stale user name until either the timer fires, the user navigates (LocationChanged → StateHasChanged), or `AbpRevalidateOnInterval` triggers.
+
+## See also
+
+- [Overview](/modules/basic-theme/overview) — package map and shared visual contract.
+- [Blazor Web (shared)](/modules/basic-theme/blazor-web) — `MainLayout`, `NavMenu`, `Branding`, `NavToolbar`, the .NET 8+ Blazor Web App host model.
+- [Blazor WebAssembly](/modules/basic-theme/blazor-webassembly) — the WebAssembly counterpart with its own `LoginDisplay` and `LanguageSwitch`.
+- [MVC walkthrough](/modules/basic-theme/mvc) — the Razor Pages equivalent (where `Account/Login` lives).
+- [Theme Shared (MVC)](/framework/ui-mvc/mvc-ui-theme-shared) — `IToolbarContributor`, `StandardToolbars`.
+- [Blazor UI overview](/framework/ui-blazor/) — Blazor-specific `IThemeManager`, `IBrandingProvider`, routing.

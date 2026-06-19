@@ -1,0 +1,249 @@
+---
+title: "Volo.Abp.BlobStoring.Database.MongoDB"
+sidebarTitle: "MongoDB"
+description: "BlobStoringMongoDbContext, MongoDb repositories and collection layout for storing blobs inside a MongoDB cluster."
+---
+
+The MongoDB sibling of the [EF Core layer](/modules/blob-storing-database/efcore). It implements the same `IDatabaseBlobContainerRepository` and `IDatabaseBlobRepository` contracts on top of `IMongoCollection<T>` so the BLOB tables can live in a MongoDB cluster instead of a relational database.
+
+## File inventory
+
+```
+Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/
+├── BlobStoringDatabaseMongoDbModule.cs
+├── BlobStoringMongoDbContext.cs
+├── BlobStoringMongoDbContextExtensions.cs
+├── IBlobStoringMongoDbContext.cs
+├── MongoDbDatabaseBlobContainerRepository.cs
+└── MongoDbDatabaseBlobRepository.cs
+```
+
+## DbContext
+
+```csharp
+[ConnectionStringName(AbpBlobStoringDatabaseDbProperties.ConnectionStringName)]
+public interface IBlobStoringMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<DatabaseBlobContainer> BlobContainers { get; }
+    IMongoCollection<DatabaseBlob> Blobs { get; }
+}
+
+[ConnectionStringName(AbpBlobStoringDatabaseDbProperties.ConnectionStringName)]
+public class BlobStoringMongoDbContext : AbpMongoDbContext, IBlobStoringMongoDbContext
+{
+    public IMongoCollection<DatabaseBlobContainer> BlobContainers
+        => Collection<DatabaseBlobContainer>();
+    public IMongoCollection<DatabaseBlob> Blobs => Collection<DatabaseBlob>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureBlobStoring();
+    }
+}
+```
+
+The `[ConnectionStringName("AbpBlobStoring")]` attribute is the same one used by the EF Core layer; ABP's connection-string resolver looks up the key in either provider, so you configure `ConnectionStrings:AbpBlobStoring` once and target the appropriate physical store.
+
+### Collection naming
+
+```csharp
+public static void ConfigureBlobStoring(this IMongoModelBuilder builder)
+{
+    Check.NotNull(builder, nameof(builder));
+
+    builder.Entity<DatabaseBlobContainer>(b =>
+    {
+        b.CollectionName = AbpBlobStoringDatabaseDbProperties.DbTablePrefix
+            + "BlobContainers";
+    });
+
+    builder.Entity<DatabaseBlob>(b =>
+    {
+        b.CollectionName = AbpBlobStoringDatabaseDbProperties.DbTablePrefix
+            + "Blobs";
+    });
+}
+```
+
+Out of the box you get `AbpBlobContainers` and `AbpBlobs` collections. The `DbTablePrefix` property is shared between EF Core and Mongo, so renaming the SQL tables also renames the Mongo collections in step.
+
+There are **no indexes declared** beyond the implicit `_id` index. If you store many blobs per container, add a compound index by hand:
+
+```csharp
+db.AbpBlobs.createIndex(
+  { TenantId: 1, ContainerId: 1, Name: 1 },
+  { name: "IX_AbpBlobs_TenantId_ContainerId_Name" }
+);
+```
+
+(The EF Core layer auto-creates this via the model builder; Mongo doesn't.)
+
+## Repository implementations
+
+### `MongoDbDatabaseBlobContainerRepository`
+
+```csharp
+public class MongoDbDatabaseBlobContainerRepository
+    : MongoDbRepository<IBlobStoringMongoDbContext, DatabaseBlobContainer, Guid>,
+      IDatabaseBlobContainerRepository
+{
+    public MongoDbDatabaseBlobContainerRepository(
+        IMongoDbContextProvider<IBlobStoringMongoDbContext> dbContextProvider)
+        : base(dbContextProvider) { }
+
+    public virtual async Task<DatabaseBlobContainer> FindAsync(string name,
+        CancellationToken cancellationToken = default)
+    {
+        return await base.FindAsync(x => x.Name == name,
+            cancellationToken: GetCancellationToken(cancellationToken));
+    }
+}
+```
+
+`MongoDbRepository<TDbContext, TEntity, TKey>` is the framework base class that provides Insert/Update/Delete/Get/List/Count over `IMongoCollection<T>`. The override of `FindAsync(name)` delegates to the predicate-based `FindAsync` already present on the base.
+
+### `MongoDbDatabaseBlobRepository`
+
+```csharp
+public class MongoDbDatabaseBlobRepository
+    : MongoDbRepository<IBlobStoringMongoDbContext, DatabaseBlob, Guid>,
+      IDatabaseBlobRepository
+{
+    public virtual async Task<DatabaseBlob> FindAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken = GetCancellationToken(cancellationToken);
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .FirstOrDefaultAsync(
+                x => x.ContainerId == containerId && x.Name == name,
+                cancellationToken);
+    }
+
+    public virtual async Task<bool> ExistsAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken = GetCancellationToken(cancellationToken);
+        return await (await GetMongoQueryableAsync(cancellationToken))
+            .AnyAsync(x => x.ContainerId == containerId && x.Name == name,
+                cancellationToken);
+    }
+
+    public virtual async Task<bool> DeleteAsync(Guid containerId, string name,
+        bool autoSave = false, CancellationToken cancellationToken = default)
+    {
+        var blob = await FindAsync(containerId, name, cancellationToken);
+        if (blob == null) return false;
+
+        await base.DeleteAsync(blob, autoSave, cancellationToken);
+        return true;
+    }
+}
+```
+
+Same shape as the EF Core repository — the only differences are `GetMongoQueryableAsync()` instead of `GetDbSetAsync()` and the use of the Mongo LINQ provider for `FirstOrDefaultAsync` / `AnyAsync`.
+
+## Module registration
+
+```csharp
+[DependsOn(
+    typeof(BlobStoringDatabaseDomainModule),
+    typeof(AbpMongoDbModule)
+)]
+public class BlobStoringDatabaseMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<BlobStoringMongoDbContext>(options =>
+        {
+            options.AddRepository<DatabaseBlobContainer,
+                MongoDbDatabaseBlobContainerRepository>();
+            options.AddRepository<DatabaseBlob, MongoDbDatabaseBlobRepository>();
+        });
+    }
+}
+```
+
+`AddMongoDbContext<T>` is the Mongo analogue of `AddAbpDbContext<T>` — it wires the context up with `IMongoDbContextProvider<T>`, the connection-string resolver, and the global `IMultiTenant` filter.
+
+## Storage model in MongoDB
+
+A blob document is a single BSON object that *includes the bytes* under the `Content` field. Mongo's per-document limit is 16 MB, so:
+
+* Anything below ~15 MB fits in one document.
+* Above that you'll hit `BsonSerializationException` / `MongoBulkWriteException` for `BSONObjectTooLarge`. The provider does **not** fall back to GridFS — it simply fails.
+
+A typical container document:
+
+```json
+{
+  "_id": "9f4e7c1f-fb27-4a85-9e95-83fef88c0c4d",
+  "TenantId": null,
+  "Name": "avatars",
+  "ExtraProperties": { },
+  "ConcurrencyStamp": "5d2c..."
+}
+```
+
+A typical blob document:
+
+```json
+{
+  "_id": "1f0a2e10-7e8f-43e2-9be6-f51a7a2e58c8",
+  "ContainerId": "9f4e7c1f-fb27-4a85-9e95-83fef88c0c4d",
+  "TenantId": null,
+  "Name": "u1.png",
+  "Content": { "$binary": "iVBORw0KGgoAAAANSUhEUgAA...", "$type": "0" },
+  "ExtraProperties": { },
+  "ConcurrencyStamp": "..."
+}
+```
+
+## Mermaid: save path
+
+```mermaid
+sequenceDiagram
+    participant Provider as DatabaseBlobProvider
+    participant ContainerRepo as MongoDbDatabaseBlobContainerRepository
+    participant Mongo as IMongoCollection&lt;T&gt;
+    participant BlobRepo as MongoDbDatabaseBlobRepository
+    Provider->>ContainerRepo: FindAsync("avatars")
+    ContainerRepo->>Mongo: find({Name:"avatars",TenantId:t})
+    alt missing
+        Provider->>ContainerRepo: InsertAsync(new container)
+        ContainerRepo->>Mongo: insertOne({...})
+    end
+    Provider->>BlobRepo: FindAsync(containerId, "u1.png")
+    BlobRepo->>Mongo: find({ContainerId,Name,TenantId})
+    alt exists & OverrideExisting
+        Provider->>BlobRepo: UpdateAsync(blob)
+        BlobRepo->>Mongo: replaceOne({_id})
+    else not exists
+        Provider->>BlobRepo: InsertAsync(blob)
+        BlobRepo->>Mongo: insertOne({...,Content:<Binary>})
+    end
+```
+
+## Choosing Mongo for blobs
+
+Mongo works well when you already run a cluster, your blobs are small (≤ 1 MB), and you value cross-document atomicity within a tenant. It's a poor fit for:
+
+* **Large files.** Hard 16 MB per-document ceiling. Use GridFS (out of scope for this module) or a `FileSystem` / S3 provider instead.
+* **High write fan-out.** Each blob save is an `insert` + an extra `find`; mongo write concerns dominate the latency.
+* **Streaming reads.** `GetOrNullAsync` returns a `MemoryStream` over the full byte array — there's no partial-content path.
+
+## Gotchas
+
+* **No indexes by default.** Add `(TenantId, Name)` on containers and `(TenantId, ContainerId, Name)` on blobs by hand. Without them every BLOB read is a collection scan.
+* **No unique constraint.** Container creation is racy in exactly the same way as the EF Core version. Pre-create in seed code.
+* **16 MB BSON limit.** A blob that exceeds 16 MB after BSON encoding (so really ~15.8 MB of payload) cannot be inserted. The save throws `MongoWriteException`.
+* **`autoSave` on Mongo.** `MongoDbRepository.InsertAsync(autoSave: true)` flushes the document synchronously; there is no ambient unit of work for Mongo by default, so this argument is effectively a no-op except inside an explicit `IUnitOfWork.SaveChangesAsync` boundary.
+* **Replica sets and write concern.** A single-node Mongo will happily lose blobs on crash. Use a 3-node RS with `w: "majority"` for production.
+* **Connection-string fallback.** Without `ConnectionStrings:AbpBlobStoring`, the module falls back to `Default` — which is normally your business database. Mixing entities and blobs in one Mongo database is fine but eats your working-set memory; isolate when possible.
+
+## Cross-links
+
+* [Domain layer](/modules/blob-storing-database/domain) — entities and `DatabaseBlobProvider`.
+* [EF Core layer](/modules/blob-storing-database/efcore) — relational sibling.
+* [Volo.Abp.MongoDB](/framework/data/mongodb) — `AbpMongoDbContext`, `MongoDbRepository<…>`.
+* [Framework BLOB Storing intro](/framework/blob-storing/intro) — `IBlobContainer` and the provider abstraction.

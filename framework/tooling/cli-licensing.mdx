@@ -1,0 +1,621 @@
+---
+title: "ABP CLI Host"
+description: "Inside Volo.Abp.Cli — the AbpApplicationFactory-powered console host that boots the CLI, parses arguments, dispatches to commands, and checks for tool updates."
+---
+
+The ABP CLI is itself an ABP application. Its entry point lives in
+`framework/src/Volo.Abp.Cli/Volo/Abp/Cli/Program.cs`, and almost every other
+piece of behaviour — argument parsing, command lookup, NuGet queries, login
+state — is wired together by `AbpCliCoreModule`. This page walks through the
+host so you can read the source confidently and reason about how every other
+`abp …` command ends up running.
+
+The two assemblies are split deliberately:
+
+- **`Volo.Abp.Cli`** — the executable shell. It contains only
+  `Program.Main`, the Serilog bootstrap, `AbpApplicationFactory.Create<AbpCliModule>(…)`
+  and a single dependency on `AbpAutofacModule`.
+- **`Volo.Abp.Cli.Core`** — everything else: `CliService`, command registry,
+  argument parser, NuGet/HTTP helpers, project builders, login store. Both
+  the `abp` tool and ABP Studio reuse this assembly, which is why the CLI
+  behaviour is shared between them.
+
+## File inventory
+
+```text
+framework/src/Volo.Abp.Cli/
+├── Volo.Abp.Cli.csproj          # OutputType=Exe, ToolCommandName=abp
+└── Volo/Abp/Cli/
+    ├── Program.cs               # Main → AbpApplicationFactory.Create<AbpCliModule>
+    └── AbpCliModule.cs          # DependsOn(AbpCliCoreModule, AbpAutofacModule)
+
+framework/src/Volo.Abp.Cli.Core/
+└── Volo/Abp/Cli/
+    ├── AbpCliCoreModule.cs      # Registers all command types & HTTP clients
+    ├── AbpCliOptions.cs         # Commands dictionary, CacheTemplates, ToolName
+    ├── CliService.cs            # RunAsync — the actual orchestrator
+    ├── CliConsts.cs             # Magic strings (HttpClientName, BranchPrefix, …)
+    ├── CliPaths.cs              # ~/.abp paths for cache, logs, tokens
+    ├── CliUrls.cs               # abp.io, account.abp.io, nuget.abp.io endpoints
+    ├── CliUsageException.cs     # Thrown for "usage" errors — logged as warning
+    ├── Args/                    # CommandLineArgumentParser & CommandLineArgs
+    ├── Commands/                # All command implementations
+    ├── Auth/                    # AuthService, login token persistence
+    ├── Http/                    # CliHttpClientHandler, CliHttpClientFactory
+    ├── Bundling/                # BundlingService for `abp bundle`
+    ├── LIbs/                    # InstallLibsService for `abp install-libs`
+    ├── ProjectBuilding/         # Template providers and project builders
+    ├── ProjectModification/     # In-place project edits (csproj, modules)
+    ├── ServiceProxying/         # csharp, js, ng proxy generators
+    └── Version/                 # PackageVersionCheckerService, MyGet/NuGet
+```
+
+The tool installs as `dotnet tool install -g Volo.Abp.Cli`. NuGet metadata in
+`Volo.Abp.Cli.csproj` registers it as a global tool with `ToolCommandName=abp`,
+which is why the binary on `$PATH` is `abp`, not `Volo.Abp.Cli`.
+
+## Program.cs — the bootstrap
+
+`Program.Main` is intentionally tiny. It sets up Serilog (file + console),
+constructs the ABP application via `AbpApplicationFactory`, resolves
+`CliService` and forwards the raw `args`.
+
+```csharp
+// framework/src/Volo.Abp.Cli/Volo/Abp/Cli/Program.cs
+private static async Task Main(string[] args)
+{
+    Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+    var loggerOutputTemplate = "{Message:lj}{NewLine}{Exception}";
+    Log.Logger = new LoggerConfiguration()
+        .MinimumLevel.Information()
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+        .MinimumLevel.Override("Volo.Abp", LogEventLevel.Warning)
+        .MinimumLevel.Override("System.Net.Http.HttpClient", LogEventLevel.Warning)
+        .MinimumLevel.Override("Volo.Abp.IdentityModel", LogEventLevel.Information)
+#if DEBUG
+        .MinimumLevel.Override("Volo.Abp.Cli", LogEventLevel.Debug)
+#else
+        .MinimumLevel.Override("Volo.Abp.Cli", LogEventLevel.Information)
+#endif
+        .Enrich.FromLogContext()
+        .WriteTo.File(Path.Combine(CliPaths.Log, "abp-cli-logs.txt"),
+                      outputTemplate: loggerOutputTemplate)
+        .WriteTo.Console(theme: AnsiConsoleTheme.Sixteen,
+                         outputTemplate: loggerOutputTemplate)
+        .CreateLogger();
+
+    using (var application = AbpApplicationFactory.Create<AbpCliModule>(options =>
+    {
+        options.UseAutofac();
+        options.Services.AddLogging(c => c.AddSerilog());
+    }))
+    {
+        application.Initialize();
+
+        await application.ServiceProvider
+            .GetRequiredService<CliService>()
+            .RunAsync(args);
+
+        application.Shutdown();
+
+        Log.CloseAndFlush();
+    }
+}
+```
+
+Three things to note:
+
+1. **UTF-8 output**. Required for the Unicode box-drawing characters in the
+   help screens and progress output on Windows consoles.
+2. **Logs land under `~/.abp/cli/logs/abp-cli-logs.txt`** — the path is
+   resolved through `CliPaths.Log`, which itself derives from the user
+   profile (see [CliPaths](#clipaths)).
+3. **`UseAutofac()`** — the CLI relies on Autofac so that
+   property-injection on commands (e.g. `public ILogger<X> Logger { get; set; }`)
+   works.
+
+`AbpCliModule` adds nothing of its own; it simply depends on
+`AbpCliCoreModule` (where the real work lives) and `AbpAutofacModule`:
+
+```csharp
+// framework/src/Volo.Abp.Cli/Volo/Abp/Cli/AbpCliModule.cs
+[DependsOn(
+    typeof(AbpCliCoreModule),
+    typeof(AbpAutofacModule)
+)]
+public class AbpCliModule : AbpModule
+{
+}
+```
+
+## AbpCliCoreModule — the command registry
+
+All command types are registered into a single dictionary on `AbpCliOptions`:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/AbpCliCoreModule.cs
+[DependsOn(
+    typeof(AbpDddDomainModule),
+    typeof(AbpJsonModule),
+    typeof(AbpIdentityModelModule),
+    typeof(AbpMinifyModule),
+    typeof(AbpHttpModule)
+)]
+public class AbpCliCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddHttpClient(CliConsts.HttpClientName)
+            .ConfigurePrimaryHttpMessageHandler(() => new CliHttpClientHandler());
+
+        context.Services.AddHttpClient(CliConsts.GithubHttpClientName, client =>
+        {
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("MyAgent/1.0");
+        });
+
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
+        Configure<AbpCliOptions>(options =>
+        {
+            options.Commands[HelpCommand.Name] = typeof(HelpCommand);
+            options.Commands[NewCommand.Name]  = typeof(NewCommand);
+            options.Commands[AddPackageCommand.Name] = typeof(AddPackageCommand);
+            options.Commands[AddModuleCommand.Name]  = typeof(AddModuleCommand);
+            options.Commands[BundleCommand.Name]     = typeof(BundleCommand);
+            options.Commands[InstallLibsCommand.Name] = typeof(InstallLibsCommand);
+            options.Commands[GenerateProxyCommand.Name] = typeof(GenerateProxyCommand);
+            options.Commands[RemoveProxyCommand.Name]   = typeof(RemoveProxyCommand);
+            options.Commands[SuiteCommand.Name]   = typeof(SuiteCommand);
+            options.Commands[LoginCommand.Name]   = typeof(LoginCommand);
+            options.Commands[LogoutCommand.Name]  = typeof(LogoutCommand);
+            options.Commands[UpdateCommand.Name]  = typeof(UpdateCommand);
+            options.Commands[TranslateCommand.Name] = typeof(TranslateCommand);
+            options.Commands[BuildCommand.Name]   = typeof(BuildCommand);
+            options.Commands[CleanCommand.Name]   = typeof(CleanCommand);
+            options.Commands[PromptCommand.Name]  = typeof(PromptCommand);
+            // … plus switch-to-stable / nightly / preview / local, list-templates,
+            //   list-modules, get-source, login-info, clear-download-cache, cli.
+        });
+
+        Configure<AbpCliServiceProxyOptions>(options =>
+        {
+            options.Generators[JavaScriptServiceProxyGenerator.Name] =
+                typeof(JavaScriptServiceProxyGenerator);
+            options.Generators[AngularServiceProxyGenerator.Name] =
+                typeof(AngularServiceProxyGenerator);
+            options.Generators[CSharpServiceProxyGenerator.Name] =
+                typeof(CSharpServiceProxyGenerator);
+        });
+    }
+}
+```
+
+Key points:
+
+- **`AbpCliOptions.Commands`** is a `Dictionary<string, Type>` with
+  `OrdinalIgnoreCase` comparison. The selector simply looks up
+  `commandLineArgs.Command` in this dictionary.
+- **`AbpCliServiceProxyOptions.Generators`** is the parallel registry for
+  `generate-proxy` — keyed by the value of `--type` (`csharp`, `js`, `ng`).
+- **Two named `HttpClient`s** — `AbpHttpClient` for `nuget.abp.io` /
+  `account.abp.io` (uses the custom `CliHttpClientHandler` to inject the
+  access token), and `GithubHttpClient` for `raw.githubusercontent.com`
+  metadata downloads.
+- **`Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)`** is
+  needed by the Suite / Studio download flow which reads Windows-1252
+  responses from older artifact servers.
+
+You can extend the registry from your own application that consumes the
+core module, but for the regular `abp` tool the list above is exhaustive.
+
+### AbpCliOptions
+
+```csharp
+public class AbpCliOptions
+{
+    public Dictionary<string, Type> Commands { get; }
+    public List<string> DisabledModulesToAddToSolution { get; set; }
+    public bool CacheTemplates { get; set; } = true;
+    public string ToolName { get; set; } = "CLI";
+    public bool AlwaysHideExternalCommandOutput { get; set; }
+
+    public AbpCliOptions()
+    {
+        Commands = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
+        DisabledModulesToAddToSolution = new();
+    }
+}
+```
+
+- `CacheTemplates` — when `true`, template ZIPs downloaded from `nuget.abp.io`
+  are kept under `~/.abp/templates` between runs.
+- `DisabledModulesToAddToSolution` — out-of-the-box contains
+  `Volo.Abp.LeptonXTheme.Pro` and `Volo.Abp.LeptonXTheme.Lite` because those
+  are sourced from solution templates, not from `add-module`.
+- `ToolName` — used in some log messages so embedders (Studio) can rename
+  themselves.
+
+## CliService.RunAsync — the orchestrator
+
+`CliService` is a `ITransientDependency`. It receives the injected
+`ICommandLineArgumentParser`, `ICommandSelector`, `IServiceScopeFactory`,
+the NuGet version checker and a tiny on-disk memory store.
+
+```csharp
+public async Task RunAsync(string[] args)
+{
+    var currentCliVersion = await GetCurrentCliVersionInternalAsync(typeof(CliService).Assembly);
+    Logger.LogInformation($"ABP CLI {currentCliVersion}");
+
+    var commandLineArgs = CommandLineArgumentParser.Parse(args);
+
+#if !DEBUG
+    if (!commandLineArgs.Options.ContainsKey("skip-cli-version-check"))
+    {
+        await CheckCliVersionAsync(currentCliVersion);
+    }
+#endif
+
+    try
+    {
+        if (commandLineArgs.IsCommand("prompt"))
+        {
+            await RunPromptAsync();
+        }
+        else if (commandLineArgs.IsCommand("batch"))
+        {
+            await RunBatchAsync(commandLineArgs);
+        }
+        else
+        {
+            await RunInternalAsync(commandLineArgs);
+        }
+    }
+    catch (CliUsageException usageException)
+    {
+        Logger.LogWarning(usageException.Message);
+    }
+    catch (Exception ex)
+    {
+        Logger.LogException(ex);
+    }
+}
+```
+
+A single `abp …` invocation walks the following path:
+
+1. **Get the installed CLI version.** `GetCurrentCliVersionInternalAsync`
+   shells out to `dotnet tool list -g`, looks for `volo.abp.cli`, parses the
+   version with `NuGet.Versioning.SemanticVersion`. If parsing fails (e.g. the
+   CLI was started from a build folder, not as a tool), it falls back to the
+   assembly file version with a `-dev` suffix — that branch is what disables
+   the upgrade nag in development.
+2. **Parse the arguments.** `CommandLineArgumentParser.Parse(string[])`
+   returns a `CommandLineArgs` (see below).
+3. **Background version check.** Unless `--skip-cli-version-check` is set
+   (or you're running a `DEBUG` build), it pulls
+   `https://raw.githubusercontent.com/abpframework/abp/dev/latest-versions.json`
+   at most once per day (gate persisted in `~/.abp/cli/memory.bin`) and
+   prints an upgrade hint if newer.
+4. **Dispatch.** `prompt` runs an interactive REPL, `batch` runs a file of
+   commands, anything else goes through `RunInternalAsync`, which creates a
+   DI scope and resolves the command type from `ICommandSelector`:
+
+```csharp
+private async Task RunInternalAsync(CommandLineArgs commandLineArgs)
+{
+    var commandType = CommandSelector.Select(commandLineArgs);
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var command = (IConsoleCommand)scope.ServiceProvider.GetRequiredService(commandType);
+        await command.ExecuteAsync(commandLineArgs);
+    }
+}
+```
+
+The DI scope is important: every command can take a fresh `IUnitOfWork`,
+`IServiceProvider`, etc., even though the CLI is technically a long-lived
+console application.
+
+### Exception strategy
+
+- `CliUsageException` — always logged as a **warning** (not red), because
+  users see it when they typo a flag. Commands throw it through
+  `GetUsageInfo()` to fall back to the help screen.
+- Anything else — logged through `Logger.LogException(ex)`, which prints
+  the exception type, message, stack trace, and inner-exception chain.
+
+The exit code is always `0`. The CLI is designed for interactive use; if
+you embed it in a script and need real exit codes, check the log output or
+wrap the commands you call.
+
+### Update-channel detection
+
+`CliService` classifies the running version into one of four `UpdateChannel`
+values, which determines the upgrade hint it prints:
+
+```csharp
+private UpdateChannel GetUpdateChannel(SemanticVersion currentCliVersion)
+{
+    if (!currentCliVersion.IsPrerelease)         return UpdateChannel.Stable;
+    if (currentCliVersion.Release.Contains("preview")) return UpdateChannel.Nightly;
+    if (currentCliVersion.Release.Contains("dev"))     return UpdateChannel.Development;
+    return UpdateChannel.Prerelease;
+}
+```
+
+For `Stable`, the upgrade hint is `dotnet tool update -g Volo.Abp.Cli`.
+For `Nightly` and `Development`, the hint is a two-step
+`dotnet tool uninstall` / `dotnet tool install --add-source
+https://www.myget.org/F/abp-nightly/api/v3/index.json --version <X>` — a
+workaround for [dotnet/sdk#2551](https://github.com/dotnet/sdk/issues/2551),
+which makes `dotnet tool update` refuse pre-release versions.
+
+## CommandLineArgs and the argument parser
+
+`CommandLineArgs` is the immutable representation of an invocation:
+
+```csharp
+public class CommandLineArgs
+{
+    public string Command { get; }              // "new", "add-package", …
+    public string Target  { get; }              // first positional, e.g. project name
+    public AbpCommandLineOptions Options { get; } // flags, both short and long
+
+    public bool IsCommand(string command) =>
+        string.Equals(Command, command, StringComparison.OrdinalIgnoreCase);
+}
+```
+
+`AbpCommandLineOptions` is a `Dictionary<string, string>` with two
+case-insensitive lookup helpers commonly seen in every command:
+
+```csharp
+commandLineArgs.Options.GetOrNull("p", "project")        // returns first non-null
+commandLineArgs.Options.ContainsKey("preview")           // boolean flag
+```
+
+The parser, `CommandLineArgumentParser`, follows simple rules:
+
+```csharp
+public CommandLineArgs Parse(string[] args)
+{
+    if (args.IsNullOrEmpty())          return CommandLineArgs.Empty();
+
+    var argumentList = args.ToList();
+
+    var command = argumentList[0];                 // first token = command
+    argumentList.RemoveAt(0);
+    if (!argumentList.Any())            return new CommandLineArgs(command);
+
+    var target = argumentList[0];                  // second token = target (unless it starts with '-')
+    if (target.StartsWith("-")) target = null;
+    else                        argumentList.RemoveAt(0);
+
+    var commandLineArgs = new CommandLineArgs(command, target);
+
+    while (argumentList.Any())                     // remaining = options
+    {
+        var optionName = ParseOptionName(argumentList[0]);  // strip leading '-' / '--'
+        argumentList.RemoveAt(0);
+
+        if (!argumentList.Any() || IsOptionName(argumentList[0]))
+        {
+            commandLineArgs.Options[optionName] = null;     // flag with no value
+            continue;
+        }
+
+        commandLineArgs.Options[optionName] = argumentList[0];
+        argumentList.RemoveAt(0);
+    }
+    return commandLineArgs;
+}
+```
+
+That means **the first positional argument after the command is always
+`Target`** and everything else is `Options`. Quoting works via the
+`Parse(string lineText)` overload, which is what the REPL and `batch`
+modes use — it understands `"` as a quote boundary inside a single string.
+
+### `--skip-cli-version-check`
+
+Set as either `--skip-cli-version-check` or `-skip-cli-version-check` on
+any command. Useful in CI to avoid hitting GitHub.
+
+## CliConsts and CliUrls
+
+Two static classes hold every endpoint and magic key the CLI uses.
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliConsts.cs
+public const string Command           = "AbpCliCommand";
+public const string BranchPrefix      = "branch@";
+public const string DocsLink          = "https://docs.abp.io";
+public const string HttpClientName    = "AbpHttpClient";
+public const string GithubHttpClientName = "GithubHttpClient";
+public const string LogoutUrl         = CliUrls.WwwAbpIo + "api/license/logout";
+public const string LicenseCodePlaceHolder = "<LICENSE_CODE/>";
+public const string AppSettingsJsonFileName        = "appsettings.json";
+public const string AppSettingsSecretJsonFileName  = "appsettings.secrets.json";
+```
+
+`BranchPrefix = "branch@"` is the magic prefix that lets you do
+`abp new Acme.X -v branch@dev` — the CLI then clones the `abp/dev` branch
+and builds local NuGet packages instead of pulling from `nuget.org`.
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliUrls.cs
+public const string WwwAbpIo       = "https://abp.io/";
+public const string AccountAbpIo   = "https://account.abp.io/";
+public const string NuGetRootPath  = "https://nuget.abp.io/";
+public const string LatestVersionCheckFullPath =
+    "https://raw.githubusercontent.com/abpframework/abp/dev/latest-versions.json";
+
+public static string GetNuGetServiceIndexUrl(string apiKey) =>
+    $"{NuGetRootPath}{apiKey}/v3/index.json";
+
+public static string GetApiDefinitionUrl(string url, ApplicationApiDescriptionModelRequestDto model = null)
+{
+    url = url.EnsureEndsWith('/');
+    return $"{url}api/abp/api-definition{(model?.IncludeTypes == true ? "?includeTypes=true" : string.Empty)}";
+}
+```
+
+`GetApiDefinitionUrl` is the endpoint hit by `generate-proxy` — every ABP
+HTTP API host exposes `/api/abp/api-definition`, and that is the contract
+the proxy generators read.
+
+## CliPaths
+
+All on-disk state lives under `~/.abp` so the CLI works for the current
+user without admin rights:
+
+```csharp
+public static class CliPaths
+{
+    public static readonly string AbpRootPath =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".abp");
+
+    public static string Root          => Path.Combine(AbpRootPath, "cli");
+    public static string Log           => Path.Combine(AbpRootPath, "cli", "logs");
+    public static string TemplateCache => Path.Combine(AbpRootPath, "templates");
+    public static string AccessToken   => Path.Combine(AbpRootPath, "cli", "access-token.bin");
+    public static string ComputerId    => Path.Combine(AbpRootPath, "cli", "computer-id.bin");
+    public static string Build         => Path.Combine(AbpRootPath, "build");
+    public static string Memory        =>
+        Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "memory.bin");
+}
+```
+
+| Path | Purpose |
+| --- | --- |
+| `~/.abp/cli/logs/abp-cli-logs.txt` | Rolling Serilog output |
+| `~/.abp/cli/access-token.bin` | OAuth token from `abp login` (DPAPI-protected on Windows) |
+| `~/.abp/cli/computer-id.bin` | Stable ID sent to abp.io for license activation |
+| `~/.abp/templates` | Cached startup template `.zip`s |
+| `~/.abp/build` | Local `dotnet pack` outputs for `branch@…` flows |
+| `<tool-dir>/memory.bin` | "Did we already check for updates today?" |
+
+If anything goes wrong, deleting `~/.abp` returns the CLI to a fresh state
+without uninstalling the tool.
+
+## Authentication and NuGet sources
+
+`AuthService` (under `Volo/Abp/Cli/Auth`) uses
+`Volo.Abp.IdentityModel` to do an OAuth2 password-grant against
+`account.abp.io`. The resulting access token is stored at
+`CliPaths.AccessToken`, then injected into every outbound `HttpRequestMessage`
+by `CliHttpClientHandler` (the primary handler for `AbpHttpClient`).
+
+`AbpNuGetIndexUrlService` calls
+`https://nuget.abp.io/api/license/get-nuget-key/<computer-id>` with that
+token to obtain the per-account API key, then returns the URL
+`https://nuget.abp.io/<api-key>/v3/index.json`. That URL is what
+`abp suite install`, `abp new -t app-pro …` and friends pass to
+`dotnet tool install --add-source`. If you ever wonder why the CLI nags you
+to `abp login` before pulling a commercial template — this is the chain.
+
+`RemoteServiceExceptionHandler` (under `ProjectBuilding/`) is responsible
+for turning `403 Forbidden` from `nuget.abp.io` into a friendly
+"Your license has expired" message rather than a stack trace.
+
+## The `prompt` and `batch` modes
+
+`CliService.RunAsync` short-circuits to two alternative loops:
+
+- **`abp prompt`** opens a REPL. Each line is run through the same parser
+  and dispatched the same way, except `exit` ends the loop.
+- **`abp batch <file>`** reads a file of commands, one per line, skipping
+  comments (`#`) and supporting inline trailing comments. Each line is
+  parsed and run sequentially. Failures don't stop the batch — they are
+  logged and the loop continues.
+
+```csharp
+// inside RunBatchAsync
+foreach (var line in File.ReadAllLines(filePath))
+{
+    var lineText = line;
+    if (lineText.IsNullOrWhiteSpace() || lineText.StartsWith("#")) continue;
+    if (lineText.Contains('#')) lineText = lineText.Substring(0, lineText.IndexOf('#'));
+
+    var args = CommandLineArgumentParser.Parse(lineText);
+    await RunInternalAsync(args);
+}
+```
+
+A typical `commands.txt` for repeatable smoke tests:
+
+```text
+# Initial bootstrap
+new Acme.BookStore -d ef --no-ui
+add-module Volo.Blogging
+install-libs
+bundle
+```
+
+## Extending the host
+
+Because the command registry is just `Dictionary<string, Type>` on
+`AbpCliOptions`, you can:
+
+```csharp
+[DependsOn(typeof(AbpCliCoreModule))]
+public class MyCliExtensionsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpCliOptions>(options =>
+        {
+            options.Commands["ping"] = typeof(PingCommand);
+        });
+    }
+}
+
+public class PingCommand : IConsoleCommand, ITransientDependency
+{
+    public Task ExecuteAsync(CommandLineArgs args)
+    {
+        Console.WriteLine("pong"); return Task.CompletedTask;
+    }
+    public string GetUsageInfo() => "abp ping";
+    public string GetShortDescription() => "Sanity check.";
+}
+```
+
+Wire `MyCliExtensionsModule` into your own host (the public CLI is closed
+because the assembly is shipped as a tool), or use this pattern to embed
+the core in a custom CLI of your own.
+
+## Gotchas
+
+- **Always run `abp` from the same shell where `~/.dotnet/tools` is on
+  `PATH`.** The version self-check shells `dotnet tool list -g`; if that
+  fails the CLI logs a warning and proceeds.
+- **The 24-hour update-check gate** is keyed by clock, not by run count.
+  If you change the system time backwards, the next run will skip the
+  check because the saved timestamp is in the future.
+- **`--skip-cli-version-check`** only skips the *network* check; it does
+  not skip the local `dotnet tool list -g` call.
+- **Tokens are not portable.** `access-token.bin` is encrypted with
+  Windows DPAPI on Windows and stored as plain bytes on Unix; copying the
+  file between machines will not work.
+- **`UseAutofac()` is required.** A custom host that swaps in the Microsoft
+  DI container will break property-injection on commands.
+
+## Cross-references
+
+- [Command registry & dispatch](./cli-commands) — how `ICommandSelector`
+  and `[CommandName]` registration work.
+- [`abp new`](./cli-new-command) — the most-used CLI verb, dissected.
+- [`abp add-package` / `add-module`](./cli-add-package) — solution surgery.
+- [`abp bundle`](./cli-bundle) — Blazor WASM bundler internals.
+- [`abp install-libs`](./cli-install-libs) — wwwroot/libs synchronisation.
+- [`abp generate-proxy`](./cli-generate-proxy) — client proxy generation.
+- [`abp suite`](./cli-suite) — installing & launching ABP Suite.
+- [DbMigrator template](./dbmigrator) — the standalone migration runner
+  that ships with every solution template.
+- [ABP Studio](./studio) — the desktop tool that reuses
+  `Volo.Abp.Cli.Core` under the hood.
+- Official documentation: [docs.abp.io](https://docs.abp.io/en/abp/latest/CLI).

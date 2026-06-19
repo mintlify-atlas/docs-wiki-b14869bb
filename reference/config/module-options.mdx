@@ -1,0 +1,327 @@
+---
+title: "Module Options — Abp*Options Catalogue Reference"
+sidebarTitle: "Module Options"
+description: "Catalogue of Abp*Options classes exposed by framework modules, the appsettings sections they bind to, and the resolution order between modules."
+---
+
+Every ABP framework module surfaces its tunables as a strongly-typed
+options class — by convention `Abp<Module>Options` — and configures
+itself through `services.Configure<Abp<Module>Options>(...)`. This page
+catalogues the canonical options classes, their bind sections, their
+default values, and the order in which framework, application and host
+modules layer their changes on top of each other. It complements the
+[options-pattern](/reference/config/options-pattern) deep-dive, which
+explains the mechanics; here we list the actual surface area.
+
+## File inventory
+
+| Options class | Location |
+| --- | --- |
+| `AbpAuditingOptions` | `framework/src/Volo.Abp.Auditing/Volo/Abp/Auditing/AbpAuditingOptions.cs` |
+| `AbpAutoMapperOptions` | `framework/src/Volo.Abp.AutoMapper/Volo/Abp/AutoMapper/AbpAutoMapperOptions.cs` |
+| `AbpBackgroundJobOptions` | `framework/src/Volo.Abp.BackgroundJobs.Abstractions/Volo/Abp/BackgroundJobs/AbpBackgroundJobOptions.cs` |
+| `AbpBackgroundWorkerOptions` | `framework/src/Volo.Abp.BackgroundWorkers/Volo/Abp/BackgroundWorkers/AbpBackgroundWorkerOptions.cs` |
+| `AbpBlobStoringOptions` | `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/AbpBlobStoringOptions.cs` |
+| `AbpDbConnectionOptions` | `framework/src/Volo.Abp.Data/Volo/Abp/Data/AbpDbConnectionOptions.cs` |
+| `AbpDistributedCacheOptions` | `framework/src/Volo.Abp.Caching/Volo/Abp/Caching/AbpDistributedCacheOptions.cs` |
+| `AbpDistributedEventBusOptions` | `framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/Distributed/AbpDistributedEventBusOptions.cs` |
+| `AbpExceptionHandlingOptions` | `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/ExceptionHandling/AbpExceptionHandlingOptions.cs` |
+| `AbpLocalizationOptions` | `framework/src/Volo.Abp.Localization/Volo/Abp/Localization/AbpLocalizationOptions.cs` |
+| `AbpMultiTenancyOptions` | `framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/AbpMultiTenancyOptions.cs` |
+| `AbpPermissionOptions` | `framework/src/Volo.Abp.Authorization/Volo/Abp/Authorization/Permissions/AbpPermissionOptions.cs` |
+| `AbpSettingOptions` | `framework/src/Volo.Abp.Settings/Volo/Abp/Settings/AbpSettingOptions.cs` |
+| `AbpVirtualFileSystemOptions` | `framework/src/Volo.Abp.VirtualFileSystem/Volo/Abp/VirtualFileSystem/AbpVirtualFileSystemOptions.cs` |
+
+The framework follows a strict naming convention: the class lives in
+the same namespace as its module, the type name is
+`Abp<ModuleShortName>Options`, and the appsettings section binds to
+`<ModuleShortName>` (e.g. `AbpDbConnectionOptions` ↔ `ConnectionStrings`
+section, `AbpDistributedCacheOptions` ↔ `DistributedCache`).
+
+## Configuration pathways
+
+```mermaid
+flowchart LR
+    A[appsettings.json] --> B[IConfiguration]
+    B --> C{Module ConfigureServices}
+    C -->|Configure&lt;TOptions&gt;(configuration.GetSection("X"))| D[OptionsBuilder]
+    C -->|Configure&lt;TOptions&gt;(lambda)| D
+    C -->|PreConfigure&lt;TOptions&gt;(lambda)| E[PreConfigureActionList]
+    D --> F[IOptionsFactory.Create]
+    E --> G[ExecutePreConfiguredActions]
+    G --> C
+    F --> H[Injected as IOptions / IOptionsSnapshot / IOptionsMonitor]
+```
+
+There are three ways a module can mutate a `TOptions` instance:
+
+1. **`PreConfigure<TOptions>(...)`** — seeds defaults into a separate
+   `PreConfigureActionList<TOptions>` that any consumer can replay via
+   `services.ExecutePreConfiguredActions<TOptions>()`. Runs during the
+   `PreConfigureServices` phase.
+2. **`Configure<TOptions>(lambda)`** — writes a normal post-configure
+   action against the standard .NET options pipeline. Runs during the
+   `ConfigureServices` phase.
+3. **`Configure<TOptions>(IConfiguration section)`** — binds JSON to
+   the options instance. Treated as another action in the chain.
+
+## Override order
+
+Within a single phase, the .NET options pipeline applies actions in
+*registration* order. ABP guarantees module-level ordering through the
+`[DependsOn]` attribute on each module:
+
+```mermaid
+sequenceDiagram
+    participant FM as Framework module (depended-on)
+    participant AM as Application module
+    participant HM as Host module (top of graph)
+    FM->>FM: PreConfigure&lt;T&gt;(seed defaults)
+    FM->>FM: Configure&lt;T&gt;(framework defaults)
+    AM->>AM: Configure&lt;T&gt;(application overrides)
+    HM->>HM: Configure&lt;T&gt;(bind appsettings section)
+    HM->>HM: Configure&lt;T&gt;(host overrides)
+    Note over HM: The last writer wins on every property.
+```
+
+In practice that means **the host module always has the final word**,
+because it sits at the top of the dependency graph. If you need to
+*forbid* a downstream override use `PostConfigure<T>(...)` instead — it
+runs after every `Configure<T>` action.
+
+## Sample appsettings.json
+
+```json
+{
+  "BackgroundJobs": {
+    "IsJobExecutionEnabled": true
+  },
+  "ConnectionStrings": {
+    "Default": "Server=.;Database=MyApp;Trusted_Connection=True;TrustServerCertificate=True",
+    "AbpAuditLogging": "Server=.;Database=MyApp_Audit;Trusted_Connection=True"
+  },
+  "DistributedCache": {
+    "KeyPrefix": "MyApp:",
+    "GlobalCacheEntryOptions": {
+      "AbsoluteExpirationRelativeToNow": "00:30:00"
+    }
+  },
+  "Localization": {
+    "DefaultResourceType": "MyAppResource"
+  },
+  "MultiTenancy": {
+    "IsEnabled": true
+  }
+}
+```
+
+Each key in this JSON is bound by exactly one module's
+`Configure<Abp*Options>(configuration.GetSection("..."))` call.
+
+## Scoped vs singleton options
+
+The lifetime of the injected wrapper drives behaviour:
+
+| Options class | Typical injection | Why |
+| --- | --- | --- |
+| `AbpAuditingOptions` | `IOptions<T>` | Read-mostly, set at startup. |
+| `AbpDbConnectionOptions` | `IOptionsMonitor<T>` | Connection strings may reload at runtime; `DefaultConnectionStringResolver` watches via change tokens. |
+| `AbpFeatureManagementOptions` | `IOptionsSnapshot<T>` | Per-request because tenant context can swap providers. |
+| `AbpBackgroundJobOptions` | `IOptions<T>` | Job registrations are fixed at startup. |
+| `AbpMultiTenancyOptions` | `IOptions<T>` | Singleton flag; never per-request. |
+| `AbpDistributedCacheOptions` | `IOptions<T>` | Cache key prefix and TTLs are immutable post-startup. |
+
+When you need per-tenant overrides on an otherwise-singleton option,
+register `AddAbpDynamicOptions<TOptions, TManager>()` so that ABP swaps
+in `AbpDynamicOptionsManager<TOptions>` as the `IOptionsFactory<TOptions>`
+implementation.
+
+## Wiring an Abp*Options class
+
+The standard pattern, mirrored across every framework module:
+
+```csharp
+public class MyModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+
+        // 1) Bind from appsettings.json
+        Configure<MyModuleOptions>(configuration.GetSection("MyModule"));
+
+        // 2) Apply hard-coded defaults / additions
+        Configure<MyModuleOptions>(options =>
+        {
+            options.Handlers.Add<MyHandler>();
+            options.IsEnabled = options.IsEnabled || Debugger.IsAttached;
+        });
+    }
+}
+```
+
+## PreConfigure-then-Configure recipe
+
+```csharp
+// Library module: declares defaults for callers
+public class DefaultsModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<MyModuleOptions>(options =>
+        {
+            options.IsEnabled = true;
+            options.Handlers.Add<LibraryHandler>();
+        });
+    }
+}
+
+// Application module: replays defaults, then customises
+public class AppModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var defaults = context.Services
+            .ExecutePreConfiguredActions<MyModuleOptions>();
+        // 'defaults' has IsEnabled=true and LibraryHandler registered.
+
+        Configure<MyModuleOptions>(options =>
+        {
+            options.Handlers.Add<AppHandler>();
+        });
+    }
+}
+```
+
+This is the *only* way to read another module's defaults during
+configuration. Once a module enters `ConfigureServices`, all earlier
+`PreConfigureServices` invocations are visible through
+`ExecutePreConfiguredActions<T>()`.
+
+## Gotchas
+
+- Two modules calling `Configure<T>(section)` against the same JSON
+  section will both run the binder; identical values are
+  idempotent, but lambdas that append to lists (e.g.
+  `Handlers.Add`) will duplicate entries. Guard with
+  `Handlers.AddIfNotContains` or check membership before adding.
+- `ConfigureAll<TOptions>(...)` (from `Microsoft.Extensions.Options`)
+  works as expected on top of ABP. Use it for named options.
+- The non-generic `Configure(string name, Action<T>)` overload routes
+  to named options, **not** the default options instance. Background
+  job retry queues and cache entry profiles use this overload.
+- Options classes are mutable POCOs; nothing prevents code from
+  reaching into `IOptions<T>.Value` and editing it. Treat them as
+  immutable post-startup.
+
+## Worked example: AbpDistributedCacheOptions
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    var configuration = context.Services.GetConfiguration();
+
+    // 1) Bind defaults from JSON
+    Configure<AbpDistributedCacheOptions>(
+        configuration.GetSection("DistributedCache"));
+
+    // 2) Layer per-environment overrides
+    Configure<AbpDistributedCacheOptions>(options =>
+    {
+        options.KeyPrefix ??= "MyApp:";
+        options.GlobalCacheEntryOptions ??=
+            new DistributedCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(30)
+            };
+    });
+
+    // 3) Surface a named profile (note: named options bypass the default)
+    context.Services.Configure<AbpDistributedCacheOptions>("short-lived",
+        options =>
+        {
+            options.GlobalCacheEntryOptions =
+                new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5)
+                };
+        });
+}
+```
+
+```mermaid
+flowchart LR
+    A[appsettings.json &gt; DistributedCache] --> B[Bind step]
+    C[Module override lambda] --> D[Configure step]
+    E[Named &quot;short-lived&quot; lambda] --> F[Named options]
+    B --> G[IOptions&lt;AbpDistributedCacheOptions&gt;]
+    D --> G
+    F --> H[IOptionsSnapshot&lt;...&gt;.Get("short-lived")]
+```
+
+## Discovering option classes
+
+Three quick recipes to discover the options a module exposes:
+
+1. **Convention scan** — grep the source for
+   `class Abp([A-Z][A-Za-z0-9]+)Options` inside the module's folder;
+   every match is bindable from JSON.
+2. **Module reflection** — call
+   `services.GetSingletonInstance<IObjectAccessor<PreConfigureActionList<TOptions>>>()`
+   inside `ConfigureServices` to inspect pre-configured defaults at
+   debug time.
+3. **`IConfigureOptions<T>` enumeration** — resolve
+   `IEnumerable<IConfigureOptions<T>>` from the built container; each
+   entry is a registered configuration action, including the lambda
+   you wrote and the framework's `ConfigurationChangeTokenSource`-
+   driven binder.
+
+## Built-in extension methods
+
+ABP adds a handful of convenience overloads on top of the .NET
+options API. The most useful ones are:
+
+| Extension | Effect |
+| --- | --- |
+| `services.PreConfigure<T>(Action<T>)` | Adds an action to `PreConfigureActionList<T>`. |
+| `services.ExecutePreConfiguredActions<T>()` | Replays the actions and returns a fresh `T`. |
+| `services.AddAbpDynamicOptions<T, TManager>()` | Swaps in `AbpDynamicOptionsManager<T>` for tenant-aware materialisation. |
+| `services.GetPreConfigureActions<T>()` | Direct access to the action list, e.g. to clear it in tests. |
+| `module.PostConfigure<T>(Action<T>)` | Runs after every `Configure<T>` action — useful for sealing values. |
+
+## Validation strategies
+
+The framework rarely uses `OptionsBuilder<T>.Validate(...)` because
+many ABP options are mutable lists. The conventional pattern is:
+
+```csharp
+public override void OnApplicationInitialization(ApplicationInitializationContext context)
+{
+    var options = context.ServiceProvider
+        .GetRequiredService<IOptions<MyModuleOptions>>().Value;
+
+    if (options.Handlers.Count == 0)
+    {
+        throw new AbpException("MyModule requires at least one handler.");
+    }
+}
+```
+
+Throwing during `OnApplicationInitialization` aborts host startup with
+a clean stack trace, which is the desired behaviour for misconfigured
+hosts.
+
+## Cross-references
+
+- [Options pattern internals](/reference/config/options-pattern) — the
+  mechanics behind `PreConfigure` / `Configure` / `PostConfigure`.
+- [appsettings.json layout](/reference/config/appsettings) — every
+  built-in top-level section.
+- [Module system](/overview/module-system) — how `[DependsOn]` walks
+  the graph at startup.
+- [Connection strings](/reference/config/connection-strings) — the most
+  commonly overridden options class.
+- [Background jobs configuration](/reference/config/background-jobs-config)
+  for a worked example of `Configure<AbpBackgroundJobOptions>`.
+- [Event bus configuration](/reference/config/event-bus-config) for a
+  multi-transport options example.

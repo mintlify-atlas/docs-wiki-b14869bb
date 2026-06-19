@@ -1,0 +1,167 @@
+---
+title: "Tenant Management Entities"
+description: "Reference for the Tenant aggregate and TenantConnectionString value entity in Volo.Abp.TenantManagement.Domain."
+---
+
+The Tenant Management module is intentionally small: a single aggregate (`Tenant`) and an owned value-entity (`TenantConnectionString`). Together they implement ABP's tenant store contract (`ITenantStore`) so that `ICurrentTenant`, the data filter, and the multi-DB connection-string resolver have a single source of truth.
+
+Source path: `modules/tenant-management/src/Volo.Abp.TenantManagement.Domain/Volo/Abp/TenantManagement/`.
+
+## Entity relationship overview
+
+```mermaid
+erDiagram
+    Tenant ||--o{ TenantConnectionString : has
+    Tenant {
+        Guid Id PK
+        string Name
+        int EntityVersion
+        bool IsDeleted
+        DateTime CreationTime
+        Guid? CreatorId
+        DateTime? LastModificationTime
+        Guid? LastModifierId
+        DateTime? DeletionTime
+        Guid? DeleterId
+        string ConcurrencyStamp
+    }
+    TenantConnectionString {
+        Guid TenantId PK,FK
+        string Name PK
+        string Value
+    }
+```
+
+## `Tenant`
+
+Base: `FullAuditedAggregateRoot<Guid>` + `IHasEntityVersion`.
+
+```csharp
+public class Tenant : FullAuditedAggregateRoot<Guid>, IHasEntityVersion
+{
+    public virtual string Name { get; protected set; }
+    public virtual int EntityVersion { get; protected set; }
+    public virtual List<TenantConnectionString> ConnectionStrings { get; protected set; }
+
+    protected internal Tenant(Guid id, [NotNull] string name) : base(id)
+    {
+        SetName(name);
+        ConnectionStrings = new List<TenantConnectionString>();
+    }
+}
+```
+
+### Properties
+
+| Property              | Type                          | Constraints                                              | Interface              |
+| --------------------- | ----------------------------- | -------------------------------------------------------- | ---------------------- |
+| `Id`                  | `Guid`                        | PK                                                       | `Entity<Guid>`          |
+| `Name`                | `string`                      | `TenantConsts.MaxNameLength` (default 64), required      | —                       |
+| `EntityVersion`       | `int`                         | Auto-incremented                                          | `IHasEntityVersion`     |
+| `ConnectionStrings`   | `List<TenantConnectionString>`| Owned collection                                          | —                       |
+| `ExtraProperties`     | `ExtraPropertyDictionary`     | From `AggregateRoot`                                      | `IHasExtraProperties`   |
+| `ConcurrencyStamp`    | `string`                      | From `AggregateRoot`                                      | `IHasConcurrencyStamp`  |
+| `CreationTime`        | `DateTime`                    | Full audit                                                | `ICreationAuditedObject`|
+| `CreatorId`           | `Guid?`                       | Full audit                                                |                         |
+| `LastModificationTime`| `DateTime?`                   | Full audit                                                | `IModificationAuditedObject` |
+| `LastModifierId`      | `Guid?`                       | Full audit                                                |                         |
+| `IsDeleted`           | `bool`                        | Soft delete                                               | `ISoftDelete`            |
+| `DeletionTime`        | `DateTime?`                   | Soft delete                                               | `IHasDeletionTime`       |
+| `DeleterId`           | `Guid?`                       | Soft delete                                               | `IDeletionAuditedObject` |
+
+### Indexes
+
+- `IX_AbpTenants_Name` (unique, filtered to non-deleted rows)
+
+### Behaviours
+
+```csharp
+public virtual string FindDefaultConnectionString()
+    => FindConnectionString(Data.ConnectionStrings.DefaultConnectionStringName);
+
+public virtual string FindConnectionString(string name)
+    => ConnectionStrings.FirstOrDefault(c => c.Name == name)?.Value;
+
+public virtual void SetConnectionString(string name, string connectionString)
+{
+    var existing = ConnectionStrings.FirstOrDefault(x => x.Name == name);
+    if (existing != null) existing.SetValue(connectionString);
+    else ConnectionStrings.Add(new TenantConnectionString(Id, name, connectionString));
+}
+
+public virtual void RemoveConnectionString(string name) { … }
+```
+
+`SetName` enforces the `TenantConsts.MaxNameLength` cap:
+
+```csharp
+protected internal virtual void SetName([NotNull] string name)
+    => Name = Check.NotNullOrWhiteSpace(name, nameof(name), TenantConsts.MaxNameLength);
+```
+
+## `TenantConnectionString`
+
+Owned entity with a composite key `(TenantId, Name)` and a mutable `Value`.
+
+```csharp
+public class TenantConnectionString : Entity
+{
+    public virtual Guid TenantId { get; protected set; }
+    public virtual string Name { get; protected set; }
+    public virtual string Value { get; protected set; }
+
+    public TenantConnectionString(Guid tenantId, [NotNull] string name, [NotNull] string value)
+    {
+        TenantId = tenantId;
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name), TenantConnectionStringConsts.MaxNameLength);
+        SetValue(value);
+    }
+
+    public virtual void SetValue([NotNull] string value)
+        => Value = Check.NotNullOrWhiteSpace(value, nameof(value), TenantConnectionStringConsts.MaxValueLength);
+
+    public override object[] GetKeys() => new object[] { TenantId, Name };
+}
+```
+
+| Property   | Type     | Constraints                                                    |
+| ---------- | -------- | -------------------------------------------------------------- |
+| `TenantId` | `Guid`   | FK to `Tenant.Id`. Composite key part.                          |
+| `Name`     | `string` | `TenantConnectionStringConsts.MaxNameLength` (default 64).      |
+| `Value`    | `string` | `TenantConnectionStringConsts.MaxValueLength` (default 1024).   |
+
+The conventional `Name == "Default"` row populates `Tenant.FindDefaultConnectionString()` and feeds the [`IConnectionStringResolver`](/framework/data/volo-abp-data) at request time.
+
+## Persistence / tables
+
+| Entity                   | Table                                | Composite key            |
+| ------------------------ | ------------------------------------ | ------------------------ |
+| `Tenant`                 | `AbpTenants`                         | `Id`                     |
+| `TenantConnectionString` | `AbpTenantConnectionStrings`         | `(TenantId, Name)`       |
+
+## Integration with the framework
+
+- `TenantStore` implements `ITenantStore` by querying the `ITenantRepository` and projecting `Tenant` + `TenantConnectionString` into `TenantConfiguration` cache items.
+- `TenantCacheItem` and `TenantCacheItemInvalidator` (in the same folder) keep an in-memory cache (`IDistributedCache<TenantCacheItem>`) hot and invalidate it on every save via a domain-event handler.
+
+```csharp
+// TenantStore (simplified)
+public async Task<TenantConfiguration?> FindAsync(string normalizedName)
+{
+    var cacheItem = await _cache.GetOrAddAsync(
+        normalizedName,
+        async () =>
+        {
+            var tenant = await _tenantRepository.FindByNameAsync(normalizedName);
+            return tenant == null ? new TenantCacheItem(null) : new TenantCacheItem(MapToConfiguration(tenant));
+        });
+    return cacheItem.Value;
+}
+```
+
+## See also
+
+- [Tenant Management module](/modules/tenant-management)
+- [Multi-tenancy resolution flow](/flows/multi-tenancy-resolution)
+- [`Volo.Abp.MultiTenancy`](/framework/multi-tenancy/volo-abp-multi-tenancy)
+- [Entity base types](/reference/models/entities-base-types)

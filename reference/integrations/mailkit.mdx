@@ -1,0 +1,253 @@
+---
+title: "MailKit SMTP"
+description: "External-service reference for MailKit-based SMTP email delivery — Volo.Abp.MailKit module, SecureSocketOptions, SMTP server requirements, and provider-specific gotchas."
+---
+
+`Volo.Abp.MailKit` swaps the default ABP `IEmailSender` (`System.Net.Mail.SmtpClient`-backed) for a MailKit implementation. MailKit (`MailKit.Net.Smtp.SmtpClient`) is more modern, supports STARTTLS / implicit TLS properly, and handles bigger messages and modern auth. This page describes the SMTP-server requirements, the small ABP options surface, and what to configure for popular SMTP providers.
+
+For the abstraction (`IEmailSender`, settings, background-job send) see [Email Sending](/framework/cross/email).
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.MailKit` | `AbpMailKitModule` |
+
+```csharp
+[DependsOn(typeof(AbpEmailingModule))]
+public class AbpMailKitModule : AbpModule { }
+```
+
+The module registers `MailKitSmtpEmailSender` as the new `IEmailSender` and `ISmtpEmailSender`:
+
+```csharp
+[Dependency(ServiceLifetime.Transient, ReplaceServices = true)]
+public class MailKitSmtpEmailSender : EmailSenderBase, IMailKitSmtpEmailSender { ... }
+```
+
+`EmailSenderBase` already supports queueing via `IBackgroundJobManager` — `SendAsync(..., normalize: true)` queues `BackgroundEmailSendingJobArgs` for asynchronous delivery, while `SendAsync(MailMessage, true)` sends inline.
+
+## Options model
+
+```csharp
+public class AbpMailKitOptions
+{
+    public SecureSocketOptions? SecureSocketOption { get; set; }
+}
+```
+
+A single knob:
+
+| Value | Meaning |
+| --- | --- |
+| `null` (default) | Falls back to ABP settings: `Abp.Mailing.Smtp.UseSsl=true` ⇒ `SslOnConnect`; otherwise `StartTlsWhenAvailable`. |
+| `SecureSocketOptions.None` | Plain TCP. Dev only. |
+| `SecureSocketOptions.Auto` | MailKit auto-detects (rarely used). |
+| `SecureSocketOptions.SslOnConnect` | Implicit TLS — typically port 465. |
+| `SecureSocketOptions.StartTls` | STARTTLS — typically port 587. Required by Gmail, Outlook, most enterprise relays. |
+| `SecureSocketOptions.StartTlsWhenAvailable` | Opportunistic STARTTLS; falls back to plain if server doesn't offer it. |
+
+Configure once in your module:
+
+```csharp
+Configure<AbpMailKitOptions>(options =>
+{
+    options.SecureSocketOption = SecureSocketOptions.StartTls;
+});
+```
+
+## SMTP configuration source
+
+`MailKitSmtpEmailSender` reads host/port/credentials/SSL from `ISmtpEmailSenderConfiguration`, which ABP wires from settings:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `Abp.Mailing.Smtp.Host` | `127.0.0.1` | Hostname of SMTP relay. |
+| `Abp.Mailing.Smtp.Port` | `25` | 25 / 465 / 587 typically. |
+| `Abp.Mailing.Smtp.UserName` | empty | SMTP auth user. |
+| `Abp.Mailing.Smtp.Password` | empty (encrypted) | SMTP auth password / app password. |
+| `Abp.Mailing.Smtp.Domain` | empty | NTLM domain (rare). |
+| `Abp.Mailing.Smtp.EnableSsl` | `false` | Toggles SSL/TLS handling. |
+| `Abp.Mailing.Smtp.UseDefaultCredentials` | `true` | If `true`, skip explicit `AuthenticateAsync`. |
+| `Abp.Mailing.DefaultFromAddress` | empty | Default `From` address. |
+| `Abp.Mailing.DefaultFromDisplayName` | empty | Default friendly name. |
+
+These are stored as ABP settings — manage them through the settings UI in production or seed them in tests with `ISettingManager`.
+
+The sender pipeline:
+
+```csharp
+await client.ConnectAsync(host, port, await GetSecureSocketOption());
+if (!useDefaultCredentials)
+    await client.AuthenticateAsync(userName, password);
+await client.SendAsync(message);
+await client.DisconnectAsync(true);
+```
+
+A new `SmtpClient` is created per send. For very high volume consider pooling, but for typical ABP email (transactional, < 100/sec) the per-send open is fine and avoids stale-connection bugs.
+
+## Sample `appsettings.json`
+
+Settings are usually persisted, not bound from JSON. But you can seed during startup:
+
+```json
+{
+  "Settings": {
+    "Abp.Mailing.Smtp.Host": "smtp.sendgrid.net",
+    "Abp.Mailing.Smtp.Port": "587",
+    "Abp.Mailing.Smtp.UserName": "apikey",
+    "Abp.Mailing.Smtp.Password": "SG....",
+    "Abp.Mailing.Smtp.EnableSsl": "true",
+    "Abp.Mailing.Smtp.UseDefaultCredentials": "false",
+    "Abp.Mailing.DefaultFromAddress": "no-reply@example.com",
+    "Abp.Mailing.DefaultFromDisplayName": "Catalog Service"
+  }
+}
+```
+
+Apply with a configuration setting provider (`ConfigurationSettingValueProvider`) or seed with `ISettingManager.SetGlobalAsync` once.
+
+## SMTP server requirements
+
+| Server | Compatible | Notes |
+| --- | --- | --- |
+| Postfix / Exim / Sendmail | ✅ | Set up auth + TLS; port 587 with STARTTLS. |
+| Microsoft Exchange / Exchange Online (SMTP AUTH) | ✅ | M365: enable SMTP AUTH per mailbox; password is an "App password" with MFA. Port 587 STARTTLS. |
+| SendGrid | ✅ | `smtp.sendgrid.net:587`, username `apikey`, password is the API key. |
+| Mailgun | ✅ | `smtp.mailgun.org:587` or 465, SMTP credentials from the domain page. |
+| Amazon SES | ✅ | `email-smtp.<region>.amazonaws.com:587` STARTTLS, IAM-derived SMTP creds. |
+| Postmark | ✅ | `smtp.postmarkapp.com:587`, server token as both user and password. |
+| Gmail / Google Workspace | ⚠️ | Requires App Password (2FA) or OAuth2; OAuth2 needs custom SASL provider — outside ABP defaults. |
+| Outlook.com personal | ⚠️ | Microsoft deprecated basic SMTP AUTH; OAuth2 required. |
+| Resend, Mailtrap, Mailjet | ✅ | Standard SMTP relay. |
+
+If your provider mandates OAuth2 (Gmail, M365), MailKit supports it via `SaslMechanismOAuth2`, but you must subclass `MailKitSmtpEmailSender` and override `ConfigureClient` to authenticate with a refreshable OAuth2 token instead of password.
+
+## Network and auth setup
+
+1. **Egress port.** Make sure 587 (STARTTLS) or 465 (implicit TLS) is open from your pods. Many corporate networks block 25; never rely on it.
+2. **DNS for sending domain.** Configure SPF (`v=spf1 include:sendgrid.net -all`), DKIM (provider-issued selectors), and DMARC (`v=DMARC1; p=quarantine; rua=...`). Without these, providers will junk or reject mail even if SMTP delivery succeeds.
+3. **From address.** Must match a verified domain on most providers. Seeding `Abp.Mailing.DefaultFromAddress` should use a real mailbox or alias.
+4. **Bounces & complaints.** Wire the provider's webhook to a controller that suppresses recipients (or unsubscribes them) — this is provider-specific, not part of ABP.
+5. **Rate limits.** Most providers cap at 100–600 messages per second per account. ABP's background-job queue (with multiple workers) can easily exceed this; introduce concurrency limits per job.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `MailKit.Security.SslHandshakeException` | Wrong `SecureSocketOption` for the port (e.g. `SslOnConnect` against 587). | Set `StartTls` for 587; `SslOnConnect` for 465. |
+| `Authentication failed: 535 5.7.8` | Bad credentials, MFA without app password, or provider blocks legacy auth. | Generate provider app password or implement OAuth2. |
+| `Service not available, closing transmission channel` after some sends | Connection limit per IP / per user. | Add small delay, reduce worker count, or batch via provider HTTP API. |
+| `Mailbox unavailable. Sender address rejected: Domain not found` | SPF/DKIM/DMARC missing or wrong From domain. | Configure DNS; use a verified sender domain. |
+| `552 5.3.4 Message size exceeds fixed limit` | Provider per-message limit (M365 = 150 MB; SendGrid = 30 MB; SES = 40 MB). | Send links to blobs instead of attachments. |
+| Mails go to spam | Reputation / DMARC misalignment. | Verify SPF/DKIM, warm up new IPs, ensure From matches DKIM domain. |
+| `Connect failed: Connection refused` | Port blocked at egress. | Open 587/465; switch to a relay if 25/465 are blocked. |
+| `Operation timed out` after first message | Server requires `AUTH` before `MAIL FROM` but `UseDefaultCredentials=true`. | Set `UseDefaultCredentials=false` and provide credentials. |
+
+## Observability hints
+
+- **Per-send latency.** Wrap `SendEmailAsync` with `Activity` to measure connect + auth + send phases. Connect spikes usually correlate with TLS issues.
+- **Background-job queue depth.** ABP queues email via `IBackgroundJobManager`; watch the job table backlog as a leading indicator of SMTP unavailability.
+- **Bounce rates.** Provider dashboards (SendGrid, SES, Postmark) expose deliverability metrics. Mirror them into your APM via webhooks.
+- **DKIM signature.** Use `mxtoolbox.com` "deliverability" check or your provider's "Validate DKIM" tool periodically.
+- **Logs.** Set `MailKit` log level to `Information` in dev; in prod keep `Warning` to avoid PII leakage.
+
+## High-volume tips
+
+- For bulk newsletters (> 10 k/hr), bypass SMTP and call the provider's HTTP API — it gives async tracking IDs and avoids connection churn.
+- Use a dedicated IP if your provider offers it and warm it up gradually (200 → 1k → 5k/day) to avoid spam-trap penalties.
+- Split transactional and marketing flows onto different sender domains / subdomains so reputation issues are isolated.
+
+## OAuth2 (XOAUTH2) for Gmail / Microsoft 365
+
+For tenants that have disabled SMTP basic auth, override the sender to use `SaslMechanismOAuth2`:
+
+```csharp
+public class OAuthSmtpEmailSender : MailKitSmtpEmailSender
+{
+    private readonly ITokenProvider _tokens;
+
+    public OAuthSmtpEmailSender(
+        ISmtpEmailSenderConfiguration smtpConfiguration,
+        IBackgroundJobManager backgroundJobManager,
+        IOptions<AbpMailKitOptions> options,
+        ITokenProvider tokens)
+        : base(smtpConfiguration, backgroundJobManager, options)
+    {
+        _tokens = tokens;
+    }
+
+    protected override async Task ConfigureClient(MailKit.Net.Smtp.SmtpClient client)
+    {
+        var host = await SmtpConfiguration.GetHostAsync();
+        var port = await SmtpConfiguration.GetPortAsync();
+        await client.ConnectAsync(host, port, SecureSocketOptions.StartTls);
+
+        var user = await SmtpConfiguration.GetUserNameAsync();
+        var token = await _tokens.GetAccessTokenAsync();
+        await client.AuthenticateAsync(new SaslMechanismOAuth2(user, token));
+    }
+}
+```
+
+Register with `[Dependency(ReplaceServices = true)]`. The token provider should cache the OAuth2 token until ~5 minutes before expiry.
+
+For Google Workspace use Google's OAuth2 / service account; for M365 use Azure AD app registration with `SMTP.Send` delegated/application permission.
+
+## Embedding inline images and attachments
+
+`MailMessage` (System.Net.Mail) supports inline images via `LinkedResource`; MailKit converts them through `MimeMessage.CreateFromMailMessage`. The default sender already does this:
+
+```csharp
+var message = MimeMessage.CreateFromMailMessage(mail);
+message.MessageId = MimeUtils.GenerateMessageId();
+```
+
+`MimeUtils.GenerateMessageId()` ensures every outgoing message has a unique `Message-Id` header (some relays reject duplicates). For massive attachments (> 5 MB) you should still prefer a blob link — most receivers reject big mails.
+
+## Connection reuse and pooling
+
+`MailKitSmtpEmailSender` constructs and disposes a `SmtpClient` per `SendAsync`. That's the safest pattern for transactional traffic. For bursty newsletter-style sends, build a pooled sender:
+
+```csharp
+public class PooledMailKitSender : IMailKitSmtpEmailSender, ISingletonDependency
+{
+    private readonly SemaphoreSlim _semaphore = new(8);
+    private SmtpClient? _client;
+
+    public async Task SendAsync(MailMessage mail)
+    {
+        await _semaphore.WaitAsync();
+        try
+        {
+            _client ??= await BuildAndConnect();
+            await _client.SendAsync(MimeMessage.CreateFromMailMessage(mail));
+        }
+        finally { _semaphore.Release(); }
+    }
+    /* ... reconnect on exception, periodic NOOP, etc. */
+}
+```
+
+Worth it once you exceed ~20 messages/sec from one pod. Below that the connection cost is irrelevant compared to TLS handshake savings.
+
+## DKIM signing
+
+ABP doesn't sign messages — that's the SMTP relay's job. Most managed providers (SendGrid, SES, Postmark, Mailgun) DKIM-sign automatically once you verify the domain. For self-hosted relays use OpenDKIM or rspamd in front of Postfix. The DKIM selector + DNS TXT record must match the From domain for DMARC alignment.
+
+## Headers and threading
+
+To support threaded replies in Gmail and Outlook, add `In-Reply-To` and `References` headers on follow-up emails:
+
+```csharp
+var mail = new MailMessage(...);
+mail.Headers.Add("In-Reply-To", originalMessageId);
+mail.Headers.Add("References", originalMessageId);
+```
+
+`System.Net.Mail` will forward custom headers through `MimeMessage`.
+
+## Related references
+
+- [Email Sending](/framework/cross/email) — abstractions, templates, background-job wiring.
+- [Background Jobs](/framework/background/background-jobs) — queue that drives async email send.

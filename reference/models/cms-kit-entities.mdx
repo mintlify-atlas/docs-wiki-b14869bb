@@ -1,0 +1,306 @@
+---
+title: "CMS Kit Entities"
+description: "Reference for the Blog, BlogPost, Page, Tag, Comment, Rating, UserReaction, MediaDescriptor, MenuItem, and related aggregates in Volo.CmsKit.Domain."
+---
+
+The CMS Kit module ships a grid of small, focused aggregates that can be composed into any application: blogs, comments, ratings, reactions, media, menus, pages, tags, global resources, and a synchronised user mirror. Most aggregates target a polymorphic `(EntityType, EntityId)` pair so that they can attach to *any* domain entity without coupling.
+
+Source path: `modules/cms-kit/src/Volo.CmsKit.Domain/Volo/CmsKit/`.
+
+## High-level map
+
+```mermaid
+erDiagram
+    Blog ||--o{ BlogPost : owns
+    Blog ||--o{ BlogFeature : has
+    BlogPost }o--|| CmsUser : authored_by
+    Comment }o--|| CmsUser : authored_by
+    Comment ||--o{ Comment : replies
+    Tag ||--o{ EntityTag : tags
+    Page ||--o{ Page : (none)
+    MediaDescriptor ||--|| Object : describes
+    MenuItem ||--o{ MenuItem : children
+    Rating }o--|| CmsUser : authored_by
+    UserReaction }o--|| CmsUser : authored_by
+```
+
+## Blog aggregates
+
+### `Blog`
+
+Base: `FullAuditedAggregateRoot<Guid>` + `IMultiTenant`.
+
+```csharp
+public class Blog : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    [NotNull] public virtual string Name { get; protected set; }
+    [NotNull] public virtual string Slug { get; protected set; }
+    public virtual Guid? TenantId { get; protected set; }
+}
+```
+
+| Property | Type     | Constraints (`BlogConsts.MaxNameLength`) | Notes                                       |
+| -------- | -------- | ----------------------------------------- | ------------------------------------------- |
+| `Name`   | `string` | `MaxNameLength`                          | Display name.                                |
+| `Slug`   | `string` | `MaxNameLength`, URL-safe (normalised)   | Normalised through `SlugNormalizer`.        |
+
+### `BlogPost`
+
+Base: `FullAuditedAggregateRoot<Guid>` + `IMultiTenant`, `IHasEntityVersion`.
+
+```csharp
+public class BlogPost : FullAuditedAggregateRoot<Guid>, IMultiTenant, IHasEntityVersion
+{
+    public virtual Guid BlogId { get; protected set; }
+    [NotNull] public virtual string Title { get; protected set; }
+    [NotNull] public virtual string Slug { get; protected set; }
+    [NotNull] public virtual string ShortDescription { get; protected set; }
+    public virtual string Content { get; protected set; }
+    public Guid? CoverImageMediaId { get; set; }
+    public virtual Guid? TenantId { get; protected set; }
+    public Guid AuthorId { get; set; }
+    public virtual CmsUser Author { get; set; }
+    public virtual BlogPostStatus Status { get; set; }
+    public virtual int EntityVersion { get; protected set; }
+}
+```
+
+`BlogPostStatus` is an enum (`Draft`, `Published`).
+
+### `BlogFeature`
+
+Base: `FullAuditedAggregateRoot<Guid>`. Per-blog toggle table for optional CMS Kit features (comments, ratings, reactions, tags).
+
+```csharp
+public class BlogFeature : FullAuditedAggregateRoot<Guid>
+{
+    public Guid BlogId { get; protected set; }
+    public string FeatureName { get; protected set; }
+    public bool IsEnabled { get; protected internal set; }
+}
+```
+
+## Polymorphic feature aggregates
+
+These aggregates all key off `(EntityType, EntityId)` so that they can attach to blog posts, pages, user-defined entities, …
+
+### `Comment`
+
+Base: `AggregateRoot<Guid>` + `IHasCreationTime`, `IMustHaveCreator`, `IMultiTenant`.
+
+```csharp
+public class Comment : AggregateRoot<Guid>, IHasCreationTime, IMustHaveCreator, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string EntityType { get; protected set; }
+    public virtual string EntityId { get; protected set; }
+    public virtual string Text { get; protected set; }
+    public virtual Guid? RepliedCommentId { get; protected set; }
+    public virtual Guid CreatorId { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+    public virtual string Url { get; set; }
+}
+```
+
+| Property            | Type     | Constraint (`CommentConsts`)       |
+| ------------------- | -------- | ---------------------------------- |
+| `EntityType`        | `string` | `MaxEntityTypeLength`              |
+| `EntityId`          | `string` | `MaxEntityIdLength`                |
+| `Text`              | `string` | `MaxTextLength`                    |
+| `RepliedCommentId`  | `Guid?`  | Self-reference for threads.        |
+| `Url`               | `string` | Where the comment was written.     |
+
+### `Rating`
+
+Base: `BasicAggregateRoot<Guid>` + `IHasCreationTime`, `IMustHaveCreator`.
+
+```csharp
+public class Rating : BasicAggregateRoot<Guid>, IHasCreationTime, IMustHaveCreator
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string EntityType { get; protected set; }
+    public virtual string EntityId { get; protected set; }
+    public virtual short StarCount { get; protected set; }
+    public virtual Guid CreatorId { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+}
+```
+
+`StarCount` is enforced to be between `RatingConsts.MinStarCount` (1) and `RatingConsts.MaxStarCount` (5).
+
+### `UserReaction`
+
+Base: `BasicAggregateRoot<Guid>` + `IHasCreationTime`, `IMustHaveCreator`, `IMultiTenant`.
+
+```csharp
+public class UserReaction : BasicAggregateRoot<Guid>, IHasCreationTime, IMustHaveCreator, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string EntityType { get; protected set; }
+    public virtual string EntityId { get; protected set; }
+    public virtual string ReactionName { get; protected set; }
+    public virtual Guid CreatorId { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+}
+```
+
+`ReactionName` is matched against the configured `CmsKitReactionOptions.Reactions` (👍, ❤, 😆, …).
+
+## Tags
+
+### `Tag`
+
+Base: `FullAuditedAggregateRoot<Guid>` + `IMultiTenant`.
+
+```csharp
+public class Tag : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+    [NotNull] public virtual string EntityType { get; protected set; }
+    [NotNull] public virtual string Name { get; protected set; }
+}
+```
+
+### `EntityTag`
+
+Base: `Entity` + `IMultiTenant`. Composite key `(TagId, EntityId)`.
+
+```csharp
+public class EntityTag : Entity, IMultiTenant
+{
+    public virtual Guid TagId { get; set; }
+    public virtual string EntityId { get; set; }
+    public virtual Guid? TenantId { get; set; }
+
+    public override object[] GetKeys() => new object[] { TagId, EntityId };
+}
+```
+
+## Pages and menus
+
+### `Page`
+
+Base: `FullAuditedAggregateRoot<Guid>` + `IMultiTenant`, `IHasEntityVersion`.
+
+```csharp
+public class Page : FullAuditedAggregateRoot<Guid>, IMultiTenant, IHasEntityVersion
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string Title { get; protected set; }
+    public virtual string Slug { get; protected set; }
+    public virtual string Content { get; protected set; }
+    public virtual string Script { get; protected set; }
+    public virtual string Style { get; protected set; }
+    public virtual bool IsHomePage { get; protected set; }
+    public virtual int EntityVersion { get; protected set; }
+}
+```
+
+Only one row may have `IsHomePage = true` — the domain service throws `MultipleHomePageException` otherwise.
+
+### `MenuItem`
+
+Base: `AuditedAggregateRoot<Guid>` + `IMultiTenant`. Hierarchical via `ParentId`.
+
+```csharp
+public class MenuItem : AuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? ParentId { get; set; }
+    [NotNull] public string DisplayName { get; protected set; }
+    public bool IsActive { get; set; }
+    [NotNull] public string Url { get; protected set; }
+    public string Icon { get; set; }
+    public int Order { get; set; }
+    public string Target { get; set; }
+    public string ElementId { get; set; }
+    public string CssClass { get; set; }
+    public Guid? PageId { get; protected set; }
+    public Guid? TenantId { get; protected set; }
+}
+```
+
+## Media
+
+### `MediaDescriptor`
+
+Base: `FullAuditedAggregateRoot<Guid>` + `IMultiTenant`. Metadata row for a binary stored in any `IBlobContainer`.
+
+```csharp
+public class MediaDescriptor : FullAuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public Guid? TenantId { get; protected set; }
+    public string EntityType { get; protected set; }
+    public string Name { get; protected set; }
+    public string MimeType { get; protected set; }
+    public long Size { get; protected set; }
+}
+```
+
+`MediaContainer` is an `IBlobContainer` derivative configured per `EntityType`. `MediaDescriptorChecks` validates `Name` against an allow-list of safe characters via `MediaDescriptorChecks.IsValidMediaFileName`.
+
+## `GlobalResource`
+
+Base: `AuditedAggregateRoot<Guid>` + `IMultiTenant`. Key/value store for global content fragments (banners, scripts, JSON snippets) usable anywhere in the host.
+
+```csharp
+public class GlobalResource : AuditedAggregateRoot<Guid>, IMultiTenant
+{
+    public virtual string Name { get; private set; }
+    public virtual string Value { get; private set; }
+    public virtual Guid? TenantId { get; protected set; }
+}
+```
+
+`Name` is capped by `GlobalResourceConsts.MaxNameLength`; `Value` by `GlobalResourceConsts.MaxValueLength`.
+
+## `CmsUser`
+
+Base: `AggregateRoot<Guid>` + `IUser`, `IUpdateUserData`. A read-only mirror of users from the Identity / external user store, kept in sync by `CmsUserSynchronizer`.
+
+```csharp
+public class CmsUser : AggregateRoot<Guid>, IUser, IUpdateUserData
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string UserName { get; protected set; }
+    public virtual string Email { get; protected set; }
+    public virtual string Name { get; set; }
+    public virtual string Surname { get; set; }
+    public virtual bool IsActive { get; set; }
+    public virtual bool EmailConfirmed { get; protected set; }
+    public virtual string PhoneNumber { get; protected set; }
+    public virtual bool PhoneNumberConfirmed { get; protected set; }
+
+    public CmsUser(IUserData user) : base(user.Id)
+    {
+        TenantId = user.TenantId;
+        UpdateInternal(user);
+    }
+}
+```
+
+CmsKit does *not* own users. It reuses the source user id, then updates the mirror via `Update(IUserData)`. Comment/Rating/Reaction aggregates carry `CreatorId` referring to this mirror.
+
+## Tables
+
+| Entity             | Table                            |
+| ------------------ | -------------------------------- |
+| `Blog`             | `CmsBlogs`                        |
+| `BlogPost`         | `CmsBlogPosts`                    |
+| `BlogFeature`      | `CmsBlogFeatures`                 |
+| `Comment`          | `CmsComments`                     |
+| `Tag`              | `CmsTags`                         |
+| `EntityTag`        | `CmsEntityTags`                   |
+| `Rating`           | `CmsRatings`                      |
+| `UserReaction`     | `CmsUserReactions`                |
+| `MediaDescriptor`  | `CmsMediaDescriptors`             |
+| `Page`             | `CmsPages`                        |
+| `MenuItem`         | `CmsMenuItems`                    |
+| `GlobalResource`   | `CmsGlobalResources`              |
+| `CmsUser`          | `CmsUsers`                        |
+
+## See also
+
+- [CMS Kit module](/modules/cms-kit)
+- [Identity module entities](/reference/models/identity-entities) (source of `CmsUser` data)
+- [BLOB Storing entities](/reference/models/blob-storing-entities) (storage for `MediaDescriptor`)
+- [Entity base types](/reference/models/entities-base-types)

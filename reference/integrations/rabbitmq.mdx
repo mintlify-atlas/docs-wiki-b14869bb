@@ -1,0 +1,266 @@
+---
+title: "RabbitMQ"
+description: "External-server reference for RabbitMQ — broker versions, exchanges/queues used by ABP, virtual hosts, TLS, and how Volo.Abp.RabbitMQ maps onto the AMQP wire protocol."
+---
+
+RabbitMQ is the most commonly used broker behind the ABP distributed event bus, the background job queue, and any custom AMQP integration. The `Volo.Abp.RabbitMQ` package is the **transport layer**: it owns the connection and channel pools and exposes the consumer loop that higher-level modules (event bus, jobs) build on. This page focuses on the broker side — what version to deploy, what connection knobs ABP exposes, and how exchanges, queues and routing keys are laid out.
+
+For the abstraction layer (`IRabbitMqMessageConsumer`, `IChannelPool`, exchange/queue declare configs), see [RabbitMQ Transport](/framework/brokers/rabbitmq). For event semantics on top of that, see [Distributed Event Bus — RabbitMQ](/framework/eventbus/rabbitmq). For jobs, see [Background Jobs — RabbitMQ](/framework/background/background-jobs-rabbitmq).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.RabbitMQ` | Connection/channel pools, consumer loop, serializer. |
+| `Volo.Abp.EventBus.RabbitMQ` | Distributed event bus over RabbitMQ. Depends on `Volo.Abp.RabbitMQ`. |
+| `Volo.Abp.BackgroundJobs.RabbitMQ` | Background job store/dispatcher over RabbitMQ. Depends on `Volo.Abp.RabbitMQ`. |
+
+The transport module is `AbpRabbitMqModule`:
+
+```csharp
+[DependsOn(
+    typeof(AbpJsonModule),
+    typeof(AbpThreadingModule)
+    )]
+public class AbpRabbitMqModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpRabbitMqOptions>(configuration.GetSection("RabbitMQ"));
+        Configure<AbpRabbitMqOptions>(options =>
+        {
+            foreach (var connectionFactory in options.Connections.Values)
+            {
+                connectionFactory.DispatchConsumersAsync = true;
+            }
+        });
+    }
+    /* OnApplicationShutdown disposes IChannelPool and IConnectionPool */
+}
+```
+
+Two facts to remember: (1) options bind from the `RabbitMQ` config section, (2) `DispatchConsumersAsync = true` is always forced, so every consumer in your app uses the async dispatcher.
+
+## Options model
+
+`AbpRabbitMqOptions` is a thin wrapper:
+
+```csharp
+public class AbpRabbitMqOptions
+{
+    public RabbitMqConnections Connections { get; }
+}
+
+public class RabbitMqConnections : Dictionary<string, ConnectionFactory>
+{
+    public const string DefaultConnectionName = "Default";
+    public ConnectionFactory Default { get => this["Default"]; set => this["Default"] = value; }
+    public ConnectionFactory GetOrDefault(string connectionName) { /* fallback to Default */ }
+}
+```
+
+Each entry is a raw `RabbitMQ.Client.ConnectionFactory` from the official `RabbitMQ.Client` NuGet package. Anything that library accepts (URI, host arrays, SSL config, vhost) is configurable from JSON — names match the property names on `ConnectionFactory` (PascalCase). Named connections let one app talk to multiple brokers (e.g. on-prem MQ for jobs, cloud MQ for integration events).
+
+## Broker version requirements
+
+| Broker | Minimum | Recommended |
+| --- | --- | --- |
+| RabbitMQ OSS | 3.8 | **3.12 / 3.13 / 4.x** (LTS line at time of writing) |
+| Erlang runtime | matches broker matrix | use the runtime image RabbitMQ ships in `rabbitmq:3-management` |
+| LavinMQ (drop-in) | 1.0 | 1.2+ — AMQP 0-9-1 compatible, missing some plugins |
+| Amazon MQ for RabbitMQ | mirrors OSS LTS | use 3.11+ |
+| CloudAMQP | — | Squirrel/Bunny/Big Bunny plans |
+
+ABP works with anything that speaks **AMQP 0-9-1** and supports publisher confirms, durable exchanges, and consumer cancel. It does **not** require streams, MQTT, STOMP, or the management plugin to function — but you'll want management or Prometheus plugins enabled for ops.
+
+The `RabbitMQ.Client` NuGet ABP depends on tracks the official client. Newer client versions can talk to older brokers, but features like single-active-consumer or quorum queues need broker 3.8+.
+
+## Sample `appsettings.json`
+
+```json
+{
+  "RabbitMQ": {
+    "Connections": {
+      "Default": {
+        "HostName": "rabbit-prod-01.internal",
+        "Port": 5671,
+        "UserName": "catalog-service",
+        "Password": "Sup3rS3cret!",
+        "VirtualHost": "/production",
+        "Ssl": {
+          "Enabled": true,
+          "ServerName": "rabbit-prod-01.internal",
+          "Version": "Tls12"
+        },
+        "RequestedHeartbeat": "00:00:30",
+        "NetworkRecoveryInterval": "00:00:05",
+        "AutomaticRecoveryEnabled": true
+      }
+    },
+    "EventBus": {
+      "ClientName": "catalog-service",
+      "ExchangeName": "Abp.Distributed.Events"
+    },
+    "Jobs": {
+      "DefaultQueueNamePrefix": "AbpQueue.",
+      "DefaultDelayedQueueNamePrefix": "AbpDelayedQueue.",
+      "DefaultExchangeNamePrefix": "AbpExchange.",
+      "RetryCount": 3,
+      "Durable": true
+    }
+  }
+}
+```
+
+`RabbitMQ:EventBus` is read by `AbpRabbitMqEventBusOptions` (from the event bus module). `RabbitMQ:Jobs` is read by `AbpRabbitMqBackgroundJobOptions` (from the jobs module). Only `RabbitMQ:Connections` is owned by the transport package.
+
+## Connection string URI form
+
+Instead of properties you can set `Uri`:
+
+```json
+{
+  "RabbitMQ": {
+    "Connections": {
+      "Default": {
+        "Uri": "amqps://catalog-service:Sup3rS3cret!@rabbit-prod-01.internal:5671/production"
+      }
+    }
+  }
+}
+```
+
+`amqp://` for plain, `amqps://` for TLS (port 5671 by default). The path after the host is the URL-encoded vhost — `/` becomes `%2F` in the default vhost.
+
+## Network and auth setup
+
+1. **Vhosts.** Always isolate environments and (often) services into virtual hosts: `/dev`, `/staging`, `/prod`, or `/catalog`, `/billing`. Permissions are per-vhost.
+2. **Users & permissions.** Create a non-admin user per service. Grant only what you need; e.g. `configure='Abp.Distributed.Events|AbpExchange\\..*' write='.*' read='AbpQueue\\..*|^amq\\.gen-.*'`. Configure permission is required for exchange/queue declares, which ABP performs on startup.
+3. **TLS.** Use port 5671 with a properly issued certificate. The `Ssl` block on `ConnectionFactory` maps to `SslOption` — set `ServerName` to the SNI the broker presents, `Version` to `Tls12` or `Tls13`, and `CertPath`/`CertPassphrase` if mutual TLS is required.
+4. **High availability.** For RabbitMQ ≥ 3.8 prefer **quorum queues** (durable, replicated). Configure ABP queues with `Durable=true` and set the quorum policy on the broker side (`x-queue-type=quorum` via policy). Classic mirrored queues are deprecated.
+5. **Cluster discovery.** Put a TCP load balancer (HAProxy, NLB) in front of the cluster and point ABP at that. Set `AutomaticRecoveryEnabled=true` and a reasonable `NetworkRecoveryInterval` (default 5 s).
+6. **Heartbeats.** Default heartbeat is 60 s. With aggressive idle disconnects (AWS NLB at 350 s idle, Azure 4 min), 30 s is safer. Set `RequestedHeartbeat: "00:00:30"`.
+
+## Exchanges, queues and routing keys
+
+ABP's higher-level modules declare a small set of topology objects. Knowing them helps when bootstrapping a fresh broker or writing migration policies.
+
+| Object | Declared by | Default name | Type | Durable |
+| --- | --- | --- | --- | --- |
+| Event-bus exchange | `Volo.Abp.EventBus.RabbitMQ` | `Abp.Distributed.Events` | `direct` | yes |
+| Per-app queue bound to event exchange | event bus | `<ClientName>` | `classic`/`quorum` | yes |
+| Job exchange | `Volo.Abp.BackgroundJobs.RabbitMQ` | `AbpExchange.<JobName>` | `direct` | yes |
+| Job queue | job module | `AbpQueue.<JobName>` | `classic`/`quorum` | yes |
+| Delayed (DLX) queue | job module | `AbpDelayedQueue.<JobName>` | `classic` with `x-message-ttl` + `x-dead-letter-exchange` | yes |
+
+You can override every prefix through the options classes referenced above. If the broker uses policies (recommended) to set `x-queue-type=quorum`, do not declare quorum-specific arguments from the client — let the policy apply.
+
+## Publisher confirms, prefetch, retries
+
+- ABP's `RabbitMqMessageConsumer` issues `basic.qos` per queue with the `PrefetchCount` from `QueueDeclareConfiguration` (default 1 for jobs; tune higher for event consumers).
+- The event bus uses **publisher confirms** to avoid losing events; failed publishes throw and are retried by the outbox if enabled.
+- For background jobs, retry semantics live in the job module (`RetryCount` config). When `RetryCount` is exhausted the message lands in the DLX queue (`AbpDeadLetterQueue.*`).
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `BrokerUnreachableException: None of the specified endpoints were reachable` | Wrong host/port, firewall, vhost permission denied. | Check security groups, run `rabbitmqctl list_permissions -p /production`. |
+| `AuthenticationFailureException: ACCESS_REFUSED` | User lacks login on the vhost, or password wrong. | `rabbitmqctl set_permissions -p /production catalog-service "..." "..." "..."`. |
+| `PRECONDITION_FAILED - inequivalent arg 'x-queue-type'` | Queue redeclared with different args than existing. | Delete the queue, change broker policy instead of client args, or align declarations. |
+| Consumers stop receiving after a network blip | Channel died but consumer wasn't re-registered. | ABP's `RabbitMqMessageConsumer` re-creates the channel automatically — confirm logs show "Consumer re-created"; ensure `AutomaticRecoveryEnabled=true`. |
+| Memory alarm on broker, publishes block | Broker hit memory high watermark. | Add more RAM, raise watermark, or shrink queues; ABP publishes will block until pressure clears. |
+| `CONNECTION_FORCED - broker forced connection closure with reason 'shutdown'` on deploy | Broker rolling restart. | Expected — recovery kicks in after `NetworkRecoveryInterval`. |
+| Bursty event lag | Default `PrefetchCount=1`. | Raise prefetch on event queue via `QueueDeclareConfiguration.PrefetchCount`. |
+| Job DLX queue fills up | Retries exhausted. | Inspect `AbpDeadLetterQueue.*`, replay manually or fix the job and re-enqueue. |
+
+## Observability hints
+
+- **Management UI / HTTP API.** `https://rabbit:15671/api/queues/%2Fproduction` exposes message rates, consumer counts and ready/unacked counters. ABP queue names follow `AbpQueue.*` / `<ClientName>` so they're easy to filter.
+- **Prometheus plugin.** `rabbitmq_prometheus` is built in from 3.8. Scrape port 15692. Useful metrics: `rabbitmq_queue_messages_ready`, `rabbitmq_queue_consumers`, `rabbitmq_channels`, `rabbitmq_connections_opened_total`.
+- **Tracing.** OpenTelemetry's `RabbitMQ.Client.OpenTelemetry` (or the in-app `Activity` decorations ABP adds for event publish/consume) annotate spans with `messaging.system=rabbitmq`, queue name and routing key.
+- **`firehose` / message tracing.** Enable the broker `rabbitmq_tracing` plugin sparingly — it copies every message and is expensive in production.
+- **Client counters.** `IConnectionPool` and `IChannelPool` are singletons — if you need pool depth, expose them via a hosted service and emit gauges.
+
+## Sizing notes
+
+- One `IConnection` per app process is sufficient; `IConnectionPool` keys by connection name. Channels are cheap — `IChannelPool` gives a channel per logical purpose.
+- For high-volume publishers, scale **horizontally** (more pods) before increasing channel count per pod.
+- Quorum queues use ~3x the disk of classic queues — plan IOPS accordingly. They also impose a leader bottleneck; spread queue leaders across cluster nodes via the queue-master-locator policy.
+
+## Policies and operator-managed config
+
+In production prefer **broker policies** over client-side queue arguments. Example to enforce quorum + lazy mode + per-queue TTL:
+
+```bash
+rabbitmqctl set_policy AbpDefaults "^AbpQueue\\.|^AbpDelayedQueue\\." \
+  '{"queue-mode":"lazy","x-queue-type":"quorum","max-length":1000000}' \
+  --apply-to queues
+```
+
+Client-side declared arguments must match the policy values (or omit them entirely). Mixing creates `PRECONDITION_FAILED` on declare.
+
+## Per-message TTL and delayed queues
+
+The job module's delayed queue uses **per-queue TTL + DLX**: messages enter the delayed queue, expire after their delay, and dead-letter into the live queue. This is the standard "delayed scheduler" trick on RabbitMQ. The downside: TTL is per-queue (so all delayed jobs share a TTL bucket), not per-message.
+
+For per-message delay, install the `rabbitmq_delayed_message_exchange` plugin and declare the exchange with `x-delayed-type=direct`. ABP doesn't use it by default — drop it in via a custom exchange declare configuration if needed.
+
+## Consumer prefetch tuning
+
+`PrefetchCount` is the broker-side credit the consumer holds. Per-channel global prefetch (`global=true`) is rare — ABP uses per-consumer prefetch.
+
+- Low (1–5): predictable latency, low throughput. Default for jobs.
+- Medium (50–100): balanced. Good for event consumers.
+- High (1000+): max throughput for batch consumers; risks memory blow-up if handler is slow.
+
+For long-running consumers also enable **single-active-consumer** on the queue if you want at-most-one active subscriber per queue (failover semantics).
+
+## Connection blocking
+
+When the broker hits memory or disk alarms, publishing channels are **blocked** — `BasicPublish` blocks until pressure clears. From the client side this looks like a hung publish. Listen for `IConnection.ConnectionBlocked`/`ConnectionUnblocked` events and surface as a metric or alarm.
+
+## Shovels and federation
+
+To bridge brokers (e.g. on-prem ↔ cloud), use built-in **shovels** (dynamic, scriptable) or **federation upstreams** (persistent links). ABP code is unchanged — the bridge moves messages between exchanges/queues transparently. Shovels are usually simpler for ad-hoc migrations.
+
+## Cluster recommendations
+
+- **3 or 5 nodes**, never 2 (quorum needs odd count).
+- Place across availability zones with low-latency interconnects (< 5 ms RTT).
+- One quorum queue leader per node spread via the `queue-master-locator=balanced` policy.
+- Use a TCP load balancer (not HTTP) — AMQP is a long-lived TCP connection.
+
+## Streams (RabbitMQ 3.9+)
+
+Streams are append-only log-like queues with retention. ABP doesn't use them — they're best for replayable event streams (similar to Kafka). If you want stream semantics on RabbitMQ, write directly against the streams client; ABP's classic-/quorum-queue model is decoupled.
+
+## Plugins worth installing
+
+| Plugin | Use |
+| --- | --- |
+| `rabbitmq_management` | Web UI + HTTP API; required for ops. |
+| `rabbitmq_prometheus` | `/metrics` endpoint; built-in 3.8+. |
+| `rabbitmq_shovel` + `rabbitmq_shovel_management` | Bridge between brokers. |
+| `rabbitmq_federation` + `rabbitmq_federation_management` | Persistent broker links. |
+| `rabbitmq_delayed_message_exchange` | Per-message delays (community). |
+| `rabbitmq_consistent_hash_exchange` | Sharded routing. |
+| `rabbitmq_auth_backend_oauth2` | OAuth2 / OIDC auth (Keycloak, Azure AD). |
+
+Most managed brokers (CloudAMQP, Amazon MQ) enable management and prometheus by default.
+
+## Capacity planning rule of thumb
+
+- **Memory** sized for your peak ready-message backlog + 50% headroom. Quorum queues stream to disk and stay lean; classic mirrored queues bloat memory.
+- **Disk** sized for retention × peak throughput. With 100 msg/sec at 1 KB and 7-day retention you need ~60 GB.
+- **CPU** rarely the bottleneck on modern brokers — except with TLS where it can be 30–50%.
+- **Network** is the typical limit; saturate gigabit before saturating CPU.
+
+For more than ~50 k msg/sec sustained, shard topics or consider Kafka.
+
+## Related references
+
+- [RabbitMQ Transport](/framework/brokers/rabbitmq) — pool internals, consumer loop, serializer.
+- [Distributed Event Bus — RabbitMQ](/framework/eventbus/rabbitmq) — event exchange + per-app queue layout.
+- [Background Jobs — RabbitMQ](/framework/background/background-jobs-rabbitmq) — job exchange, delayed queue, retry policy.

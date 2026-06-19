@@ -1,0 +1,491 @@
+---
+title: "RabbitMQ Transport"
+description: "Connection pool, channel pool, message consumers and serializer in Volo.Abp.RabbitMQ — the general-purpose RabbitMQ integration that powers (but is independent from) the distributed event bus."
+---
+
+`Volo.Abp.RabbitMQ` is the **transport-level** RabbitMQ package. It owns connections, channels and a generic message consumer loop. Any module that needs to talk to RabbitMQ — the distributed event bus, the outbox dispatcher, a custom integration — depends on this package and reuses its pools instead of opening its own sockets.
+
+This page documents the public surface of `Volo.Abp.RabbitMQ`. If you are looking for how integration events flow through RabbitMQ exchanges, that is a separate layer documented in [Distributed Event Bus — RabbitMQ](/framework/eventbus/rabbitmq).
+
+## Package layout
+
+The package ships a small, focused set of types under the `Volo.Abp.RabbitMQ` namespace:
+
+| File | Type | Purpose |
+| --- | --- | --- |
+| `AbpRabbitMqModule.cs` | `AbpRabbitMqModule` | Module entry; binds `RabbitMQ` config section, forces `DispatchConsumersAsync = true`, disposes pools on shutdown. |
+| `AbpRabbitMqOptions.cs` | `AbpRabbitMqOptions` | Options root — exposes a `Connections` dictionary. |
+| `RabbitMqConnections.cs` | `RabbitMqConnections : Dictionary<string, ConnectionFactory>` | Named-connection registry. |
+| `IConnectionPool.cs` / `ConnectionPool.cs` | Singleton pool of `IConnection` per connection name. |
+| `IChannelPool.cs` / `ChannelPool.cs` | Singleton pool of `IModel` (channel) per channel name. |
+| `IChannelAccessor.cs` | Disposable handle over a pooled channel. |
+| `ExchangeDeclareConfiguration.cs` | DTO with exchange name, type, `Durable`, `AutoDelete`, `Arguments`. |
+| `QueueDeclareConfiguration.cs` | DTO with queue name, `Durable`, `Exclusive`, `AutoDelete`, `PrefetchCount`, `Arguments` and a `Declare(IModel)` helper. |
+| `IRabbitMqMessageConsumer.cs` / `RabbitMqMessageConsumer.cs` | Long-lived consumer that re-creates its channel on failure. |
+| `IRabbitMqMessageConsumerFactory.cs` / `RabbitMqMessageConsumerFactory.cs` | Singleton factory that resolves consumers through a private `IServiceScope`. |
+| `IRabbitMqSerializer.cs` / `Utf8JsonRabbitMqSerializer.cs` | UTF‑8 JSON serializer backed by `IJsonSerializer`. |
+| `RabbitMqConsts.cs` | `DeliveryModes` and `ExchangeTypes` constants. |
+| `QueueBindType.cs` | Internal bind/unbind command enum. |
+
+## Module and configuration binding
+
+`AbpRabbitMqModule` is the only thing you need to depend on. It performs three jobs:
+
+```csharp
+[DependsOn(
+    typeof(AbpJsonModule),
+    typeof(AbpThreadingModule)
+    )]
+public class AbpRabbitMqModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpRabbitMqOptions>(configuration.GetSection("RabbitMQ"));
+        Configure<AbpRabbitMqOptions>(options =>
+        {
+            foreach (var connectionFactory in options.Connections.Values)
+            {
+                connectionFactory.DispatchConsumersAsync = true;
+            }
+        });
+    }
+
+    public override void OnApplicationShutdown(ApplicationShutdownContext context)
+    {
+        context.ServiceProvider
+            .GetRequiredService<IChannelPool>()
+            .Dispose();
+
+        context.ServiceProvider
+            .GetRequiredService<IConnectionPool>()
+            .Dispose();
+    }
+}
+```
+
+Two consequences are worth highlighting:
+
+1. The `"RabbitMQ"` configuration section is bound to `AbpRabbitMqOptions`, which means hostname, username, password, virtual host and port can all come from `appsettings.json`.
+2. Every `ConnectionFactory` is forced into asynchronous-consumer mode. The framework's consumer pipeline relies on `AsyncEventingBasicConsumer`; if you previously set `DispatchConsumersAsync = false` your override is overwritten.
+
+## Options
+
+`AbpRabbitMqOptions` is just a wrapper around the connection registry:
+
+```csharp
+public class AbpRabbitMqOptions
+{
+    public RabbitMqConnections Connections { get; }
+
+    public AbpRabbitMqOptions()
+    {
+        Connections = new RabbitMqConnections();
+    }
+}
+```
+
+`RabbitMqConnections` is a `Dictionary<string, ConnectionFactory>` with a sentinel key `Default` (constant `RabbitMqConnections.DefaultConnectionName = "Default"`). A new instance pre-creates a default `ConnectionFactory`, so the dictionary is never empty. `GetOrDefault(connectionName)` falls back to that default when an unknown name is requested.
+
+### Configuration example
+
+```json title="appsettings.json"
+{
+  "RabbitMQ": {
+    "Connections": {
+      "Default": {
+        "HostName": "rabbit-1;rabbit-2;rabbit-3",
+        "UserName": "guest",
+        "Password": "guest",
+        "VirtualHost": "/",
+        "Port": 5672
+      },
+      "Audit": {
+        "HostName": "audit-rabbit",
+        "UserName": "audit",
+        "Password": "***"
+      }
+    }
+  }
+}
+```
+
+`HostName` accepts a semicolon-separated list. `ConnectionPool` trims a trailing `;` and switches between `CreateConnection()` and `CreateConnection(string[])` to support clusters — there is no separate cluster setting.
+
+## Connection pool
+
+```csharp
+public class ConnectionPool : IConnectionPool, ISingletonDependency
+{
+    public virtual IConnection Get(string? connectionName = null)
+    {
+        connectionName ??= RabbitMqConnections.DefaultConnectionName;
+
+        try
+        {
+            var lazyConnection = Connections.GetOrAdd(
+                connectionName, () => new Lazy<IConnection>(() =>
+                {
+                    var connection = Options.Connections.GetOrDefault(connectionName);
+                    var hostnames = connection.HostName.TrimEnd(';').Split(';');
+                    // Handle Rabbit MQ Cluster.
+                    return hostnames.Length == 1
+                        ? connection.CreateConnection()
+                        : connection.CreateConnection(hostnames);
+                })
+            );
+
+            return lazyConnection.Value;
+        }
+        catch (Exception)
+        {
+            Connections.TryRemove(connectionName, out _);
+            throw;
+        }
+    }
+}
+```
+
+Key behaviours:
+
+- **One connection per name.** Backed by a `ConcurrentDictionary<string, Lazy<IConnection>>`. The dictionary is keyed by connection name, not by hostname, so two named connections to the same host produce two TCP sockets.
+- **Lazy construction.** The factory is invoked on first `Get(...)`. If it throws, the failed entry is removed so the next call retries instead of caching a broken `Lazy`.
+- **Module-driven disposal.** `Dispose()` swallows individual `IConnection.Dispose()` exceptions and clears the dictionary; it is called from `OnApplicationShutdown` so you do not need to dispose the pool yourself.
+
+## Channel pool
+
+`ChannelPool` is the level most consumers should use. It hands out `IChannelAccessor` handles — wrappers that release the channel back to the pool on dispose without closing it.
+
+```csharp
+public virtual IChannelAccessor Acquire(string? channelName = null, string? connectionName = null)
+{
+    CheckDisposed();
+
+    channelName = channelName ?? "";
+
+    var poolItem = Channels.GetOrAdd(
+        channelName,
+        _ => new ChannelPoolItem(CreateChannel(channelName, connectionName))
+    );
+
+    poolItem.Acquire();
+
+    return new ChannelAccessor(
+        poolItem.Channel,
+        channelName,
+        () => poolItem.Release()
+    );
+}
+```
+
+The pool item itself synchronises access with `Monitor.Wait`/`Monitor.PulseAll`, so concurrent callers requesting the same channel name **serialise**:
+
+```csharp
+public void Acquire()
+{
+    lock (this)
+    {
+        while (IsInUse)
+        {
+            Monitor.Wait(this);
+        }
+
+        IsInUse = true;
+    }
+}
+```
+
+That is intentional — `IModel` is not thread-safe and the pool guarantees a single in-flight publish/declare per channel. If you need parallelism, use distinct `channelName` values.
+
+`Dispose()` waits up to `TotalDisposeWaitDuration` (10 seconds) across the whole pool, and logs a warning if disposal takes more than 5 seconds.
+
+### Usage pattern
+
+```csharp
+public class OrderPublisher : ITransientDependency
+{
+    private readonly IChannelPool _channelPool;
+    private readonly IRabbitMqSerializer _serializer;
+
+    public OrderPublisher(IChannelPool channelPool, IRabbitMqSerializer serializer)
+    {
+        _channelPool = channelPool;
+        _serializer = serializer;
+    }
+
+    public void Publish(OrderCreatedMessage message)
+    {
+        using (var channel = _channelPool.Acquire(channelName: "orders"))
+        {
+            channel.Channel.ExchangeDeclare(
+                exchange: "orders",
+                type: RabbitMqConsts.ExchangeTypes.Topic,
+                durable: true);
+
+            var properties = channel.Channel.CreateBasicProperties();
+            properties.DeliveryMode = RabbitMqConsts.DeliveryModes.Persistent;
+
+            channel.Channel.BasicPublish(
+                exchange: "orders",
+                routingKey: "orders.created",
+                basicProperties: properties,
+                body: _serializer.Serialize(message));
+        }
+    }
+}
+```
+
+Notes:
+
+- Never call `Dispose()` on `IChannelAccessor.Channel` — the accessor's own `Dispose()` only releases the lease. Disposing the underlying `IModel` corrupts the pool entry.
+- `Acquire(channelName, connectionName)` lets you target a non-default connection (e.g. `"Audit"` above).
+- Declaring the exchange every time is cheap; RabbitMQ ignores redeclarations as long as the parameters match.
+
+## Exchange and queue configuration objects
+
+`ExchangeDeclareConfiguration` and `QueueDeclareConfiguration` are immutable-ish DTOs used by the consumer to redeclare topology on every reconnect.
+
+```csharp
+public class ExchangeDeclareConfiguration
+{
+    public string ExchangeName { get; }
+    public string Type { get; }                    // use RabbitMqConsts.ExchangeTypes
+    public bool Durable { get; set; }
+    public bool AutoDelete { get; set; }
+    public IDictionary<string, object> Arguments { get; }
+}
+```
+
+```csharp
+public class QueueDeclareConfiguration
+{
+    [NotNull] public string QueueName { get; }
+    public bool Durable { get; set; }
+    public bool Exclusive { get; set; }
+    public bool AutoDelete { get; set; }
+    public ushort? PrefetchCount { get; set; }
+    public IDictionary<string, object> Arguments { get; }
+
+    public virtual QueueDeclareOk Declare(IModel channel) =>
+        channel.QueueDeclare(QueueName, Durable, Exclusive, AutoDelete, Arguments);
+}
+```
+
+`PrefetchCount` is applied via `BasicQos(0, prefetchCount, false)` inside the consumer; setting it caps the number of unacknowledged messages a single channel will hold.
+
+## Message consumer
+
+`RabbitMqMessageConsumer` is the high-level abstraction. It is registered as transient and produced through `IRabbitMqMessageConsumerFactory`:
+
+```csharp
+public class RabbitMqMessageConsumerFactory : IRabbitMqMessageConsumerFactory, ISingletonDependency, IDisposable
+{
+    protected IServiceScope ServiceScope { get; }
+
+    public RabbitMqMessageConsumerFactory(IServiceScopeFactory serviceScopeFactory)
+    {
+        ServiceScope = serviceScopeFactory.CreateScope();
+    }
+
+    public IRabbitMqMessageConsumer Create(
+        ExchangeDeclareConfiguration exchange,
+        QueueDeclareConfiguration queue,
+        string? connectionName = null)
+    {
+        var consumer = ServiceScope.ServiceProvider.GetRequiredService<RabbitMqMessageConsumer>();
+        consumer.Initialize(exchange, queue, connectionName);
+        return consumer;
+    }
+}
+```
+
+The factory holds a **single** `IServiceScope` for its lifetime. Every consumer it creates lives in that scope and is only disposed when the application shuts down — hence the doc-comment warning *"Avoid to create too many consumers since they are not disposed until end of the application."* Treat consumers as long-lived singletons keyed by `(exchange, queue)`.
+
+### Consumer lifecycle
+
+```csharp
+public void Initialize(
+    [NotNull] ExchangeDeclareConfiguration exchange,
+    [NotNull] QueueDeclareConfiguration queue,
+    string? connectionName = null)
+{
+    Exchange = Check.NotNull(exchange, nameof(exchange));
+    Queue = Check.NotNull(queue, nameof(queue));
+    ConnectionName = connectionName;
+    Timer.Start();
+}
+```
+
+`Initialize` only starts an `AbpAsyncTimer` (period 5 s, `RunOnStart = true`). The actual channel is created from the timer callback so transient broker outages do not kill the consumer:
+
+```csharp
+protected virtual async Task Timer_Elapsed(AbpAsyncTimer timer)
+{
+    if (Channel == null || Channel.IsOpen == false)
+    {
+        await TryCreateChannelAsync();
+        await TrySendQueueBindCommandsAsync();
+    }
+}
+```
+
+`TryCreateChannelAsync` declares the exchange and queue, applies `PrefetchCount`, registers an `AsyncEventingBasicConsumer` and subscribes with `autoAck: false`:
+
+```csharp
+Channel = ConnectionPool.Get(ConnectionName).CreateModel();
+
+Channel.ExchangeDeclare(Exchange.ExchangeName, Exchange.Type,
+    Exchange.Durable, Exchange.AutoDelete, Exchange.Arguments);
+
+Channel.QueueDeclare(Queue.QueueName, Queue.Durable,
+    Queue.Exclusive, Queue.AutoDelete, Queue.Arguments);
+
+if (Queue.PrefetchCount.HasValue)
+{
+    Channel.BasicQos(0, Queue.PrefetchCount.Value, false);
+}
+
+var consumer = new AsyncEventingBasicConsumer(Channel);
+consumer.Received += HandleIncomingMessageAsync;
+
+Channel.BasicConsume(queue: Queue.QueueName, autoAck: false, consumer: consumer);
+```
+
+### Binding routing keys
+
+`BindAsync` / `UnbindAsync` push commands onto a `ConcurrentQueue<QueueBindCommand>` and drain them under a lock, so binds issued before the channel exists are replayed once the timer creates one:
+
+```csharp
+public virtual async Task BindAsync(string routingKey)
+{
+    QueueBindCommands.Enqueue(new QueueBindCommand(QueueBindType.Bind, routingKey));
+    await TrySendQueueBindCommandsAsync();
+}
+```
+
+### Message handling
+
+```csharp
+protected virtual async Task HandleIncomingMessageAsync(object sender, BasicDeliverEventArgs basicDeliverEventArgs)
+{
+    try
+    {
+        foreach (var callback in Callbacks)
+        {
+            await callback(Channel!, basicDeliverEventArgs);
+        }
+
+        Channel?.BasicAck(basicDeliverEventArgs.DeliveryTag, multiple: false);
+    }
+    catch (Exception ex)
+    {
+        try
+        {
+            Channel?.BasicNack(basicDeliverEventArgs.DeliveryTag, multiple: false, requeue: true);
+        }
+        catch { }
+
+        Logger.LogException(ex);
+        await ExceptionNotifier.NotifyAsync(ex);
+    }
+}
+```
+
+Three behaviours that matter for production code:
+
+- **At-least-once semantics.** Messages are acked only after every callback returns successfully. A throwing callback triggers `BasicNack` with `requeue: true`, so the broker redelivers immediately. Implement idempotency or move poison messages to a DLX yourself.
+- **All callbacks share the message.** `OnMessageReceived` accumulates callbacks in a `ConcurrentBag`; every callback runs for every message.
+- **Exceptions are notified.** They flow through `IExceptionNotifier` in addition to logging.
+
+### Putting it together
+
+```csharp
+public class StockProjector : ISingletonDependency, IDisposable
+{
+    private readonly IRabbitMqMessageConsumer _consumer;
+    private readonly IRabbitMqSerializer _serializer;
+
+    public StockProjector(
+        IRabbitMqMessageConsumerFactory factory,
+        IRabbitMqSerializer serializer)
+    {
+        _serializer = serializer;
+        _consumer = factory.Create(
+            exchange: new ExchangeDeclareConfiguration(
+                "inventory", RabbitMqConsts.ExchangeTypes.Topic, durable: true),
+            queue: new QueueDeclareConfiguration(
+                "inventory.projector", durable: true, prefetchCount: 32));
+
+        _consumer.OnMessageReceived(HandleAsync);
+        AsyncHelper.RunSync(() => _consumer.BindAsync("stock.*"));
+    }
+
+    private Task HandleAsync(IModel channel, BasicDeliverEventArgs args)
+    {
+        var message = _serializer.Deserialize<StockChangedMessage>(args.Body.ToArray());
+        // ... project ...
+        return Task.CompletedTask;
+    }
+
+    public void Dispose() => (_consumer as IDisposable)?.Dispose();
+}
+```
+
+## Serializer
+
+`IRabbitMqSerializer` is the contract the framework uses to translate between `byte[]` payloads and CLR objects. The default implementation is `Utf8JsonRabbitMqSerializer`, which delegates to ABP's `IJsonSerializer`:
+
+```csharp
+public class Utf8JsonRabbitMqSerializer : IRabbitMqSerializer, ITransientDependency
+{
+    public byte[] Serialize(object obj)
+        => Encoding.UTF8.GetBytes(_jsonSerializer.Serialize(obj));
+
+    public object Deserialize(byte[] value, Type type)
+        => _jsonSerializer.Deserialize(type, Encoding.UTF8.GetString(value));
+
+    public T Deserialize<T>(byte[] value)
+        => _jsonSerializer.Deserialize<T>(Encoding.UTF8.GetString(value));
+}
+```
+
+Replace it by registering your own `IRabbitMqSerializer` (for example a MessagePack implementation) before `AbpRabbitMqModule` resolves the default.
+
+## Constants
+
+```csharp
+public static class RabbitMqConsts
+{
+    public static class DeliveryModes
+    {
+        public const int NonPersistent = 1;
+        public const int Persistent    = 2;
+    }
+
+    public static class ExchangeTypes
+    {
+        public const string Direct  = "direct";
+        public const string Topic   = "topic";
+        public const string Fanout  = "fanout";
+        public const string Headers = "headers";
+    }
+}
+```
+
+Use them when constructing `IBasicProperties` and `ExchangeDeclareConfiguration` so a typo never breaks a publish.
+
+## Gotchas
+
+- **`DispatchConsumersAsync` cannot be turned off.** The module forces it on for every connection. Custom consumers must use `AsyncEventingBasicConsumer`, not the synchronous variant.
+- **Channels are serialised per name.** Two threads requesting `Acquire("orders")` will execute back-to-back. Use distinct names for genuinely parallel publishers.
+- **Do not dispose the inner `IModel`.** Only the `IChannelAccessor` should be disposed. Disposing the model leaves the pool entry pointing at a closed channel.
+- **Consumers are scoped for the lifetime of the application.** `RabbitMqMessageConsumerFactory` keeps one `IServiceScope`. Create a consumer once per `(exchange, queue)` and keep the reference — do not call `Create` per message or per request.
+- **Queue and exchange parameters must match.** RabbitMQ will close the channel on a parameter mismatch (e.g. `durable: false` re-declared as `durable: true`). Use stable declarations.
+- **Cluster hostnames are split on `;`.** A single `HostName` containing `host-a;host-b` calls `CreateConnection(string[])` — there is no `Hosts` array property.
+- **`PrefetchCount` is per-consumer, not global.** It is applied with `BasicQos(0, value, false)`. Choose it relative to the worker concurrency of a single consumer.
+
+## See also
+
+- [Distributed Event Bus — RabbitMQ](/framework/eventbus/rabbitmq) — uses these pools to deliver integration events.
+- [Distributed Event Bus — Abstractions](/framework/eventbus/abstractions) — the layer above this transport.
+- [Inbox / Outbox](/framework/eventbus/inbox-outbox) — durability story that pairs naturally with RabbitMQ.

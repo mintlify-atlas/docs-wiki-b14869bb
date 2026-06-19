@@ -1,0 +1,130 @@
+---
+title: "BLOB Storing Database Entities"
+description: "Reference for DatabaseBlob and DatabaseBlobContainer in Volo.Abp.BlobStoring.Database.Domain."
+---
+
+The Database BLOB storing provider exposes ABP's standard `IBlobContainer` API on top of two persisted aggregates: `DatabaseBlobContainer` (one row per logical container) and `DatabaseBlob` (one row per stored blob). Together they let applications store small/medium binary data in the relational database without provisioning external storage.
+
+Source path: `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/`.
+
+## Overview
+
+```mermaid
+erDiagram
+    DatabaseBlobContainer ||--o{ DatabaseBlob : holds
+    DatabaseBlobContainer {
+        Guid Id PK
+        Guid? TenantId
+        string Name
+    }
+    DatabaseBlob {
+        Guid Id PK
+        Guid ContainerId FK
+        Guid? TenantId
+        string Name
+        byte[] Content
+    }
+```
+
+## `DatabaseBlobContainer`
+
+Base: `AggregateRoot<Guid>` + `IMultiTenant`. A logical bucket — one row per distinct container name in the host or tenant.
+
+```csharp
+public class DatabaseBlobContainer : AggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string Name { get; protected set; }
+
+    public DatabaseBlobContainer(Guid id, [NotNull] string name, Guid? tenantId = null) : base(id)
+    {
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name), DatabaseContainerConsts.MaxNameLength);
+        TenantId = tenantId;
+    }
+}
+```
+
+| Property   | Type     | Constraints                                                |
+| ---------- | -------- | ---------------------------------------------------------- |
+| `Id`       | `Guid`   | PK.                                                         |
+| `TenantId` | `Guid?`  | Multi-tenant filter; rows are partitioned per tenant.       |
+| `Name`     | `string` | `DatabaseContainerConsts.MaxNameLength` (default 64). Unique per tenant. |
+
+### Indexes
+
+- `UNIQUE (TenantId, Name)`
+
+## `DatabaseBlob`
+
+Base: `AggregateRoot<Guid>` + `IMultiTenant`. One row per stored blob.
+
+```csharp
+public class DatabaseBlob : AggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid ContainerId { get; protected set; }
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string Name { get; protected set; }
+    [DisableAuditing] public virtual byte[] Content { get; protected set; }
+
+    public DatabaseBlob(Guid id, Guid containerId, [NotNull] string name, [NotNull] byte[] content, Guid? tenantId = null)
+        : base(id)
+    {
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name), DatabaseBlobConsts.MaxNameLength);
+        ContainerId = containerId;
+        Content = CheckContentLength(content);
+        TenantId = tenantId;
+    }
+
+    public virtual void SetContent(byte[] content) => Content = CheckContentLength(content);
+
+    protected virtual byte[] CheckContentLength(byte[] content)
+    {
+        Check.NotNull(content, nameof(content));
+        if (content.Length >= DatabaseBlobConsts.MaxContentLength)
+            throw new AbpException($"Blob content size cannot be more than {DatabaseBlobConsts.MaxContentLength} Bytes.");
+        return content;
+    }
+}
+```
+
+| Property      | Type     | Constraints                                                  |
+| ------------- | -------- | ------------------------------------------------------------ |
+| `Id`          | `Guid`   | PK.                                                           |
+| `ContainerId` | `Guid`   | FK → `DatabaseBlobContainer.Id`. Indexed.                     |
+| `TenantId`    | `Guid?`  | Multi-tenant filter.                                          |
+| `Name`        | `string` | `DatabaseBlobConsts.MaxNameLength` (default 512). Unique per container. |
+| `Content`     | `byte[]` | `[DisableAuditing]` (never serialised into the audit log). Capped by `DatabaseBlobConsts.MaxContentLength` (default 64 MB). |
+
+### Indexes
+
+- `UNIQUE (ContainerId, Name)` per the EF Core configuration in `BlobStoringDatabaseDbContextModelCreatingExtensions`.
+
+### Why `[DisableAuditing]` on `Content`?
+
+The binary payload is excluded from the audit log to (a) avoid serialising potentially huge values into `AbpEntityPropertyChanges.NewValue` / `OriginalValue`, and (b) avoid leaking blob contents through the audit pipeline.
+
+## `DatabaseBlobProvider`
+
+`DatabaseBlobProvider` is the `IBlobProvider` implementation that bridges `IBlobContainer.SaveAsync(name, stream)` calls into rows on these two tables. Its responsibilities:
+
+| Operation                | Behaviour                                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------------------------- |
+| `SaveAsync`              | Ensures the `DatabaseBlobContainer` row exists, then inserts or replaces a `DatabaseBlob`.       |
+| `GetOrNullAsync`         | Streams `DatabaseBlob.Content` back to the caller.                                              |
+| `DeleteAsync`            | Hard-deletes the row (no soft-delete on `DatabaseBlob`).                                        |
+| `ExistsAsync`            | `bool` exists check via `IDatabaseBlobRepository`.                                              |
+
+The provider routes lookups through `IDatabaseBlobContainerRepository` and `IDatabaseBlobRepository`, which are the same DB-context-backed repos used by the migration tooling.
+
+## Tables
+
+| Entity                  | Table                                | Composite key      |
+| ----------------------- | ------------------------------------ | ------------------ |
+| `DatabaseBlobContainer` | `AbpBlobContainers`                  | `Id` (unique on `TenantId, Name`) |
+| `DatabaseBlob`          | `AbpBlobs`                           | `Id` (unique on `ContainerId, Name`) |
+
+## See also
+
+- [BLOB Storing Database module](/modules/blob-storing-database)
+- [`Volo.Abp.BlobStoring`](/framework/blob/volo-abp-blob-storing)
+- [Entity base types](/reference/models/entities-base-types)

@@ -1,0 +1,170 @@
+---
+title: "Virtual File Explorer Module Overview"
+sidebarTitle: "Overview"
+description: "Tour of the Volo.Abp.VirtualFileExplorer.Web Razor Pages module — an embedded admin tool that browses every file in ABP's virtual file system, including resources embedded inside referenced module assemblies."
+---
+
+The **Virtual File Explorer** is a tiny but invaluable ABP module that exposes ABP's `IVirtualFileProvider` as a navigable web UI. Once installed, an `~/VirtualFileExplorer` Razor Page lets administrators walk the merged virtual file tree — every embedded `.cshtml`, `.css`, `.js`, `.json` resource contributed by ABP modules, plus any physical files mapped through `AbpVirtualFileSystemOptions`. It is the practical companion to the [Virtual File System framework documentation](/framework/fundamentals/virtual-file-system) and a quick way to confirm that a module's resources actually shipped.
+
+Compared with the heavyweight admin modules (Identity, Tenant Management, etc.), Virtual File Explorer is shockingly small: it contains **one options class**, **one menu contributor**, **two Razor Pages** and **two bundle contributor extensions**. There is no application service, no DTO, no database. Everything is read directly from `IVirtualFileProvider` at request time.
+
+The whole module is shipped as a single NuGet package: `Volo.Abp.VirtualFileExplorer.Web`. There are no separate Domain, Application, HttpApi or Blazor layers because the explorer is intentionally bound to MVC/Razor Pages — its job is to render embedded `.cshtml` content with syntax highlighting, which is a server-rendered concern.
+
+## Package map
+
+| Package | Role |
+| --- | --- |
+| `Volo.Abp.VirtualFileExplorer.Web` | The entire feature: Razor Pages, menu, view models, options, Prismjs bundle extensions, localization. Depends on `AbpAspNetCoreMvcUiBootstrapModule` and `AbpAspNetCoreMvcUiThemeSharedModule`. |
+| `Volo.Abp.VirtualFileExplorer.Installer` | NuGet installer metadata used by the ABP CLI (`abp add-module Volo.Abp.VirtualFileExplorer`). No runtime code. |
+
+## What it actually does
+
+The module module's `ConfigureServices` registers three things behind a single feature flag (`AbpVirtualFileExplorerOptions.IsEnabled`, default `true`):
+
+1. A **main-menu item** under `StandardMenus.Main` pointing to `~/VirtualFileExplorer`.
+2. An **embedded `FileSet`** so the explorer's own pages, CSS, and JS are available even when the host app is reduced to its CLI-only state.
+3. **Prismjs bundle extensions** that add the toolbar and copy-to-clipboard plugins so file content viewed in the modal can be copied with one click.
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreMvcUiBootstrapModule))]
+[DependsOn(typeof(AbpAspNetCoreMvcUiThemeSharedModule))]
+public class AbpVirtualFileExplorerWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var virtualFileExplorerOptions =
+            context.Services.ExecutePreConfiguredActions<AbpVirtualFileExplorerOptions>();
+
+        if (virtualFileExplorerOptions.IsEnabled)
+        {
+            Configure<AbpNavigationOptions>(options =>
+            {
+                options.MenuContributors.Add(new VirtualFileExplorerMenuContributor());
+            });
+
+            Configure<AbpVirtualFileSystemOptions>(options =>
+            {
+                options.FileSets.AddEmbedded<AbpVirtualFileExplorerWebModule>(
+                    "Volo.Abp.VirtualFileExplorer.Web");
+            });
+
+            Configure<AbpLocalizationOptions>(options =>
+            {
+                options.Resources
+                    .Add<VirtualFileExplorerResource>("en")
+                    .AddBaseTypes(typeof(AbpValidationResource))
+                    .AddVirtualJson("/Localization/Resources");
+            });
+
+            Configure<AbpBundleContributorOptions>(options =>
+            {
+                options.Extensions<PrismjsStyleBundleContributor>()
+                       .Add<PrismjsStyleBundleContributorDocsExtension>();
+                options.Extensions<PrismjsScriptBundleContributor>()
+                       .Add<PrismjsScriptBundleContributorDocsExtension>();
+            });
+        }
+    }
+}
+```
+
+The whole module is feature-flagged: setting `IsEnabled = false` in a `PreConfigureServices` block — via `PreConfigure<AbpVirtualFileExplorerOptions>(o => o.IsEnabled = false)` — removes the menu item, the localisation resource, and the bundle extensions in one go. This is the recommended way to keep the explorer linked in non-Development hosts but hidden behind a build flag.
+
+## Why "virtual" matters
+
+ABP's `IVirtualFileProvider` is a composite over an ordered list of physical, embedded, and in-memory `IFileProvider` instances configured through `AbpVirtualFileSystemOptions.FileSets`. When you call `GetDirectoryContents("/Pages/VirtualFileExplorer")` the framework merges contributions from every loaded module, with later modules overriding earlier ones — this is exactly how ABP's *embedded view override* mechanism works. The explorer makes that merged view visible:
+
+- `EmbeddedResourceFileInfo` — files compiled into a module assembly as `<EmbeddedResource>`.
+- `VirtualDirectoryFileInfo` — synthesised directory nodes that aggregate embedded contributions.
+- `ManifestFileInfo` / `ManifestDirectoryInfo` — physical files projected through a manifest file provider (`Microsoft.Extensions.FileProviders.Embedded`).
+
+Only those four `IFileInfo` implementations are listed; the constant lives in `VirtualFileExplorerConsts.AllowFileInfoTypes`:
+
+```csharp
+public static class VirtualFileExplorerConsts
+{
+    public static readonly string[] AllowFileInfoTypes = new[]
+    {
+        "VirtualDirectoryFileInfo",
+        "EmbeddedResourceFileInfo",
+        "ManifestDirectoryInfo",
+        "ManifestFileInfo"
+    };
+}
+```
+
+That whitelist intentionally excludes raw `PhysicalFileInfo` and `NotFoundFileInfo`, so the tree shows the things that *only* ABP's virtual layering can produce — i.e. the things you cannot just inspect with Explorer/Finder. If you need to list physical wwwroot assets, use the operating system; if you need to see what `AddEmbedded<MyModule>()` actually contributed, this is the tool.
+
+## File inventory
+
+The runtime assembly is small. Here is everything under `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/`:
+
+| File | Role |
+| --- | --- |
+| `AbpVirtualFileExplorerWebModule.cs` | The `[DependsOn]` module with the conditional `ConfigureServices` shown above. |
+| `AbpVirtualFileExplorerOptions.cs` | Single `bool IsEnabled { get; set; } = true;` property. |
+| `VirtualFileExplorerConsts.cs` | The `AllowFileInfoTypes` whitelist. |
+| `Pages/VirtualFileExplorer/Index.cshtml(.cs)` | The directory listing page (see [web.mdx](/modules/virtual-file-explorer/web)). |
+| `Pages/VirtualFileExplorer/FileContentModal.cshtml(.cs)` | The "view content" modal that streams a file through `ReadAsStringAsync()` and wraps it in a Prismjs `<pre><code>` block. |
+| `Pages/VirtualFileExplorer/VirtualFileExplorerPageModel.cs` | Abstract `AbpPageModel` base that sets `LocalizationResourceType` and `ObjectMapperContext`. |
+| `Pages/VirtualFileExplorer/index.js` / `index.css` | Tiny client-side helpers — `abp.ModalManager` instantiation and a CSS rule to keep the modal scrollable. |
+| `Models/FileInfoViewModel.cs` | Row model: `FilePath`, `Icon`, `FileType`, `Length`, `FileName`, `LastUpdateTime`, `IsDirectory`. |
+| `Navigation/VirtualFileExplorerMenuContributor.cs` | Adds a single `ApplicationMenuItem` with the `fa fa-file` icon to `StandardMenus.Main`. |
+| `Navigation/VirtualFileExplorerMenuNames.cs` | Constants: `GroupName = "AbpVirualFileExplorer"`, `Index = GroupName + ".Index"`. |
+| `Bundling/PrismjsScriptBundleContributorDocsExtension.cs` | Adds `prism-toolbar.js` and `prism-copy-to-clipboard.js`. |
+| `Bundling/PrismjsStyleBundleContributorDocsExtension.cs` | Adds `prism-toolbar.css`. |
+| `Localization/VirtualFileExplorerResource.cs` | Marker type for the localisation resource. |
+| `Localization/Resources/*.json` | 27 locale files (`en.json`, `tr.json`, `zh-Hans.json`, etc.). |
+
+There is one minor naming gotcha in the source: `VirtualFileExplorerMenuNames.GroupName` is spelt `AbpVirualFileExplorer` (note the missing "t"). The constant is rarely consumed externally so it has never been corrected; if you reference it from a custom contributor, use the constant rather than retyping the string.
+
+## Installing the module
+
+```bash
+abp add-module Volo.Abp.VirtualFileExplorer -s yourapp.sln
+```
+
+The CLI adds a `<PackageReference Include="Volo.Abp.VirtualFileExplorer.Web">` to your `*.Web` project and inserts `typeof(AbpVirtualFileExplorerWebModule)` into the `[DependsOn]` attribute of the web module. Restart the host and navigate to `/VirtualFileExplorer` (or click the new menu item under your theme's main toolbar).
+
+To install only for `Development`, gate the `[DependsOn]` in the host module with an `#if DEBUG` directive or split the dependency into a separate `[DependsOn]` chain on a *debug-only* module class — the conditional `[DependsOn]` style avoids leaving production hosts with an unauthenticated information disclosure surface.
+
+## Security considerations
+
+The explorer is gated by **menu authorisation only**: the menu item appears for every authenticated user because `VirtualFileExplorerMenuContributor` adds the item without checking a permission or feature. The Razor Pages themselves inherit `AbpPageModel` and are decorated with no `[Authorize]` attribute beyond the host's default authorisation policy.
+
+In practice that means:
+
+- If the host uses the standard `app.UseAuthorization()` pipeline without a fallback policy, **the explorer is publicly accessible**.
+- If a fallback policy of `RequireAuthenticatedUser` is configured (the ABP startup template's default for tenant-aware apps), anonymous browsers are redirected to login but any signed-in tenant user can read every embedded `.cshtml` and `.js`.
+
+Recommended hardening:
+
+1. **Disable in non-Development environments.** Wrap the dependency on `AbpVirtualFileExplorerWebModule` with an environment check or use the `IsEnabled` option:
+   ```csharp
+   public override void PreConfigureServices(ServiceConfigurationContext context)
+   {
+       if (!context.Services.GetHostingEnvironment().IsDevelopment())
+       {
+           PreConfigure<AbpVirtualFileExplorerOptions>(o => o.IsEnabled = false);
+       }
+   }
+   ```
+2. **Add an authorisation policy** to the page route using `Configure<RazorPagesOptions>` to convention-restrict `/VirtualFileExplorer/*` to an admin permission.
+3. **Strip from the menu** for non-admins by writing a custom `IMenuContributor` that removes `VirtualFileExplorerMenuNames.Index` after the default contributor runs.
+
+## Cross-links
+
+- [Virtual File System (framework)](/framework/fundamentals/virtual-file-system) — the underlying `IVirtualFileProvider`, `FileSets`, and embedded resource compilation rules.
+- [Theme Shared (MVC/UI)](/framework/ui-mvc/mvc-ui-theme-shared) — the layout, bundle, and toolbar abstractions used by `VirtualFileExplorerPageModel`.
+- [Bundling & Minification](/framework/ui-mvc/bundling) — how the Prismjs extensions contribute toolbar/copy plugins into the global script bundle.
+- [Web pages reference](/modules/virtual-file-explorer/web) — page-by-page walkthrough of `Index.cshtml` and `FileContentModal.cshtml`.
+
+## Versioning notes
+
+The module has been part of ABP since v0.x and has remained intentionally stable. Breaking changes since 5.0 are limited to:
+
+- 6.0 — the menu item was moved from the *Administration* group into the root of `StandardMenus.Main` (the `VirtualFileExplorerMenuNames.GroupName` constant survives but the contributor no longer nests under an `Administration` parent).
+- 7.0 — switched the file modal layout to `Layout = null` so it renders correctly when invoked through `abp.ModalManager`.
+- 8.0 — adopted Bootstrap 5 dropdown attributes (`data-bs-toggle` instead of `data-toggle`); custom subclasses of `IndexModel` that re-emit raw HTML should update accordingly.
+
+For deeper page internals continue to the next section.

@@ -1,0 +1,392 @@
+---
+title: "Virtual File Explorer — Web (Razor Pages)"
+sidebarTitle: "Web"
+description: "Page-level walkthrough of Volo.Abp.VirtualFileExplorer.Web — Index.cshtml, FileContentModal.cshtml, bundle extensions, the menu contributor, and customisation points."
+---
+
+This page is the implementation reference for the `Volo.Abp.VirtualFileExplorer.Web` package. The [overview](/modules/virtual-file-explorer/overview) covered *what* the module ships; this page explains *how* the two Razor Pages render the embedded file tree, where the integration seams are, and the most common customisation patterns.
+
+## The page model base class
+
+Every page in the module derives from `VirtualFileExplorerPageModel`, an abstract `AbpPageModel` subclass that sets the localisation resource and the AutoMapper context for the whole feature.
+
+```csharp
+public abstract class VirtualFileExplorerPageModel : AbpPageModel
+{
+    protected VirtualFileExplorerPageModel()
+    {
+        LocalizationResourceType = typeof(VirtualFileExplorerResource);
+        ObjectMapperContext = typeof(AbpVirtualFileExplorerWebModule);
+    }
+}
+```
+
+Setting `LocalizationResourceType` once means every page can simply call `L["VirtualFileName"]` and the framework will resolve against `Volo.Abp.VirtualFileExplorer.Web.Localization.Resources.*.json`. The `ObjectMapperContext` is provided defensively — the explorer ships no AutoMapper profile but the property is required by the `AbpPageModel` contract.
+
+If you derive your own page (for example to add a permission check) make sure to inherit from this base, not from `AbpPageModel` directly, otherwise the localiser will fall back to the host's default resource and your strings will appear as keys.
+
+## `IndexModel` — the directory listing
+
+`Index.cshtml.cs` is the only page that reads from `IVirtualFileProvider`. It is bound to `~/VirtualFileExplorer` and accepts three query-string parameters:
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `Path` | `"/"` | Virtual path to list. Mapped from `?path=` (case-insensitive). |
+| `CurrentPage` | `1` | 1-based page index. |
+| `PageSize` | `10` | Rows per page. |
+
+The `OnGet` handler is short — it pulls the directory contents, filters to the allowed `IFileInfo` subtypes, sorts directories first, and slices the result into a `PagerModel`:
+
+```csharp
+public virtual IActionResult OnGet()
+{
+    var query = VirtualFileProvider.GetDirectoryContents(Path)
+        .Where(d => VirtualFileExplorerConsts.AllowFileInfoTypes.Contains(d.GetType().Name))
+        .OrderByDescending(f => f.IsDirectory)
+        .ToList();
+
+    PagerModel = new PagerModel(
+        query.Count, PageSize, CurrentPage, PageSize,
+        $"{Url.Content("~/")}VirtualFileExplorer?Path={Path}&PageSize={PageSize}");
+
+    SetViewModel(query.Skip((CurrentPage - 1) * PageSize).Take(PageSize));
+    SetPathNavigation();
+
+    return Page();
+}
+```
+
+Note that the filter is keyed on `GetType().Name` (a string) rather than `is` checks. That keeps the module decoupled from the concrete `IFileInfo` implementations in `Microsoft.Extensions.FileProviders.Embedded` and `Volo.Abp.VirtualFileSystem` — a future ABP release that introduces a new directory provider can opt-in by appending its type name to `VirtualFileExplorerConsts.AllowFileInfoTypes`.
+
+### Building the row view model
+
+`SetViewModel` projects each `IFileInfo` into a `FileInfoViewModel`. Directories are rendered with a `fas fa-folder` icon and the file name is wrapped in an anchor that drills into the path. Files get `fas fa-file` and the row's "Actions" dropdown reveals a "View content" link wired to the modal:
+
+```csharp
+foreach (var fileInfo in fileInfos)
+{
+    var vm = new FileInfoViewModel
+    {
+        IsDirectory = fileInfo.IsDirectory,
+        Icon       = "fas fa-file",
+        FileType   = "file",
+        Length     = fileInfo.Length + " bytes",
+        FileName   = fileInfo.Name,
+        LastUpdateTime = fileInfo.LastModified.LocalDateTime
+    };
+
+    var filePath = fileInfo.PhysicalPath ?? $"{Path.EnsureEndsWith('/')}{fileInfo.Name}";
+
+    if (fileInfo.IsDirectory)
+    {
+        vm.Icon = "fas fa-folder";
+        vm.FileType = "folder";
+        vm.Length = "/";
+        vm.FileName = $"<a href='{Url.Content("~/")}VirtualFileExplorer?path={filePath}'>{fileInfo.Name}</a>";
+    }
+    else if (fileInfo is EmbeddedResourceFileInfo erf)
+    {
+        vm.FilePath = erf.VirtualPath;
+    }
+    else
+    {
+        vm.FilePath = filePath;
+    }
+
+    FileInfoList.Add(vm);
+}
+```
+
+The interesting branch is the embedded one: `EmbeddedResourceFileInfo.VirtualPath` is the *virtual* path under the module root (e.g. `/Pages/Home/Index.cshtml`) rather than a physical file path. The modal needs that virtual path because it will re-resolve the file via `IVirtualFileProvider.GetFileInfo()`, which only understands virtual paths. For physical files projected through a manifest provider, the explorer falls back to combining `Path` and `fileInfo.Name`, which still resolves correctly.
+
+### Breadcrumb construction
+
+`SetPathNavigation` produces a Bootstrap `<nav><ol class='breadcrumb'>` HTML fragment by hand and stores it in the `PathNavigation` string. The page renders it with `@Html.Raw(Model.PathNavigation)` so the HTML must be trusted — which is fine because every fragment comes from the splitter `Path.Split('/')` and the localised "BackToRoot" string.
+
+```csharp
+private void SetPathNavigation()
+{
+    var sb = new StringBuilder();
+    var pathArray = Path.Split('/').Where(p => !p.IsNullOrWhiteSpace());
+    var href = $"{Url.Content("~/")}VirtualFileExplorer?path=";
+
+    sb.Append("<nav aria-label='breadcrumb'> <ol class='breadcrumb'>" +
+              $"<li class='breadcrumb-item'><a href='{href}/'>{L["BackToRoot"]}</a></li>");
+
+    foreach (var item in pathArray)
+    {
+        href += "/" + item;
+        sb.Append($"<li class='breadcrumb-item'><a href='{href}'>{item}</a></li>");
+    }
+
+    sb.Append("</ol></nav>");
+    PathNavigation = sb.ToString();
+}
+```
+
+A subtle but important consequence: because the page uses `@Html.Raw` for `FileName` *and* `PathNavigation`, any directory whose name contains HTML-sensitive characters would be emitted raw. In ABP modules embedded resource names cannot contain such characters (the C# resource name grammar forbids them), so this is safe — but if you add a custom `IFileProvider` that exposes user-supplied names, replace `@Html.Raw(item.FileName)` with `@Html.Encode(...)` in a custom `Index.cshtml`.
+
+## `Index.cshtml` — the view
+
+The view is a single `<abp-card>` containing the breadcrumb, an `<abp-table>` for rows, and an `<abp-paginator>`:
+
+```cshtml
+@page
+@model IndexModel
+@inject IPageLayout PageLayout
+@inject IHtmlLocalizer<VirtualFileExplorerResource> L
+@inject IHtmlLocalizer<AbpUiResource> UiLocalizer
+@{
+    PageLayout.Content.Title = L["VirtualFileExplorer"].Value;
+    PageLayout.Content.BreadCrumb.Add(L["Menu:VirtualFileExplorer"].Value);
+    PageLayout.Content.MenuItemName = VirtualFileExplorerMenuNames.Index;
+}
+
+@section styles {
+    <abp-style-bundle name="@typeof(IndexModel).FullName">
+        <abp-style src="/Pages/VirtualFileExplorer/index.css"/>
+    </abp-style-bundle>
+}
+
+@section scripts {
+    <abp-script-bundle name="@typeof(IndexModel).FullName">
+        <abp-script src="/Pages/VirtualFileExplorer/index.js"/>
+    </abp-script-bundle>
+}
+
+<abp-card id="VirtualFileExplorerWrapper">
+    <abp-card-body>
+        @Html.Raw(Model.PathNavigation)
+        <abp-table striped-rows="true" class="nowrap dataTable no-footer">
+            ...
+        </abp-table>
+        <abp-paginator model="Model.PagerModel" show-info="true"/>
+    </abp-card-body>
+</abp-card>
+```
+
+Visually the page renders a Bootstrap card on the application layout: a breadcrumb at the top showing the current virtual path with each segment hyperlinked back to its parent; a striped table with five columns (Actions, Name, Type, Last update, Size); a paginator footer with size selector. Directory rows show a folder icon, a `/` size, and no actions dropdown; file rows show a file icon, the byte length, and a primary-coloured "Actions" button that drops down to a "File content" link.
+
+The two `<abp-style-bundle>` / `<abp-script-bundle>` tags use `typeof(IndexModel).FullName` as the bundle name. Per the [Bundling system](/framework/ui-mvc/bundling), this name is used as a cache key — it is the same across requests so the bundle is built once and reused.
+
+## `FileContentModal` — the modal
+
+When the user clicks "File content" the JavaScript file `index.js` opens an ABP modal:
+
+```javascript
+var _fileContentModal = new abp.ModalManager(
+    abp.appPath + 'VirtualFileExplorer/FileContentModal'
+);
+
+function showContent(filePath) {
+    _fileContentModal.open({
+        filePath: filePath,
+    });
+}
+```
+
+`abp.ModalManager` issues a GET to `~/VirtualFileExplorer/FileContentModal?filePath=...` and injects the resulting HTML into a Bootstrap modal. The page handler is dead simple:
+
+```csharp
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    var fileInfo = VirtualFileProvider.GetFileInfo(FilePath);
+    if (fileInfo == null || fileInfo.IsDirectory)
+    {
+        return NotFound();
+    }
+
+    Content = await fileInfo.ReadAsStringAsync();
+    return Page();
+}
+```
+
+The view sets `Layout = null` so only the modal markup is rendered, and wraps the content in a Prismjs `<pre class="language-markup"><code class="language-markup">` block:
+
+```cshtml
+@page
+@model FileContentModal
+@{ Layout = null; }
+
+<abp-style-bundle name="@typeof(VirtualFileExplorerResource).FullName">
+    <abp-script type="@typeof(PrismjsStyleBundleContributor)" />
+</abp-style-bundle>
+
+<abp-script-bundle name="@typeof(VirtualFileExplorerResource).FullName">
+    <abp-script type="@typeof(PrismjsScriptBundleContributor)" />
+</abp-script-bundle>
+
+<abp-modal size="ExtraLarge">
+    <abp-modal-header title="@L["FileContent"].Value"></abp-modal-header>
+    <abp-modal-body>
+        <pre class="language-markup">
+            <code class="language-markup">
+@Model.Content.Trim()
+            </code>
+        </pre>
+    </abp-modal-body>
+    <abp-modal-footer buttons="@(AbpModalButtons.Close)"></abp-modal-footer>
+</abp-modal>
+```
+
+The modal uses the `ExtraLarge` size constant (a 90%-wide flush) and a single Close button. The CSS file scopes `.modal-dialog { overflow-y: initial }` and `.modal-body { max-height: 80vh; overflow-y: auto }` so long files scroll inside the modal rather than ballooning the page.
+
+### The Prismjs bundle extensions
+
+The module *does not* register the core Prismjs bundle — that contribution comes from `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared` via the standard `PrismjsStyleBundleContributor` and `PrismjsScriptBundleContributor`. What it does add are two **extensions** that splice in the toolbar plugin and the copy-to-clipboard button:
+
+```csharp
+public class PrismjsScriptBundleContributorDocsExtension : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.AddIfNotContains("/libs/prismjs/plugins/toolbar/prism-toolbar.js");
+        context.Files.AddIfNotContains("/libs/prismjs/plugins/copy-to-clipboard/prism-copy-to-clipboard.js");
+    }
+}
+
+public class PrismjsStyleBundleContributorDocsExtension : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.AddIfNotContains("/libs/prismjs/plugins/toolbar/prism-toolbar.css");
+    }
+}
+```
+
+`AddIfNotContains` matters: the same extensions are also wired by the Docs module, and a host that uses both should not end up with duplicate plugin scripts. If you write your own contributor that needs the toolbar plugin, prefer extending the core contributor in the same way rather than emitting raw `<abp-script>` tags in the page.
+
+## Menu integration
+
+The menu contributor unconditionally adds an item to `StandardMenus.Main`:
+
+```csharp
+public class VirtualFileExplorerMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.Main)
+        {
+            return Task.CompletedTask;
+        }
+
+        var l = context.GetLocalizer<VirtualFileExplorerResource>();
+
+        context.Menu.Items.Add(new ApplicationMenuItem(
+            VirtualFileExplorerMenuNames.Index,
+            l["Menu:VirtualFileExplorer"],
+            icon: "fa fa-file",
+            url: "~/VirtualFileExplorer"));
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+No permission name and no `RequiredPermissionName` argument — every menu rendering includes this item. If your app needs to hide it from non-admins, register another contributor *after* this one and remove the item by name:
+
+```csharp
+public class HideVirtualFileExplorerMenuContributor : IMenuContributor
+{
+    public Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name == StandardMenus.Main)
+        {
+            var item = context.Menu.GetMenuItemOrNull(VirtualFileExplorerMenuNames.Index);
+            if (item != null && !IsAdmin(context))
+            {
+                context.Menu.Items.Remove(item);
+            }
+        }
+        return Task.CompletedTask;
+    }
+}
+```
+
+ABP runs contributors in the order they are registered, so add this contributor *after* `AbpVirtualFileExplorerWebModule` has finished its `ConfigureServices` — typically by registering it inside your host module's `Configure<AbpNavigationOptions>(options => options.MenuContributors.Add(...))`.
+
+## Customisation patterns
+
+### Restricting paths
+
+Override `IndexModel.OnGet()` and prepend a guard:
+
+```csharp
+public class MyIndexModel : IndexModel
+{
+    private static readonly string[] AllowedRoots = { "/Pages", "/Themes", "/Localization" };
+
+    public MyIndexModel(IVirtualFileProvider vfp) : base(vfp) { }
+
+    public override IActionResult OnGet()
+    {
+        if (!AllowedRoots.Any(r => Path.StartsWith(r, StringComparison.OrdinalIgnoreCase)))
+        {
+            return Forbid();
+        }
+        return base.OnGet();
+    }
+}
+```
+
+Then replace the registration through `Configure<RazorPagesOptions>(o => o.Conventions.AddPageRoute(...))` or by overriding the `[Dependency(ReplaceServices = true)]` registration on a new page model — see the [page customization recipe](/framework/ui-mvc/customizing-mvc-views).
+
+### Filtering listed types
+
+If you ship a custom `IFileProvider` whose `IFileInfo` implementation has an unfamiliar type name, append it via a `PreConfigureServices` action:
+
+```csharp
+PreConfigureServices(ctx =>
+{
+    // No public extension point — fork the consts list yourself.
+    typeof(VirtualFileExplorerConsts)
+        .GetField(nameof(VirtualFileExplorerConsts.AllowFileInfoTypes))
+        ?.SetValue(null, new[] {
+            "VirtualDirectoryFileInfo",
+            "EmbeddedResourceFileInfo",
+            "ManifestDirectoryInfo",
+            "ManifestFileInfo",
+            "MyCustomFileInfo"
+        });
+});
+```
+
+This is unavoidably reflective because `AllowFileInfoTypes` is a public static field. A pull request to make it an `AbpVirtualFileExplorerOptions` property would be welcome upstream; until then the safer pattern is to subclass `IndexModel` and override the LINQ filter directly.
+
+### Adding syntax-highlighting languages
+
+Prismjs is bundled with the markup grammar only. Add additional grammars by extending the `PrismjsScriptBundleContributor` in your host module:
+
+```csharp
+Configure<AbpBundleContributorOptions>(options =>
+{
+    options.Extensions<PrismjsScriptBundleContributor>()
+           .Add<MyPrismLanguagesExtension>();
+});
+
+public class MyPrismLanguagesExtension : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.AddIfNotContains("/libs/prismjs/components/prism-csharp.min.js");
+        context.Files.AddIfNotContains("/libs/prismjs/components/prism-json.min.js");
+    }
+}
+```
+
+Then change `class="language-markup"` in a custom `FileContentModal.cshtml` to switch based on file extension. The modal markup is small enough that a full override is usually clearer than a partial customisation.
+
+## Gotchas
+
+- **Pager URL trailing path** — the `PagerModel` URL uses `?Path=...&PageSize=...`. If the user paginates and the path contains characters Bootstrap's pager URL-encodes inconsistently with the query-string binder, the back button can land on the wrong directory. Stick to standard virtual paths (`/`, `/A/B/`) and you will not hit this.
+- **`FileSize.Length` for directories** — `IFileInfo.Length` is `-1` for directories in `EmbeddedFileProvider`. The view model overwrites this with `"/"` so the table never shows `-1 bytes`, but a custom row template should preserve that fallback.
+- **Modal navigation away** — `abp.ModalManager` uses Bootstrap 5 dropdowns under the hood. If your host still includes a Bootstrap 4 polyfill the file modal will open under the navigation bar's z-index. The fix is to remove the polyfill, not to override the modal CSS.
+- **Embedded path case sensitivity** — `EmbeddedResourceFileInfo.VirtualPath` is normalised to forward slashes but preserves casing. Linux hosts are case-sensitive when reading from the manifest, so a `path=/Pages/Index.cshtml` lookup that worked on Windows can 404 on Linux.
+
+## See also
+
+- [Overview](/modules/virtual-file-explorer/overview) — package map and security context.
+- [Virtual File System](/framework/fundamentals/virtual-file-system) — `IVirtualFileProvider`, `FileSets`, embedded resource compilation.
+- [Bundling & Minification](/framework/ui-mvc/bundling) — how `<abp-script-bundle>` resolves contributors and extensions.
+- [Theme Shared](/framework/ui-mvc/mvc-ui-theme-shared) — `IPageLayout`, `<abp-card>`, `<abp-table>`, `<abp-paginator>` tag helpers.
+- [Customizing application modules: MVC](/framework/ui-mvc/customizing-mvc-views) — patterns for overriding embedded Razor Pages.

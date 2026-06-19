@@ -1,0 +1,265 @@
+---
+title: "CMS Kit shared HTTP endpoints"
+sidebarTitle: "CMS Kit shared endpoints"
+description: "Routes exposed by Volo.CmsKit.Common.HttpApi — the shared surface used by both the admin and the public UI: blog features and media downloads."
+---
+
+CMS Kit splits its HTTP surface into three packages:
+
+- `Volo.CmsKit.Common.HttpApi` — endpoints shared by the admin and the
+  public site (this page).
+- `Volo.CmsKit.Admin.HttpApi` — admin-only routes ([see admin
+  endpoints](/reference/api/cms-kit-admin-endpoints)).
+- `Volo.CmsKit.Public.HttpApi` — anonymous/customer-facing routes
+  ([see public endpoints](/reference/api/cms-kit-public-endpoints)).
+
+This page documents only the **common** controllers. They are scoped
+to the `cms-kit` area (`CmsKitCommonRemoteServiceConsts.ModuleName`).
+
+```text Volo.CmsKit.Common.HttpApi
+Volo/CmsKit/
+├── Blogs/BlogFeatureController.cs
+│       → /api/cms-kit/blogs/{blogId}/features
+└── MediaDescriptors/MediaDescriptorController.cs
+        → /api/cms-kit/media
+```
+
+## Route summary
+
+| Verb | Path | Body | Returns | Feature gate |
+| ---- | ---- | ---- | ------- | ------------ |
+| GET  | `/api/cms-kit/blogs/{blogId}/features/{featureName}` | — | `BlogFeatureDto` | `BlogsFeature` global feature |
+| GET  | `/api/cms-kit/media/{id}` | — | binary stream (`RemoteStreamContent`) | `MediaFeature` global feature |
+
+The endpoints are tenant-aware — the same blog id can resolve to a
+different feature toggle per tenant when CMS Kit is enabled inside a
+tenant scope.
+
+## BlogFeatureController
+
+```csharp modules/cms-kit/src/Volo.CmsKit.Common.HttpApi/Volo/CmsKit/Blogs/BlogFeatureController.cs
+[RequiresGlobalFeature(typeof(BlogsFeature))]
+[RemoteService(Name = CmsKitCommonRemoteServiceConsts.RemoteServiceName)]
+[Area(CmsKitCommonRemoteServiceConsts.ModuleName)]
+[Route("api/cms-kit/blogs/{blogId}/features")]
+public class BlogFeatureController : CmsKitControllerBase, IBlogFeatureAppService
+{
+    protected IBlogFeatureAppService BlogFeatureAppService { get; }
+
+    public BlogFeatureController(IBlogFeatureAppService blogFeatureAppService)
+        => BlogFeatureAppService = blogFeatureAppService;
+
+    [HttpGet]
+    [Route("{featureName}")]
+    public Task<BlogFeatureDto> GetOrDefaultAsync(Guid blogId, string featureName)
+        => BlogFeatureAppService.GetOrDefaultAsync(blogId, featureName);
+}
+```
+
+The single action returns the merged feature value for one blog. A blog
+feature is a per-blog toggle (reactions on/off, ratings on/off, etc.) —
+the corresponding admin-side write surface is at
+`/api/cms-kit-admin/blogs/{blogId}/features` (see
+[CMS Kit admin endpoints](/reference/api/cms-kit-admin-endpoints#blogfeatureadmincontroller)).
+
+### `GET /api/cms-kit/blogs/{blogId}/features/{featureName}`
+
+```http
+GET /api/cms-kit/blogs/3fa85f64-.../features/CmsKit.Blogs.Reactions HTTP/1.1
+```
+
+```json
+{
+  "name": "CmsKit.Blogs.Reactions",
+  "isEnabled": true
+}
+```
+
+`GetOrDefault` semantics: when the blog has no row for `featureName` the
+service returns the feature definition's default rather than `404`. The
+ABP front-end uses this to render the "react" button only when the toggle
+allows it.
+
+## MediaDescriptorController
+
+```csharp modules/cms-kit/src/Volo.CmsKit.Common.HttpApi/Volo/CmsKit/MediaDescriptors/MediaDescriptorController.cs
+[RequiresGlobalFeature(typeof(MediaFeature))]
+[RemoteService(Name = CmsKitCommonRemoteServiceConsts.RemoteServiceName)]
+[Area(CmsKitCommonRemoteServiceConsts.ModuleName)]
+[Route("api/cms-kit/media")]
+public class MediaDescriptorController : CmsKitControllerBase, IMediaDescriptorAppService
+{
+    protected readonly IMediaDescriptorAppService MediaDescriptorAppService;
+
+    public MediaDescriptorController(IMediaDescriptorAppService mediaDescriptorAppService)
+        => MediaDescriptorAppService = mediaDescriptorAppService;
+
+    [HttpGet]
+    [Route("{id}")]
+    public virtual Task<RemoteStreamContent> DownloadAsync(Guid id)
+        => MediaDescriptorAppService.DownloadAsync(id);
+}
+```
+
+### `GET /api/cms-kit/media/{id}`
+
+Streams the raw bytes of a media file (image, PDF, …). The response
+content-type is the value the uploader stored — `image/png`, `image/jpeg`,
+`application/pdf`, … — and the body is the file itself, **not** a JSON
+wrapper. The `RemoteStreamContent` return type tells ABP's MVC
+infrastructure to map the result to a `FileStreamResult` with the
+descriptor's stored MIME type.
+
+```http
+GET /api/cms-kit/media/8c7b4f10-... HTTP/1.1
+Accept: */*
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: image/png
+Content-Length: 14920
+Cache-Control: private
+
+<raw PNG bytes>
+```
+
+Media descriptors are created from the admin side — see
+[`POST /api/cms-kit-admin/media/{entityType}`](/reference/api/cms-kit-admin-endpoints#mediadescriptoradmincontroller).
+
+## Module / area setup
+
+```csharp modules/cms-kit/src/Volo.CmsKit.Common.HttpApi/Volo/CmsKit/AbpCmsKitCommonHttpApiModule.cs (sketch)
+[DependsOn(
+    typeof(CmsKitCommonApplicationContractsModule),
+    typeof(AbpAspNetCoreMvcModule)
+)]
+public class AbpCmsKitCommonHttpApiModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpCmsKitCommonHttpApiModule).Assembly);
+        });
+    }
+}
+```
+
+The `[Area(CmsKitCommonRemoteServiceConsts.ModuleName)]` attribute carried
+by both controllers is what tells `AbpServiceConvention` to register the
+routes under the `cms-kit` group and which set of conventional-controller
+options to honour. The actual constant resolves to the string `"cms-kit"`
+— it is the **shared** area name, distinct from `cms-kit-admin` and
+`cms-kit-public`.
+
+## DTO shapes
+
+```csharp modules/cms-kit/src/Volo.CmsKit.Common.Application.Contracts/Volo/CmsKit/Blogs/BlogFeatureDto.cs (sketch)
+public class BlogFeatureDto
+{
+    public string Name { get; set; }   // e.g. "CmsKit.Blogs.Reactions"
+    public bool IsEnabled { get; set; }
+}
+```
+
+```csharp modules/cms-kit/src/Volo.CmsKit.Common.Application.Contracts/Volo/CmsKit/MediaDescriptors/IMediaDescriptorAppService.cs (sketch)
+public interface IMediaDescriptorAppService : IApplicationService
+{
+    Task<RemoteStreamContent> DownloadAsync(Guid id);
+}
+```
+
+The `RemoteStreamContent` return type is the same abstraction used by
+the blob-storing module: the stream wraps the actual file plus its
+content type and recommended file name. MVC's content negotiation picks
+it up and writes the bytes directly.
+
+## Feature gates explained
+
+Both controllers carry **two** ABP feature attributes:
+
+- `[RequiresGlobalFeature]` — checked by `Volo.Abp.GlobalFeatures`. If
+  the global feature is disabled at startup the controller is removed
+  from the application model; the route returns `404`.
+- (Common controllers do **not** carry `[RequiresFeature]` — that
+  per-tenant gate lives on the admin/public counterparts where the user
+  triggers a UX flow.)
+
+The pair lets a host disable, say, blogs entirely (
+`GlobalFeatureManager.Instance.Modules.CmsKit().Blogs.Disable()` in the
+pre-configure step) without leaving dead routes behind.
+
+## Client-side usage
+
+The TypeScript API definition produced by ABP's static-proxy generator
+(`abp generate-proxy`) names these endpoints after their app-service
+interfaces:
+
+```ts
+// generated
+class BlogFeatureService {
+  apiName = 'CmsKitCommon';
+  getOrDefault(blogId: string, featureName: string) {
+    return this.restService.request<any, BlogFeatureDto>({
+      method: 'GET',
+      url: `/api/cms-kit/blogs/${blogId}/features/${featureName}`,
+    });
+  }
+}
+
+class MediaDescriptorService {
+  download(id: string) {
+    return this.restService.request<any, Blob>({
+      method: 'GET',
+      url: `/api/cms-kit/media/${id}`,
+      responseType: 'blob',
+    });
+  }
+}
+```
+
+The same shape is generated for C# via `abp generate-proxy -t csharp` —
+the framework guarantees URL parity between the dynamic proxy and the
+hand-written controllers documented on this page.
+
+## Multi-tenancy
+
+CMS Kit is multi-tenant by default. The blog identified by `{blogId}` is
+resolved within the current tenant scope, so the same `Guid` cannot match
+two tenants and a tenant cannot probe another tenant's media descriptors.
+Pass `__tenant` to switch context as a host admin:
+
+```http
+GET /api/cms-kit/blogs/3fa85f64-.../features/CmsKit.Blogs.Reactions HTTP/1.1
+__tenant: contoso
+```
+
+## Common error envelope
+
+A missing media id returns the standard `EntityNotFoundException`
+envelope:
+
+```json
+{
+  "error": {
+    "code": "Volo.Abp.Domain:Entities.EntityNotFound",
+    "message": "There is no entity MediaDescriptor with id 8c7b4f10-...",
+    "details": null
+  }
+}
+```
+
+A blog id whose feature is unknown returns the default — never `404` —
+because the service uses `GetOrDefault`.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="CMS Kit admin endpoints" icon="user-tie" href="/reference/api/cms-kit-admin-endpoints">
+    Pages, blogs, comments, tags and media management for editors.
+  </Card>
+  <Card title="CMS Kit public endpoints" icon="globe" href="/reference/api/cms-kit-public-endpoints">
+    Reader-facing pages, blogs, ratings and reactions.
+  </Card>
+</CardGroup>

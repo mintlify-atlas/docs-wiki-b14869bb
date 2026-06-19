@@ -1,0 +1,416 @@
+---
+title: "Kafka Transport"
+description: "Producer pool, consumer pool, message consumer loop and serializer in Volo.Abp.Kafka — the general-purpose Kafka integration that other ABP modules build on."
+---
+
+`Volo.Abp.Kafka` is the **transport-level** Kafka package. It wraps the `Confluent.Kafka` client in a pair of pooled abstractions (`IProducerPool`, `IConsumerPool`) and a long-lived consumer loop (`IKafkaMessageConsumer`), and exposes a single `AbpKafkaOptions` block for connection settings.
+
+It is deliberately decoupled from the event bus: the distributed event bus depends on this package, but you can use the pools and the consumer directly for any Kafka-based integration. The event-bus layer is documented in [Distributed Event Bus — Kafka](/framework/eventbus/kafka).
+
+## Package layout
+
+All types live under `Volo.Abp.Kafka`:
+
+| File | Type | Purpose |
+| --- | --- | --- |
+| `AbpKafkaModule.cs` | `AbpKafkaModule` | Binds the `Kafka` configuration section and disposes both pools at shutdown. |
+| `AbpKafkaOptions.cs` | `AbpKafkaOptions` | Connection registry plus `ConfigureProducer` / `ConfigureConsumer` / `ConfigureTopic` callbacks. |
+| `KafkaConnections.cs` | `KafkaConnections : Dictionary<string, ClientConfig>` | Named-connection registry over `Confluent.Kafka.ClientConfig`. |
+| `IProducerPool.cs` / `ProducerPool.cs` | Singleton pool of `IProducer<string, byte[]>` per connection name. |
+| `IConsumerPool.cs` / `ConsumerPool.cs` | Singleton pool of `IConsumer<string, byte[]>` per connection name. |
+| `IKafkaMessageConsumer.cs` / `KafkaMessageConsumer.cs` | Long-running consume loop with auto topic creation. |
+| `IKafkaMessageConsumerFactory.cs` / `KafkaMessageConsumerFactory.cs` | Singleton factory that resolves consumers through a private `IServiceScope`. |
+| `IKafkaSerializer.cs` / `Utf8JsonKafkaSerializer.cs` | UTF‑8 JSON serializer backed by `IJsonSerializer`. |
+
+## Module and configuration binding
+
+```csharp
+[DependsOn(
+    typeof(AbpJsonModule),
+    typeof(AbpThreadingModule)
+)]
+public class AbpKafkaModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpKafkaOptions>(configuration.GetSection("Kafka"));
+    }
+
+    public override void OnApplicationShutdown(ApplicationShutdownContext context)
+    {
+        context.ServiceProvider
+            .GetRequiredService<IConsumerPool>()
+            .Dispose();
+
+        context.ServiceProvider
+            .GetRequiredService<IProducerPool>()
+            .Dispose();
+    }
+}
+```
+
+The `"Kafka"` section in your configuration is bound to `AbpKafkaOptions`. Pools are disposed in reverse: consumers first (they call `Unsubscribe` + `Close` before disposing), then producers.
+
+## Options
+
+```csharp
+public class AbpKafkaOptions
+{
+    public KafkaConnections Connections { get; }
+
+    public Action<ProducerConfig>      ConfigureProducer { get; set; }
+    public Action<ConsumerConfig>      ConfigureConsumer { get; set; }
+    public Action<TopicSpecification>  ConfigureTopic    { get; set; }
+}
+```
+
+| Property | When invoked |
+| --- | --- |
+| `Connections` | Read on every `ProducerPool.Get` / `ConsumerPool.Get` to source bootstrap settings. |
+| `ConfigureProducer` | Invoked once per connection name, after the per-connection `ProducerConfig` is built. |
+| `ConfigureConsumer` | Invoked once per connection name, after the per-connection `ConsumerConfig` is built (and **after** ABP forces `EnableAutoCommit = false`). |
+| `ConfigureTopic` | Invoked inside `KafkaMessageConsumer.CreateTopicAsync` before `CreateTopicsAsync`, so you can override `NumPartitions`, `ReplicationFactor` or config entries. |
+
+`KafkaConnections` is `Dictionary<string, ClientConfig>` with a default key:
+
+```csharp
+[Serializable]
+public class KafkaConnections : Dictionary<string, ClientConfig>
+{
+    public const string DefaultConnectionName = "Default";
+
+    [NotNull]
+    public ClientConfig Default {
+        get => this[DefaultConnectionName];
+        set => this[DefaultConnectionName] = Check.NotNull(value, nameof(value));
+    }
+
+    public KafkaConnections() { Default = new ClientConfig(); }
+
+    public ClientConfig GetOrDefault(string connectionName) =>
+        TryGetValue(connectionName, out var c) ? c : Default;
+}
+```
+
+### Configuration example
+
+```json title="appsettings.json"
+{
+  "Kafka": {
+    "Connections": {
+      "Default": {
+        "BootstrapServers": "kafka-1:9092,kafka-2:9092,kafka-3:9092"
+      }
+    }
+  }
+}
+```
+
+Anything `ClientConfig` accepts (security protocol, SASL credentials, client.id, etc.) can be set in this section because `ClientConfig` is itself an `IDictionary<string, string>`.
+
+For everything else — partitioning strategy, acks, batch size — use the typed `ConfigureProducer` / `ConfigureConsumer` callbacks:
+
+```csharp
+Configure<AbpKafkaOptions>(options =>
+{
+    options.ConfigureProducer = p =>
+    {
+        p.Acks = Acks.All;
+        p.EnableIdempotence = true;
+    };
+
+    options.ConfigureConsumer = c =>
+    {
+        c.AutoOffsetReset = AutoOffsetReset.Earliest;
+        c.SessionTimeoutMs = 10000;
+    };
+
+    options.ConfigureTopic = t =>
+    {
+        t.NumPartitions     = 6;
+        t.ReplicationFactor = 3;
+    };
+});
+```
+
+## Producer pool
+
+```csharp
+public class ProducerPool : IProducerPool, ISingletonDependency
+{
+    public virtual IProducer<string, byte[]> Get(string connectionName = null)
+    {
+        connectionName ??= KafkaConnections.DefaultConnectionName;
+
+        return Producers.GetOrAdd(
+            connectionName, connection => new Lazy<IProducer<string, byte[]>>(() =>
+            {
+                var producerConfig = new ProducerConfig(
+                    Options.Connections.GetOrDefault(connection)
+                        .ToDictionary(k => k.Key, v => v.Value));
+
+                Options.ConfigureProducer?.Invoke(producerConfig);
+                return new ProducerBuilder<string, byte[]>(producerConfig).Build();
+            })).Value;
+    }
+}
+```
+
+Highlights:
+
+- **One producer per connection name.** Backed by a `ConcurrentDictionary<string, Lazy<IProducer<string, byte[]>>>`. Producers are thread-safe in `Confluent.Kafka`, so sharing one across the application is correct.
+- **Key/value types are fixed** at `<string, byte[]>`. You serialise yourself (typically with `IKafkaSerializer`).
+- **Lazy build, eager dispose.** The first `Get` triggers the build; `Dispose()` walks every producer and disposes it, with a 10 second total budget and a warning above 5 seconds (`TotalDisposeWaitDuration`).
+
+### Producing a message
+
+```csharp
+public class OrderProducer : ITransientDependency
+{
+    private readonly IProducerPool _producerPool;
+    private readonly IKafkaSerializer _serializer;
+
+    public OrderProducer(IProducerPool producerPool, IKafkaSerializer serializer)
+    {
+        _producerPool = producerPool;
+        _serializer = serializer;
+    }
+
+    public async Task PublishAsync(OrderCreated message)
+    {
+        var producer = _producerPool.Get();
+        await producer.ProduceAsync("orders", new Message<string, byte[]>
+        {
+            Key   = message.OrderId.ToString(),
+            Value = _serializer.Serialize(message)
+        });
+    }
+}
+```
+
+Do not dispose the producer you get back — the pool owns its lifecycle.
+
+## Consumer pool
+
+```csharp
+public virtual IConsumer<string, byte[]> Get(string groupId, string connectionName = null)
+{
+    connectionName ??= KafkaConnections.DefaultConnectionName;
+
+    return Consumers.GetOrAdd(
+        connectionName, connection => new Lazy<IConsumer<string, byte[]>>(() =>
+        {
+            var config = new ConsumerConfig(
+                Options.Connections.GetOrDefault(connection)
+                    .ToDictionary(k => k.Key, v => v.Value))
+            {
+                GroupId = groupId,
+                EnableAutoCommit = false
+            };
+
+            Options.ConfigureConsumer?.Invoke(config);
+            return new ConsumerBuilder<string, byte[]>(config).Build();
+        })
+    ).Value;
+}
+```
+
+Two design choices to be aware of:
+
+1. **The pool key is `connectionName`, not `groupId`.** The first call wins: the `GroupId` of the very first consumer requested for a connection becomes that connection's group, and subsequent calls reuse the same `IConsumer` regardless of the `groupId` argument. In practice you should keep one `(connectionName, groupId)` pair per application or use distinct named connections per consumer group.
+2. **Auto-commit is forced off.** This is set **before** `ConfigureConsumer` runs, so user callbacks can flip it back if they really want auto-commit — but the framework's own consumer loop relies on the default (it does not commit explicitly either; see below).
+
+Disposal calls `Unsubscribe()`, `Close()` then `Dispose()` per consumer.
+
+## Message consumer
+
+The high-level `IKafkaMessageConsumer` is produced through a factory that owns a private `IServiceScope`:
+
+```csharp
+public class KafkaMessageConsumerFactory : IKafkaMessageConsumerFactory, ISingletonDependency, IDisposable
+{
+    protected IServiceScope ServiceScope { get; }
+
+    public KafkaMessageConsumerFactory(IServiceScopeFactory serviceScopeFactory)
+    {
+        ServiceScope = serviceScopeFactory.CreateScope();
+    }
+
+    public IKafkaMessageConsumer Create(string topicName, string groupId, string connectionName = null)
+    {
+        var consumer = ServiceScope.ServiceProvider.GetRequiredService<KafkaMessageConsumer>();
+        consumer.Initialize(topicName, groupId, connectionName);
+        return consumer;
+    }
+}
+```
+
+The same warning as RabbitMQ applies: *"Avoid to create too many consumers since they are not disposed until end of the application."* Treat each consumer as a singleton keyed by `(topic, groupId)`.
+
+### Lifecycle
+
+`Initialize` simply starts the timer and stores parameters:
+
+```csharp
+public virtual void Initialize(
+    [NotNull] string topicName,
+    [NotNull] string groupId,
+    string connectionName = null)
+{
+    Check.NotNull(topicName, nameof(topicName));
+    Check.NotNull(groupId, nameof(groupId));
+    TopicName       = topicName;
+    ConnectionName  = connectionName ?? KafkaConnections.DefaultConnectionName;
+    GroupId         = groupId;
+    Timer.Start();
+}
+```
+
+The timer (`AbpAsyncTimer`, 5 second period, `RunOnStart = true`) drives the real work:
+
+```csharp
+protected virtual async Task Timer_Elapsed(AbpAsyncTimer timer)
+{
+    if (Consumer == null)
+    {
+        await CreateTopicAsync();
+        Consume();
+    }
+}
+```
+
+### Topic auto-creation
+
+```csharp
+protected virtual async Task CreateTopicAsync()
+{
+    using (var adminClient = new AdminClientBuilder(
+               Options.Connections.GetOrDefault(ConnectionName)).Build())
+    {
+        var topic = new TopicSpecification
+        {
+            Name = TopicName,
+            NumPartitions = 1,
+            ReplicationFactor = 1
+        };
+
+        Options.ConfigureTopic?.Invoke(topic);
+
+        try
+        {
+            await adminClient.CreateTopicsAsync(new[] { topic });
+        }
+        catch (CreateTopicsException e)
+        {
+            if (e.Results.Any(x => x.Error.Code != ErrorCode.TopicAlreadyExists))
+            {
+                throw;
+            }
+        }
+    }
+}
+```
+
+The defaults — **one partition and one replica** — are almost certainly wrong for production. Set `ConfigureTopic` to override them, or pre-create your topics with the right values and rely on `TopicAlreadyExists` being swallowed.
+
+### Consume loop
+
+```csharp
+protected virtual void Consume()
+{
+    Consumer = ConsumerPool.Get(GroupId, ConnectionName);
+
+    Task.Factory.StartNew(async () =>
+    {
+        Consumer.Subscribe(TopicName);
+
+        while (true)
+        {
+            try
+            {
+                var consumeResult = Consumer.Consume();
+
+                if (consumeResult.IsPartitionEOF)
+                {
+                    continue;
+                }
+
+                await HandleIncomingMessage(consumeResult);
+            }
+            catch (ConsumeException ex)
+            {
+                Logger.LogException(ex, LogLevel.Warning);
+                // ...
+            }
+        }
+    });
+}
+```
+
+`HandleIncomingMessage` invokes every callback registered via `OnMessageReceived` for each delivered message. There is no explicit `Commit` call — when `EnableAutoCommit` is left at the framework default of `false`, offsets are only persisted by the broker when the consumer group's session ends. If you need at-least-once semantics with progress, register a callback that calls `Consumer.StoreOffset(...)` / `Consumer.Commit(...)` after successful work, or flip `EnableAutoCommit = true` inside `ConfigureConsumer`.
+
+### Putting it together
+
+```csharp
+public class StockProjector : ISingletonDependency
+{
+    private readonly IKafkaMessageConsumer _consumer;
+    private readonly IKafkaSerializer _serializer;
+
+    public StockProjector(
+        IKafkaMessageConsumerFactory factory,
+        IKafkaSerializer serializer)
+    {
+        _serializer = serializer;
+        _consumer = factory.Create(
+            topicName: "stock-events",
+            groupId:   "stock-projector");
+
+        _consumer.OnMessageReceived(HandleAsync);
+    }
+
+    private Task HandleAsync(Message<string, byte[]> message)
+    {
+        var payload = _serializer.Deserialize<StockChanged>(message.Value);
+        // ... project ...
+        return Task.CompletedTask;
+    }
+}
+```
+
+## Serializer
+
+`IKafkaSerializer` mirrors the RabbitMQ contract. The default `Utf8JsonKafkaSerializer` is registered transiently:
+
+```csharp
+public class Utf8JsonKafkaSerializer : IKafkaSerializer, ITransientDependency
+{
+    public byte[] Serialize(object obj)
+        => Encoding.UTF8.GetBytes(_jsonSerializer.Serialize(obj));
+
+    public object Deserialize(byte[] value, Type type)
+        => _jsonSerializer.Deserialize(type, Encoding.UTF8.GetString(value));
+
+    public T Deserialize<T>(byte[] value)
+        => _jsonSerializer.Deserialize<T>(Encoding.UTF8.GetString(value));
+}
+```
+
+Replace it with your own implementation (Avro, Protobuf, Schema Registry-aware …) by registering an `IKafkaSerializer` before the module resolves the default.
+
+## Gotchas
+
+- **Default topic settings are 1/1.** `KafkaMessageConsumer` creates topics with `NumPartitions = 1`, `ReplicationFactor = 1`. Always provide `ConfigureTopic` or pre-create topics with Terraform/CLI.
+- **`EnableAutoCommit` is forced off.** Without a callback that calls `StoreOffset`/`Commit`, you may lose progress between restarts. Decide on a commit strategy explicitly.
+- **`ConsumerPool` keys by connection name.** Asking the pool for two different `groupId`s on the same connection returns the same `IConsumer` — and therefore the same group. Use named connections per group.
+- **`KafkaMessageConsumer.Consume()` runs forever on a thread-pool task.** It has no cancellation token; the framework relies on `IConsumerPool.Dispose()` (called at shutdown) to break the loop via `ConsumeException`. Do not call `Initialize` twice on the same instance.
+- **Topic auto-creation requires a broker that allows it.** Many managed services (e.g. MSK with `auto.create.topics.enable = false`) reject `CreateTopicsAsync`. Pre-create the topics, and the `TopicAlreadyExists` branch keeps startup quiet.
+- **Producers and consumers receive raw `byte[]`.** Use `IKafkaSerializer` consistently, or you will have to handle encoding on every call site.
+- **The factory keeps a single `IServiceScope`.** Long-lived consumers prevent any scoped service from being released until shutdown. Do not bind request-scoped state into a consumer.
+
+## See also
+
+- [Distributed Event Bus — Kafka](/framework/eventbus/kafka) — uses these pools to deliver integration events.
+- [Distributed Event Bus — Abstractions](/framework/eventbus/abstractions) — the layer above this transport.
+- [Inbox / Outbox](/framework/eventbus/inbox-outbox) — recommended companion for at-least-once Kafka workloads.

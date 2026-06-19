@@ -1,0 +1,395 @@
+---
+title: "@abp/ng.theme.shared"
+description: "Theme-agnostic UI primitives — modal, toast, confirmation, breadcrumb, loading, form input, plus the extensions sub-entry that powers @abp/ng.identity and @abp/ng.tenant-management."
+---
+
+`@abp/ng.theme.shared` is the visual scaffolding every ABP theme builds on. It is *theme-agnostic* in the sense that any theme can consume the same modal, toast, breadcrumb, loader and confirmation primitives without re-implementing them. It also contains the *Extensions* sub-entry — the contributor framework used by Identity and Tenant Management to render their extensible tables and forms.
+
+Two sub-entries are published:
+
+| Import | Purpose |
+| ------ | ------- |
+| `@abp/ng.theme.shared` | components, services, directives, animations |
+| `@abp/ng.theme.shared/extensions` | extensible table/form, contributor models, props enum |
+
+## File tree
+
+```text
+packages/theme-shared/
+├── package.json            # "@abp/ng.theme.shared" — version 7.4.0
+├── ng-package.json
+├── extensions/             # @abp/ng.theme.shared/extensions
+│   ├── ng-package.json
+│   └── src/
+│       ├── public-api.ts
+│       └── lib/
+│           ├── adapters/
+│           ├── components/
+│           │   ├── extensible-form/
+│           │   ├── extensible-table/
+│           │   ├── grid-actions/
+│           │   ├── page-toolbar/
+│           │   └── date-time-picker/
+│           ├── enums/
+│           ├── models/
+│           └── tokens/
+├── testing/                # public test utilities
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── theme-shared.module.ts
+        ├── animations/
+        ├── components/
+        │   ├── breadcrumb/
+        │   ├── breadcrumb-items/
+        │   ├── button/
+        │   ├── card/
+        │   ├── checkbox/
+        │   ├── confirmation/
+        │   ├── form-input/
+        │   ├── http-error-wrapper/
+        │   ├── internet-connection-status/
+        │   ├── loader-bar/
+        │   ├── loading/
+        │   ├── modal/
+        │   ├── password/
+        │   ├── toast/
+        │   └── toast-container/
+        ├── constants/      # DEFAULT_VALIDATION_BLUEPRINTS, DEFAULT_ERROR_MESSAGES
+        ├── directives/     # EllipsisDirective, LoadingDirective, NgxDatatableDefault…
+        ├── enums/
+        ├── handlers/       # DocumentDirHandler, ErrorHandler, status-code handlers
+        ├── models/
+        ├── providers/      # ERROR_HANDLERS_PROVIDERS, THEME_SHARED_ROUTE_PROVIDERS
+        ├── services/       # ConfirmationService, ToasterService, …
+        ├── tokens/
+        └── utils/
+```
+
+## `public-api.ts`
+
+```typescript
+// packages/theme-shared/src/public-api.ts
+export * from './lib/animations';
+export * from './lib/components';
+export * from './lib/constants/validation';
+export * from './lib/constants/default-errors';
+export * from './lib/directives';
+export * from './lib/enums';
+export * from './lib/handlers';
+export * from './lib/models';
+export * from './lib/providers';
+export * from './lib/services';
+export * from './lib/theme-shared.module';
+export * from './lib/tokens';
+export * from './lib/utils';
+```
+
+## ThemeSharedModule.forRoot
+
+`ThemeSharedModule` is the eager root module every consuming app imports once:
+
+```typescript
+// packages/theme-shared/src/lib/theme-shared.module.ts (excerpt)
+const declarationsWithExports = [
+  BreadcrumbComponent,
+  BreadcrumbItemsComponent,
+  ButtonComponent,
+  ConfirmationComponent,
+  LoaderBarComponent,
+  LoadingComponent,
+  ModalComponent,
+  ToastComponent,
+  ToastContainerComponent,
+  PasswordComponent,
+  NgxDatatableDefaultDirective,
+  NgxDatatableListDirective,
+  LoadingDirective,
+  ModalCloseDirective,
+  AbpVisibleDirective,
+  FormInputComponent,
+  FormCheckboxComponent,
+];
+
+@NgModule({
+  imports: [BaseThemeSharedModule],
+  exports: [BaseThemeSharedModule],
+})
+export class ThemeSharedModule {
+  static forRoot({ httpErrorConfig, validation = {}, confirmationIcons = {} } = {} as RootParams)
+    : ModuleWithProviders<ThemeSharedModule>
+  {
+    return {
+      ngModule: ThemeSharedModule,
+      providers: [
+        { provide: APP_INITIALIZER, multi: true, deps: [ErrorHandler],        useFactory: noop },
+        THEME_SHARED_ROUTE_PROVIDERS,
+        { provide: APP_INITIALIZER, multi: true, deps: [THEME_SHARED_APPEND_CONTENT], useFactory: noop },
+        { provide: HTTP_ERROR_CONFIG, useValue: httpErrorConfig },
+        { provide: NgbDateParserFormatter, useClass: DateParserFormatter },
+        NG_BOOTSTRAP_CONFIG_PROVIDERS,
+        { provide: VALIDATION_BLUEPRINTS, useValue: { ...DEFAULT_VALIDATION_BLUEPRINTS, ...(validation.blueprints || {}) } },
+        { provide: VALIDATION_MAP_ERRORS_FN, useValue: validation.mapErrorsFn || defaultMapErrorsFn },
+        { provide: VALIDATION_VALIDATE_ON_SUBMIT, useValue: validation.validateOnSubmit },
+        DocumentDirHandlerService,
+        { provide: APP_INITIALIZER, useFactory: noop, multi: true, deps: [DocumentDirHandlerService] },
+        /* …confirmation icons, tenant-not-found provider, ERROR_HANDLERS_PROVIDERS */
+      ],
+    };
+  }
+}
+```
+
+The factory installs:
+
+* `THEME_SHARED_ROUTE_PROVIDERS` — registers the *Profile management* / *Settings* menu routes used across themes.
+* `ErrorHandler` + a chain of status-code handlers (`RouterErrorHandler`, `TenantResolveErrorHandler`, `UnknownStatusCodeErrorHandler`, …) listening to `HttpErrorReporterService`.
+* `DocumentDirHandlerService` flipping `<html dir>` to `rtl` for Arabic/Hebrew locales.
+* `VALIDATION_*` providers wiring `@ngx-validate/core` defaults.
+* `NgbDateParserFormatter` so `ng-bootstrap` dates respect the active locale.
+
+## ModalComponent
+
+```typescript
+// packages/theme-shared/src/lib/components/modal/modal.component.ts (excerpt)
+export type ModalSize = 'sm' | 'md' | 'lg' | 'xl';
+
+@Component({
+  selector: 'abp-modal',
+  templateUrl: './modal.component.html',
+  styleUrls: ['./modal.component.scss'],
+  providers: [SubscriptionService],
+})
+export class ModalComponent implements OnInit, OnDestroy, DismissableModal {
+  @Input() get visible(): boolean { return this._visible; }
+  set visible(value: boolean) {
+    if (typeof value !== 'boolean') return;
+    this.toggle$.next(value);
+  }
+
+  @Input() get busy(): boolean { return this._busy; }
+  set busy(value: boolean) {
+    if (this.abpSubmit instanceof ButtonComponent) {
+      this.abpSubmit.loading = value;
+    }
+    this._busy = value;
+  }
+
+  @Input() options: NgbModalOptions = {};
+  @Input() suppressUnsavedChangesWarning = this.suppressUnsavedChangesWarningToken;
+
+  @ContentChild('abpHeader', { static: false }) abpHeader?: TemplateRef<any>;
+  /* + abpBody / abpFooter content children, dismiss handling */
+}
+```
+
+Usage:
+
+```html
+<abp-modal [(visible)]="isVisible" [busy]="modalBusy" [options]="{ size: 'lg' }">
+  <ng-template #abpHeader>{{ '::Edit' | abpLocalization }}</ng-template>
+  <ng-template #abpBody>
+    <form [formGroup]="form">…</form>
+  </ng-template>
+  <ng-template #abpFooter>
+    <abp-button #abpSubmit (click)="save()">Save</abp-button>
+  </ng-template>
+</abp-modal>
+```
+
+The component wraps `NgbModal` from `@ng-bootstrap/ng-bootstrap`. If the form is `dirty`, closing the modal triggers a confirmation modal asking the user to confirm losing unsaved changes — opt out via `SUPPRESS_UNSAVED_CHANGES_WARNING`.
+
+## BreadcrumbComponent
+
+```typescript
+// packages/theme-shared/src/lib/components/breadcrumb/breadcrumb.component.ts (excerpt)
+@Component({
+  selector: 'abp-breadcrumb',
+  templateUrl: './breadcrumb.component.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  providers: [SubscriptionService],
+})
+export class BreadcrumbComponent implements OnInit {
+  segments: Partial<ABP.Route>[] = [];
+
+  constructor(
+    public readonly cdRef: ChangeDetectorRef,
+    private router: Router,
+    private routes: RoutesService,
+    private subscription: SubscriptionService,
+    private routerEvents: RouterEvents,
+  ) {}
+
+  ngOnInit(): void {
+    this.subscription.addOne(
+      this.routerEvents.getNavigationEvents('End').pipe(
+        startWith(null),
+        map(() => this.routes.search({ path: getRoutePath(this.router) })),
+      ),
+      route => {
+        this.segments = [];
+        if (route) {
+          let node = { parent: route } as TreeNode<ABP.Route>;
+          /* walk up the parent chain to build segments */
+        }
+      },
+    );
+  }
+}
+```
+
+The breadcrumb is fully driven by `RoutesService` — there is no template-level configuration. Routes registered via `routesService.add([{ path, name, parentName }])` automatically produce the right trail.
+
+## Services
+
+| Service | Selector / role |
+| ------- | --------------- |
+| `ToasterService` | `success/info/warn/error(message, title?, options?)`, status observable |
+| `ConfirmationService` | promise-style `info/success/warn/error` returning `Observable<Confirmation.Status>` |
+| `RouterErrorHandler`, `StatusCodeErrorHandler`, `UnknownStatusCodeErrorHandler`, `TenantResolveErrorHandler`, `AbpFormatErrorHandler` | listeners on `HttpErrorReporterService` |
+| `NavItemsService`, `UserMenuService` | extensible registries used by theme layouts |
+| `PageAlertService` | per-page alerts rendered above content |
+| `ToasterService` and friends are `providedIn: 'root'` and projected through `ContentProjectionService` |
+
+Excerpt — `ConfirmationService.info`:
+
+```typescript
+// packages/theme-shared/src/lib/services/confirmation.service.ts (excerpt)
+@Injectable({ providedIn: 'root' })
+export class ConfirmationService {
+  status$!: Subject<Confirmation.Status>;
+  confirmation$ = new ReplaySubject<Confirmation.DialogData | null>(1);
+
+  private containerComponentRef!: ComponentRef<ConfirmationComponent>;
+
+  clear = (status: Confirmation.Status = Confirmation.Status.dismiss) => {
+    this.confirmation$.next(null);
+    this.status$.next(status);
+  };
+
+  constructor(private contentProjectionService: ContentProjectionService) {}
+
+  info(message: LocalizationParam, title: LocalizationParam, options?: Partial<Confirmation.Options>)
+    : Observable<Confirmation.Status>
+  {
+    return this.show(message, title, 'info', options);
+  }
+}
+```
+
+Typical usage:
+
+```typescript
+this.confirmation
+  .warn('::AreYouSureToDelete', '::AreYouSure')
+  .pipe(filter(status => status === Confirmation.Status.confirm))
+  .subscribe(() => this.delete());
+```
+
+## `@abp/ng.theme.shared/extensions`
+
+The sub-entry's public-api ships the entire contributor framework:
+
+```typescript
+// packages/theme-shared/extensions/src/public-api.ts (excerpt)
+export * from './lib/adapters/date-time.adapter';
+export * from './lib/adapters/date.adapter';
+export * from './lib/adapters/time.adapter';
+export * from './lib/components/date-time-picker/date-time-picker.component';
+export * from './lib/components/extensible-form/extensible-form-prop.component';
+export * from './lib/components/extensible-form/extensible-form.component';
+export * from './lib/components/extensible-table/extensible-table.component';
+export * from './lib/components/grid-actions/grid-actions.component';
+export * from './lib/components/page-toolbar/page-toolbar.component';
+export * from './lib/constants/extra-properties';
+export * from './lib/directives/disabled.directive';
+export * from './lib/directives/prop-data.directive';
+export * from './lib/enums/props.enum';      // ePropType
+export * from './lib/enums/components';
+export {
+  EntityAction,
+  EntityActionContributorCallback,
+  EntityActionList,
+  EntityActionOptions,
+  EntityActions,
+  EntityActionsFactory,
+} from './lib/models/entity-actions';
+/* …EntityProp, EntityPropList, FormProp, FormPropList, ToolbarAction, ActionList, generateFormFromProps, FormPropData */
+```
+
+Key building blocks:
+
+* `ePropType` — enum for `String | Boolean | Number | DateTime | Date | Time | Enum | Email | Password`.
+* `EntityProp<T>` — column definition for the extensible table.
+* `EntityAction<T>` — row button.
+* `ToolbarAction<T>` — top-right button.
+* `FormProp<T>` — control definition for `ExtensibleFormComponent`.
+* `generateFormFromProps(data)` — builds an `UntypedFormGroup` from a `FormPropData` instance, applying contributor lists registered against `EXTENSIONS_IDENTIFIER`.
+
+`<abp-extensible-table>` and `<abp-extensible-form>` consume these definitions and rely on `EXTENSIONS_IDENTIFIER` provided at component scope to look up the right contributor list (that's why `UsersComponent` provides it inline).
+
+## Form input components
+
+`FormInputComponent` and `FormCheckboxComponent` are wrappers around standard inputs that integrate with `@ngx-validate/core` to render localized validation errors automatically:
+
+```html
+<abp-form-input formControlName="userName" label="::UserName">
+</abp-form-input>
+
+<abp-form-checkbox formControlName="isActive" label="::IsActive">
+</abp-form-checkbox>
+```
+
+Errors look up the `VALIDATION_BLUEPRINTS` map (configurable via `ThemeSharedModule.forRoot({ validation })`) for the appropriate `::Resource:Key`.
+
+## Animations
+
+`animations/` exports `fadeIn/Out`, `slideFromBottom`, `expandCollapse` — used by the toast container and the loader bar.
+
+## Usage
+
+```typescript
+// app.module.ts
+@NgModule({
+  imports: [
+    ThemeSharedModule.forRoot({
+      httpErrorConfig: { errorScreen: { component: MyErrorComponent } },
+      validation: { validateOnSubmit: false },
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+```typescript
+// some component
+constructor(
+  private toaster: ToasterService,
+  private confirmation: ConfirmationService,
+) {}
+
+save() {
+  this.toaster.success('::SaveSuccessful');
+}
+
+remove() {
+  this.confirmation
+    .warn('::AreYouSureToDelete', '::AreYouSure')
+    .pipe(filter(s => s === Confirmation.Status.confirm))
+    .subscribe(() => this.deleteImpl());
+}
+```
+
+## Gotchas
+
+* `ThemeSharedModule.forRoot()` must be imported exactly once, in your root module. Importing it in lazy modules duplicates `ErrorHandler` and produces double-fired toasts.
+* `<abp-modal>` and `<abp-confirmation>` are instantiated through `ContentProjectionService` (which appends them to `document.body`). They will not honour any CSS scoped to a parent component.
+* Validation error keys default to `AbpUi::ThisFieldIsRequired`, etc. Replace the resource module's strings rather than the `VALIDATION_BLUEPRINTS` map unless you need to change the *key* shape.
+* `<abp-button #abpSubmit>` is the convention `ModalComponent.busy` looks for — naming the template ref differently breaks the loading-spinner integration.
+* `@abp/ng.theme.shared/extensions` is a separate npm sub-entry — importing `EntityProp` from `@abp/ng.theme.shared` will not work.
+
+## Related pages
+
+* `ng/theme-basic.mdx` — concrete layouts that consume modal, toast, etc.
+* `ng/identity.mdx` — heavy user of `<abp-extensible-table>` and contributor tokens.
+* `ng/core.mdx` — `HttpErrorReporterService` that feeds the error handlers wired here.

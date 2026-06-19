@@ -1,0 +1,278 @@
+---
+title: "Azure Blob Storage"
+description: "External-service reference for Azure Blob Storage — Volo.Abp.BlobStoring.Azure provider, account kinds, container naming, auth modes (connection string, SAS, Managed Identity), and operational guidance."
+---
+
+`Volo.Abp.BlobStoring.Azure` is an ABP `IBlobProvider` implementation that stores blobs in Azure Blob Storage containers. It builds on the official `Azure.Storage.Blobs` client. This reference focuses on the **Azure Storage account** side — what kind of account to provision, container naming, auth modes, and the configuration keys the provider reads.
+
+For the ABP-side BLOB abstractions (`IBlobContainer<T>`, multi-tenant naming, streams) see [Blob Storing — Azure](/framework/imaging-blob/blob-storing-azure) and the [overview](/framework/imaging-blob/blob-storing).
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.BlobStoring.Azure` | `AbpBlobStoringAzureModule` |
+
+The module is intentionally tiny:
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule))]
+public class AbpBlobStoringAzureModule : AbpModule { }
+```
+
+All work happens in `AzureBlobProvider` and is selected per blob container via:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseAzure(azure =>
+        {
+            azure.ConnectionString = "...";
+            azure.ContainerName = "mycontainer";
+            azure.CreateContainerIfNotExists = true;
+        });
+    });
+});
+```
+
+## Provider configuration keys
+
+`Volo.Abp.BlobStoring.Azure.AzureBlobProviderConfigurationNames`:
+
+```csharp
+public const string ConnectionString             = "Azure.ConnectionString";
+public const string ContainerName                = "Azure.ContainerName";
+public const string CreateContainerIfNotExists   = "Azure.CreateContainerIfNotExists";
+```
+
+These are the only three keys the provider reads. When you call `UseAzure(...)` on the container options the extension method writes them into the per-container `Configuration` dictionary.
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `Azure.ConnectionString` | string | required | Azure Storage connection string. |
+| `Azure.ContainerName` | string | container name from ABP | Optional override; falls back to the ABP blob container name normalised to lowercase. |
+| `Azure.CreateContainerIfNotExists` | bool | `false` | If `true`, `CreateIfNotExistsAsync` is called on first use. Requires `Microsoft.Storage/storageAccounts/blobServices/containers/write`. |
+
+## Storage account types
+
+| Kind | Use for blobs? | Notes |
+| --- | --- | --- |
+| **StorageV2 (general purpose v2)** | ✅ default choice | Tiering (Hot/Cool/Cold/Archive), lifecycle policies, soft delete, versioning. |
+| **BlockBlobStorage (Premium)** | ✅ for high-IOPS small blobs | Premium SSD-backed; flat per-GB cost. |
+| **BlobStorage (legacy)** | ✅ but use V2 instead | Predecessor of StorageV2. |
+| **StorageV1** | ❌ | No lifecycle, no archive — migrate. |
+| **FileStorage** | ❌ | Azure Files, not blobs. |
+| Azurite emulator | ✅ for dev/CI | Use `UseDevelopmentStorage=true` connection string. |
+
+For ABP workloads (user uploads, generated reports, media), StorageV2 with the **Hot** access tier is the default. Move cold buckets via lifecycle policies — the ABP provider stores objects as block blobs and is tier-agnostic.
+
+## Container naming
+
+Azure container names must match `^[a-z0-9-]{3,63}$` (lowercase letters, digits, hyphens; 3–63 chars). ABP's container name (e.g. `Reports`, `UserAvatars`) is normalised but you should still avoid uppercase and underscores in `ABP` blob container names. With multi-tenancy enabled the provider stores blobs as `<tenant-id>/<blob-name>` inside the single Azure container — it does not create per-tenant containers.
+
+If you need per-tenant containers (e.g. for separate KMS keys per tenant), implement a custom `IBlobContainerConfigurationProvider` that overrides `Azure.ContainerName` per tenant.
+
+## Sample `appsettings.json`
+
+ABP doesn't bind the provider config from JSON automatically — you wire it in your module. A common pattern is to expose the connection string in JSON and read it in code:
+
+```json
+{
+  "AzureBlobStorage": {
+    "ConnectionString": "DefaultEndpointsProtocol=https;AccountName=mystorage;AccountKey=...;EndpointSuffix=core.windows.net",
+    "ContainerName": "catalog-reports",
+    "CreateContainerIfNotExists": true
+  }
+}
+```
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.Configure<ReportContainer>(c =>
+    {
+        c.UseAzure(azure =>
+        {
+            azure.ConnectionString  = configuration["AzureBlobStorage:ConnectionString"];
+            azure.ContainerName     = configuration["AzureBlobStorage:ContainerName"];
+            azure.CreateContainerIfNotExists = bool.Parse(configuration["AzureBlobStorage:CreateContainerIfNotExists"] ?? "false");
+        });
+    });
+});
+```
+
+## Authentication modes
+
+The `Azure.ConnectionString` value drives auth. Supported forms:
+
+### Account-key
+
+```
+DefaultEndpointsProtocol=https;AccountName=mystorage;AccountKey=AAAA...==;EndpointSuffix=core.windows.net
+```
+
+Highest privilege. Rotate keys regularly (Storage Accounts → Access keys → Rotate). Store in Key Vault or as user secrets — never check in.
+
+### SAS token
+
+```
+BlobEndpoint=https://mystorage.blob.core.windows.net/;SharedAccessSignature=sv=2023-08-03&ss=b&srt=co&sp=rwdlacx&se=...&sig=...
+```
+
+Limit `sp` (permissions) and `se` (expiry). For ABP you typically need `r` (read), `w` (write), `d` (delete), and `c` (create). `l` and `a` enable listing and append blobs respectively.
+
+### Azure AD / Managed Identity
+
+`Azure.Storage.Blobs` accepts a connection string with `Authentication=Active Directory Managed Identity`:
+
+```
+BlobEndpoint=https://mystorage.blob.core.windows.net/;Authentication=Active Directory Managed Identity
+```
+
+Grant the identity the **Storage Blob Data Contributor** role on the account or container. This is the recommended production mode in Azure.
+
+If you need finer control (token cache, custom credential), subclass `AzureBlobProvider` and override `GetBlobServiceClient` to construct a `BlobServiceClient(uri, credential)`.
+
+## Connection-string limitations
+
+The Azure SDK won't parse all forms — beware of:
+
+- Newlines or stray whitespace in the connection string (very common when pasted from the portal).
+- Missing `EndpointSuffix` when using sovereign clouds (`core.usgovcloudapi.net`, `core.chinacloudapi.cn`).
+- `DefaultEndpointsProtocol=http` — rejected by managed accounts that enforce HTTPS-only.
+
+## Streaming, multi-part and limits
+
+| Limit | Value | Note |
+| --- | --- | --- |
+| Max block blob size | 5 000 MiB × 50 000 blocks ≈ 190.7 TiB | Practical for any ABP use. |
+| Single block size | 4000 MiB (4 GiB) | Used by `BlobClient.UploadAsync` automatically. |
+| Single request upload | 256 MiB | Above this the SDK switches to staged blocks. |
+| Throughput per storage account | up to 50 Gbps egress | Premium block blob doubles this. |
+| Request rate per blob | 500 req/s per blob, 20 000 IOPS per partition | Hot keys may throttle. |
+
+ABP's provider always streams (no in-memory buffering of the whole blob), so very large uploads are safe as long as the calling code passes a `Stream`.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `BlobAlreadyExists` on save | Default overwrite flag false. | The provider passes `overwrite: true` by default for `SaveAsync`; if you see this, you've called `SaveAsync(..., overwrite: false)` on an existing blob. |
+| `AuthenticationFailed: Server failed to authenticate the request` | Wrong account key, expired SAS, or AAD token without role assignment. | Verify key, regenerate SAS, check IAM role. |
+| `ContainerNotFound` | `CreateContainerIfNotExists=false` and container doesn't exist. | Either flip the flag or pre-create the container via IaC. |
+| `InvalidResourceName` | Container name has uppercase, underscores, or is < 3 chars. | Override `Azure.ContainerName` with a compliant slug. |
+| `ServerBusy` / 503 | Account-level throughput saturated. | Spread workload across containers; consider Premium block blob; add retries (SDK retries by default). |
+| Slow first request | DNS / TLS handshake. | Reuse the `BlobServiceClient`; ABP caches one per provider instance. |
+| `403 PublicAccessNotPermitted` | Reading from a private container without auth. | Add auth, or set container public access (rarely a good idea). |
+| Blob shows zero bytes | Upload Stream was already consumed. | Reset stream position to 0 before passing to `SaveAsync`. |
+
+## Observability hints
+
+- **Storage diagnostic settings.** Send `StorageRead`, `StorageWrite`, `StorageDelete` logs to Log Analytics or an event hub. Useful for audit and slow-request triage.
+- **Metrics.** Storage account → Metrics: `Transactions`, `Egress`, `Ingress`, `SuccessE2ELatency`, `SuccessServerLatency`, `Availability`. Alert on availability < 99.9% and 5xx error count.
+- **Throttling.** `Transactions` split by `ResponseType` shows `ServerBusyError` — increase your retry MaxDelay and consider spreading writes across containers.
+- **Lifecycle.** Set lifecycle rules to tier old reports to Cool/Cold/Archive automatically. ABP doesn't restore archived blobs — code must `RehydratePriority` first.
+- **Versioning + soft delete.** Both should be enabled in production. ABP overwrites blobs in place; without versioning a delete is unrecoverable. Soft delete (7–365 days) gives you a recycle bin.
+
+## Multi-tenant considerations
+
+When `IBlobContainer<T>` is resolved from a tenant scope:
+
+- Default key format is `<tenant-id-guid>/<blob-name>` within the shared container.
+- Switch to per-tenant containers by registering a custom `IAzureBlobNameCalculator`.
+- For per-tenant **storage accounts** (e.g. data residency), inject `ICurrentTenant` into a custom `IBlobContainerConfigurationProvider` and pick the connection string by tenant.
+
+## CORS for browser uploads
+
+If a SPA uploads directly to the container via SAS URLs, the account-level CORS rule has to allow it. Configure on the storage account:
+
+```
+Allowed Origins:  https://app.example.com
+Allowed Methods:  GET, PUT, HEAD
+Allowed Headers:  *
+Exposed Headers:  *
+Max Age:          3600
+```
+
+ABP doesn't apply CORS to Azure Blob — that's an Azure-side setting. If your app generates user-delegation SAS for direct upload, run `BlobServiceClient.SetPropertiesAsync` once with the CORS rule above, or set it via ARM template.
+
+## User Delegation SAS
+
+For Managed Identity setups, mint short-lived per-user SAS without sharing the account key:
+
+```csharp
+var userDelegationKey = await blobServiceClient.GetUserDelegationKeyAsync(
+    startsOn: DateTimeOffset.UtcNow,
+    expiresOn: DateTimeOffset.UtcNow.AddHours(1));
+
+var sasBuilder = new BlobSasBuilder(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(15))
+{
+    BlobContainerName = "catalog-reports",
+    BlobName = "monthly.pdf",
+    Resource = "b"
+};
+
+var sasToken = sasBuilder.ToSasQueryParameters(
+    userDelegationKey, blobServiceClient.AccountName).ToString();
+```
+
+The signing key (`userDelegationKey`) is itself granted by AAD — no account key is needed at any layer. Cache user delegation keys for up to 7 days but rotate frequently.
+
+## Lifecycle, tiering and rehydration
+
+Common policy for ABP-generated reports / receipts:
+
+```json
+{
+  "rules": [
+    {
+      "name": "report-retention",
+      "type": "Lifecycle",
+      "definition": {
+        "actions": {
+          "baseBlob": {
+            "tierToCool":   { "daysAfterModificationGreaterThan": 30 },
+            "tierToArchive":{ "daysAfterModificationGreaterThan": 180 },
+            "delete":       { "daysAfterModificationGreaterThan": 730 }
+          }
+        },
+        "filters": { "prefixMatch": [ "catalog-reports/" ] }
+      }
+    }
+  ]
+}
+```
+
+If the user requests an archived blob, the SDK throws `BlobArchivedException` — call `BlobClient.SetAccessTierAsync(AccessTier.Hot, rehydratePriority: RehydratePriority.Standard)` and surface a "Restoring, try in 1-15 hours" message. ABP doesn't automate rehydration.
+
+## Customer-managed keys (CMK)
+
+For sovereign workloads enable CMK at the storage-account level:
+
+1. Create a Key Vault key (RSA 3072+).
+2. Grant the storage account's managed identity `wrap`, `unwrap`, `get`.
+3. Configure the storage account to use the key.
+
+ABP code is unchanged. CMK adds ~5 ms per operation as the account unwraps the data encryption key on read.
+
+## Soft delete recovery
+
+If a blob is deleted (or overwritten with versioning + soft delete on), undelete via:
+
+```csharp
+await blobClient.UndeleteAsync();
+```
+
+ABP doesn't expose an undelete API — write a small admin endpoint for support staff. Combine with diagnostic logs so audits show who deleted what.
+
+## Multi-region resilience
+
+Geo-redundant storage (GRS / RA-GRS / GZRS) replicates asynchronously. Failover is account-level and may lose seconds of writes. For tight RPO, write to two accounts and read from the primary with fallback — Azure doesn't expose synchronous cross-region replication. ABP's provider talks to one account at a time; a wrapper provider can implement dual-write.
+
+## Related references
+
+- [Blob Storing](/framework/imaging-blob/blob-storing) — the abstraction and container model.
+- [Blob Storing — Azure](/framework/imaging-blob/blob-storing-azure) — provider internals.
+- [Imaging](/framework/imaging-blob/imaging) — pair blob storage with image resizing/compression.

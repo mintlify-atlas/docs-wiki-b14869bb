@@ -1,0 +1,256 @@
+---
+title: "Azure Service Bus"
+description: "External-service reference for Azure Service Bus — Volo.Abp.AzureServiceBus transport, namespace SKUs, connection-string vs. AAD auth, topics/subscriptions used by ABP, and message size limits."
+---
+
+`Volo.Abp.AzureServiceBus` is the transport layer behind ABP's Azure Service Bus integration. It owns the namespace connection, the publisher pool, the processor pool, and the consumer abstraction that the distributed event bus rides on. This reference focuses on the **Service Bus namespace** side — SKUs, authentication, topic/subscription layout, quotas and operational pitfalls.
+
+For ABP-side internals (publisher pool, processor pool, serializer) see [Azure Service Bus Transport](/framework/brokers/azure-servicebus). For event-bus semantics see [Distributed Event Bus — Azure](/framework/eventbus/azure).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.AzureServiceBus` | Connection / publisher / processor pools, `IAzureServiceBusMessageConsumer`. |
+| `Volo.Abp.EventBus.Azure` | Distributed event bus over Azure Service Bus topics + subscriptions. |
+
+Module:
+
+```csharp
+[DependsOn(typeof(AbpJsonModule), typeof(AbpThreadingModule))]
+public class AbpAzureServiceBusModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpAzureServiceBusOptions>(configuration.GetSection("Azure:ServiceBus"));
+    }
+}
+```
+
+Note the config section is `Azure:ServiceBus` (nested), not `AzureServiceBus`.
+
+## Options model
+
+```csharp
+public class AbpAzureServiceBusOptions
+{
+    public AzureServiceBusConnections Connections { get; }
+}
+
+public class AzureServiceBusConnections : Dictionary<string, ClientConfig>
+{
+    public const string DefaultConnectionName = "Default";
+    public ClientConfig Default { /* indexer over "Default" */ }
+}
+
+public class ClientConfig
+{
+    public string ConnectionString { get; set; } = default!;
+    public ServiceBusAdministrationClientOptions Admin { get; set; } = new();
+    public ServiceBusClientOptions Client { get; set; } = new();
+    public ServiceBusProcessorOptions Processor { get; set; } = new();
+}
+```
+
+Each named connection holds:
+
+- a Service Bus **connection string** (or you switch to AAD in code, see below),
+- `ServiceBusClientOptions` — transport type, retry policy, identifier,
+- `ServiceBusProcessorOptions` — concurrency, prefetch, auto-complete,
+- `ServiceBusAdministrationClientOptions` — used when ABP auto-creates topics/subscriptions.
+
+## Namespace SKU requirements
+
+| SKU | Use for ABP? | Notes |
+| --- | --- | --- |
+| **Basic** | ❌ | Queues only, no topics/subscriptions — ABP event bus needs topics. |
+| **Standard** | ✅ | Topics, subscriptions, 256 KB max message, sessions, duplicate detection. Default choice. |
+| **Premium** | ✅ recommended for production | Dedicated capacity (messaging units), 100 MB max message (with large-message support), VNet integration, geo-DR, JetStream-style throughput. |
+| **Premium with AMQP over WebSockets** | ✅ | Same as Premium; pick the transport via `Client.TransportType`. |
+
+If you need Service Bus to live inside a VNet (no public endpoint), you must use Premium. Standard supports IP firewall rules but not private endpoints with full feature parity.
+
+## Authentication
+
+### Connection-string auth (simplest)
+
+```json
+{
+  "Azure": {
+    "ServiceBus": {
+      "Connections": {
+        "Default": {
+          "ConnectionString": "Endpoint=sb://my-ns.servicebus.windows.net/;SharedAccessKeyName=catalog-service;SharedAccessKey=AAAA....=="
+        }
+      }
+    }
+  }
+}
+```
+
+Create a **Shared Access Policy** per service with `Send` + `Listen` (and optionally `Manage` if you want ABP to auto-create topics/subscriptions). Avoid the namespace-level `RootManageSharedAccessKey` in production.
+
+### Azure AD (Managed Identity / Workload Identity)
+
+In code, replace the connection string by passing a `TokenCredential` to the client. ABP's pools instantiate `ServiceBusClient` from the connection string in `ClientConfig`, so for AAD you need a custom factory. The standard pattern is:
+
+```csharp
+Configure<AbpAzureServiceBusOptions>(options =>
+{
+    options.Connections.Default.ConnectionString =
+        "Endpoint=sb://my-ns.servicebus.windows.net/;Authentication=Managed Identity";
+});
+```
+
+Service Bus connection strings accept `Authentication=Managed Identity` (or `Authentication=Active Directory Default`) instead of `SharedAccessKey`. The pool will then use the ambient `DefaultAzureCredential`. Make sure the identity holds `Azure Service Bus Data Sender` and `Azure Service Bus Data Receiver` (and `Azure Service Bus Data Owner` if you want it to create entities) on the namespace.
+
+## Sample `appsettings.json`
+
+```json
+{
+  "Azure": {
+    "ServiceBus": {
+      "Connections": {
+        "Default": {
+          "ConnectionString": "Endpoint=sb://my-ns.servicebus.windows.net/;SharedAccessKeyName=catalog-service;SharedAccessKey=...",
+          "Client": {
+            "TransportType": "AmqpWebSockets",
+            "RetryOptions": {
+              "Mode": "Exponential",
+              "MaxRetries": 5,
+              "Delay": "00:00:01",
+              "MaxDelay": "00:00:30"
+            },
+            "Identifier": "catalog-service"
+          },
+          "Processor": {
+            "MaxConcurrentCalls": 8,
+            "PrefetchCount": 16,
+            "AutoCompleteMessages": false,
+            "MaxAutoLockRenewalDuration": "00:05:00"
+          }
+        }
+      }
+    },
+    "ServiceBus:EventBus": {
+      "ConnectionName": "Default",
+      "TopicName": "Abp.Distributed.Events",
+      "SubscriberName": "catalog-service"
+    }
+  }
+}
+```
+
+The processor options drive throughput per process: `MaxConcurrentCalls=8` means up to eight handlers run in parallel; `PrefetchCount` should be `~2x` concurrency.
+
+## Topic and subscription layout
+
+ABP's Azure event-bus module creates (or expects) the following on first start:
+
+| Object | Default | Notes |
+| --- | --- | --- |
+| Topic | `Abp.Distributed.Events` (configurable) | One topic per app cluster. |
+| Subscription | `<SubscriberName>` (one per service) | Each service has its own subscription on the shared topic. |
+| Rule | default `1=1` SQL filter | ABP doesn't apply event-type filters; the consumer dispatches by `EventName` header. |
+
+If you want topic-level filtering (e.g. per microservice subscribe only to its event types), create subscription rules with SQL filters `EventName LIKE 'Catalog.%'` and disable the `$Default` rule.
+
+## Quotas and limits to plan for
+
+| Limit | Standard | Premium |
+| --- | --- | --- |
+| Max message size | 256 KB | 100 MB (with large-message support) |
+| Max topics/queues per namespace | 10 000 | 10 000 per messaging unit |
+| Max subscriptions per topic | 2 000 | 2 000 |
+| Max concurrent connections per namespace | 1 000 | 1 000 per messaging unit |
+| Max message TTL | 14 days | 14 days |
+
+If your events approach 256 KB on Standard, either move to Premium or split the payload. ABP's UTF-8 JSON serialization is verbose for large object graphs.
+
+## Network setup
+
+1. **Public endpoint** — easiest. Use IP firewall rules to limit access; combine with SAS keys per service.
+2. **Private endpoint** — Premium only. Create a private endpoint in your VNet; DNS resolves `my-ns.servicebus.windows.net` to the private IP. App nodes need outbound 5671 (AMQP) or 443 (AMQP-WS).
+3. **AMQP over WebSockets** (`TransportType=AmqpWebSockets`) tunnels through port 443. Use it when 5671 is blocked by corporate proxies.
+4. **Geo-DR.** Premium supports paired namespaces with manual failover. Use the alias endpoint in your connection string; ABP doesn't need to change.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `ServiceBusException: The messaging entity 'sb://.../topics/Abp.Distributed.Events' could not be found` | Topic doesn't exist and the SAS key lacks `Manage`. | Pre-create the topic via IaC, or grant `Manage` to the SAS policy. |
+| `Unauthorized: claim is empty` | Connection string for a different namespace or revoked SAS key. | Rotate key, verify `Endpoint=` in the string. |
+| Messages stuck in `Active` but consumer running | `MaxConcurrentCalls=1` and a long-running handler. | Increase concurrency or shrink handler. |
+| `MessageLockLostException` | Handler took longer than the message lock (default 30 s) and `MaxAutoLockRenewalDuration` wasn't set. | Increase lock renewal duration; ensure clock skew between pod and Azure < 1 min. |
+| `QuotaExceededException: Maximum entity size has been reached` | Subscription dead-letter queue filled. | Drain or purge DLQ; raise `MaxSizeInMegabytes` on the subscription. |
+| `MessageSizeExceededException: 524288 bytes > 262144` | Standard SKU 256 KB limit. | Compress payload, move to Premium, or split message. |
+| `OperationCanceledException` storms during deploy | `MaxConcurrentCalls` × `PrefetchCount` connections all reconnecting. | Stagger pod rollout; raise the retry MaxDelay. |
+| Duplicate events received | `AutoCompleteMessages=true` + handler exception. | Set `AutoCompleteMessages=false`; the processor pool completes on handler success and dead-letters on failure. |
+
+## Observability hints
+
+- **Azure Monitor metrics.** Namespace-level: `ActiveMessages`, `DeadletteredMessages`, `IncomingMessages`, `OutgoingMessages`, `ServerErrors`, `ThrottledRequests`, `Size`. Set alerts on `DeadletteredMessages > 0` and `ServerErrors > 5/min`.
+- **Diagnostic logs.** Enable `OperationalLogs` and `RuntimeAuditLogs`; send to Log Analytics. Useful for tracking who sent/received messages.
+- **Application Insights.** The `Azure.Messaging.ServiceBus` client emits `DiagnosticSource` events. Hook them with `Microsoft.ApplicationInsights` or OpenTelemetry's `Azure.Messaging.ServiceBus` instrumentation. Spans carry the topic name, message id, and `enqueuedTime`.
+- **Throttling.** `ThrottledRequests` > 0 on Standard means you've hit shared throughput limits — move to Premium messaging units.
+- **DLQ inspection.** `Service Bus Explorer` (Azure Portal) or `azservicebus` CLI to peek dead-lettered messages without consuming them.
+
+## Premium sizing
+
+- **Messaging units.** Premium is sold in 1 / 2 / 4 / 8 / 16 MUs. Roughly 1 MU ≈ 1 000 msg/sec at 1 KB. ABP event traffic is usually small per-message, so 1 MU covers many services until you cross ~100 k events/min.
+- **Partitions.** Premium topics can be partitioned (set at creation). ABP doesn't require partitioning, but it raises sustained throughput and dilutes hot subscribers.
+
+## Sessions and ordered delivery
+
+Service Bus sessions guarantee FIFO order per session id. ABP's processor pool can opt into sessions via `ServiceBusProcessorOptions.SessionIdleTimeout` (only on session-aware processors). If your events need per-aggregate ordering, set `MessageId` and `SessionId` both to the aggregate id and create the subscription with `RequiresSession=true`. Without sessions Service Bus reorders under retry.
+
+## Duplicate detection
+
+Enabling `Duplicate Detection` on the queue/subscription (Premium only, requires explicit `RequiresDuplicateDetection=true` at create time) dedupes by `MessageId` over a configurable window (1 min – 7 days). ABP sets `MessageId` to the event's unique id by default — combine with outbox to make event publishing safely idempotent across retries.
+
+## Subscription filters and rules
+
+A common pattern is to filter by event type at the broker so each subscriber only receives relevant traffic:
+
+```csharp
+var admin = new ServiceBusAdministrationClient(connectionString);
+await admin.CreateRuleAsync("Abp.Distributed.Events", "catalog-service",
+    new CreateRuleOptions("CatalogOnly",
+        new SqlRuleFilter("eventname LIKE 'Catalog.%'")));
+await admin.DeleteRuleAsync("Abp.Distributed.Events", "catalog-service", "$Default");
+```
+
+ABP doesn't apply rules by default; they save consumer CPU and dead-letter pollution.
+
+## Dead-letter queue handling
+
+Every queue/subscription has an implicit DLQ at `<entity>/$DeadLetterQueue`. Messages move there when:
+
+- `MaxDeliveryCount` (default 10) is exceeded.
+- TTL elapses while message is active.
+- A handler calls `DeadLetterMessageAsync(reason, description)`.
+
+ABP's processor calls dead-letter on terminal handler exceptions. Run a small DLQ-replay worker that periodically peeks the DLQ, logs metadata, and re-enqueues curated messages.
+
+## Geo-disaster recovery
+
+Premium supports paired primary + secondary namespaces. Configure an alias DNS that points at the primary; failover swaps it. ABP code uses the alias — no changes during failover. Note: failover doesn't replicate messages, only namespace metadata. Plan for a small delivery gap.
+
+## Private endpoints and DNS
+
+Private endpoints attach a private IP to the Service Bus namespace inside your VNet. DNS resolution is critical — without an Azure DNS Private Zone (`privatelink.servicebus.windows.net`) clients still resolve the public IP and bypass the endpoint. Use Azure Policy to enforce private DNS zones across subscriptions.
+
+## Forwarders
+
+Topics support **auto-forwarding** to another queue/topic — useful for fan-out across regions or for legacy bridges. Set on the subscription via the management client. ABP doesn't manage forwards; configure via IaC.
+
+## Throttling and reactive scaling
+
+`ThrottledRequests` on Standard is a soft hint to upgrade. Premium MUs scale 1 → 16, but scale takes effect within minutes. For predictable spikes (Black Friday), pre-scale. For organic growth, watch `Size` and `IncomingMessages` and alert at 80% MU utilisation.
+
+## Related references
+
+- [Azure Service Bus Transport](/framework/brokers/azure-servicebus) — pool internals, processor and publisher abstractions.
+- [Distributed Event Bus — Azure](/framework/eventbus/azure) — topic + per-service subscription layout.
+- [Inbox/Outbox](/framework/eventbus/inbox-outbox) — combine with Azure Service Bus for exactly-once semantics.

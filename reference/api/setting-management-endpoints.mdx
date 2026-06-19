@@ -1,0 +1,321 @@
+---
+title: "Setting management HTTP endpoints"
+sidebarTitle: "Setting management endpoints"
+description: "Routes exposed by Volo.Abp.SettingManagement.HttpApi: emailing settings (SMTP), the send-test-email probe, and the time-zone settings endpoints."
+---
+
+The setting-management module ships two MVC controllers:
+
+- `EmailSettingsController` — SMTP configuration and a test-email sender.
+- `TimeZoneSettingsController` — current time zone and the list of
+  supported zones.
+
+Both controllers carry `[Area(SettingManagementRemoteServiceConsts.ModuleName)]`
+(`"setting-management"`) and implement an
+`IApplicationService` interface. Authorization lives on the application
+service: `[Authorize(SettingManagementPermissions.Emailing)]` at class
+level, with `EmailingTest` overriding the test-email action.
+
+```text Volo.Abp.SettingManagement.HttpApi
+Volo/Abp/SettingManagement/
+├── AbpSettingManagementHttpApiModule.cs
+├── EmailSettingsController.cs    → /api/setting-management/emailing
+└── TimeZoneSettingsController.cs → /api/setting-management/timezone
+```
+
+The "settings system" the module hosts is exposed elsewhere — the
+`SettingDefinitionManager` and the `AbpApplicationConfigurationAppService`
+deliver the *values* to the client. These two controllers are only the
+admin write surface for SMTP and time zone.
+
+## Route summary
+
+### Email
+
+| Verb | Path | Body | Returns | Policy |
+| ---- | ---- | ---- | ------- | ------ |
+| GET  | `/api/setting-management/emailing` | — | `EmailSettingsDto` | `SettingManagement.Emailing` |
+| POST | `/api/setting-management/emailing` | `UpdateEmailSettingsDto` | `204` | `SettingManagement.Emailing` |
+| POST | `/api/setting-management/emailing/send-test-email` | `SendTestEmailInput` | `204` | `SettingManagement.Emailing.Test` |
+
+### Time zone
+
+| Verb | Path | Body | Returns | Policy |
+| ---- | ---- | ---- | ------- | ------ |
+| GET  | `/api/setting-management/timezone` | — | `string` (current zone id) | `SettingManagement.TimeZone` |
+| GET  | `/api/setting-management/timezone/timezones` | — | `List<NameValue>` | `SettingManagement.TimeZone` |
+| POST | `/api/setting-management/timezone?timezone=...` | — | `204` | `SettingManagement.TimeZone` |
+
+A `feature-management` rule —
+`AllowChangingEmailSettingsFeatureSimpleStateChecker` — additionally hides
+the email controller for tenants whose `SettingManagement.AllowChangingEmailSettings`
+feature is disabled. For host callers the feature has no effect.
+
+## EmailSettingsController
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi/Volo/Abp/SettingManagement/EmailSettingsController.cs
+[RemoteService(Name = SettingManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(SettingManagementRemoteServiceConsts.ModuleName)]
+[Route("api/setting-management/emailing")]
+public class EmailSettingsController : AbpControllerBase, IEmailSettingsAppService
+{
+    private readonly IEmailSettingsAppService _emailSettingsAppService;
+
+    public EmailSettingsController(IEmailSettingsAppService emailSettingsAppService)
+        => _emailSettingsAppService = emailSettingsAppService;
+
+    [HttpGet]
+    public Task<EmailSettingsDto> GetAsync() => _emailSettingsAppService.GetAsync();
+
+    [HttpPost]
+    public Task UpdateAsync(UpdateEmailSettingsDto input) => _emailSettingsAppService.UpdateAsync(input);
+
+    [HttpPost("send-test-email")]
+    public Task SendTestEmailAsync(SendTestEmailInput input) => _emailSettingsAppService.SendTestEmailAsync(input);
+}
+```
+
+Two notable conventions:
+
+- `UpdateAsync` is a `POST` (not `PUT`) — historical decision; the route
+  still treats it as a full replace.
+- The `[HttpPost("send-test-email")]` short-form combines the verb and
+  the route in one attribute.
+
+### `GET /api/setting-management/emailing`
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/Volo/Abp/SettingManagement/EmailSettingsDto.cs
+public class EmailSettingsDto
+{
+    public string SmtpHost { get; set; }
+    public int    SmtpPort { get; set; }
+    public string SmtpUserName { get; set; }
+    public string SmtpPassword { get; set; }
+    public string SmtpDomain { get; set; }
+    public bool   SmtpEnableSsl { get; set; }
+    public bool   SmtpUseDefaultCredentials { get; set; }
+    public string DefaultFromAddress { get; set; }
+    public string DefaultFromDisplayName { get; set; }
+}
+```
+
+`SmtpPassword` is returned as the stored value — it's never automatically
+masked by the controller. Protect the endpoint with TLS and the
+`Emailing` permission.
+
+```http
+GET /api/setting-management/emailing HTTP/1.1
+Authorization: Bearer ...
+```
+
+```json
+{
+  "smtpHost": "smtp.sendgrid.net",
+  "smtpPort": 587,
+  "smtpUserName": "apikey",
+  "smtpPassword": "SG.xxxxxxxx",
+  "smtpDomain": "",
+  "smtpEnableSsl": true,
+  "smtpUseDefaultCredentials": false,
+  "defaultFromAddress": "noreply@example.com",
+  "defaultFromDisplayName": "Example"
+}
+```
+
+### `POST /api/setting-management/emailing`
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/Volo/Abp/SettingManagement/UpdateEmailSettingsDto.cs
+public class UpdateEmailSettingsDto
+{
+    [MaxLength(256)] public string SmtpHost { get; set; }
+    [Range(1, 65535)] public int  SmtpPort { get; set; }
+    [MaxLength(1024)] public string SmtpUserName { get; set; }
+    [MaxLength(1024)] [DisableAuditing] public string SmtpPassword { get; set; }
+    [MaxLength(1024)] public string SmtpDomain { get; set; }
+    public bool SmtpEnableSsl { get; set; }
+    public bool SmtpUseDefaultCredentials { get; set; }
+    [MaxLength(1024)] [Required] public string DefaultFromAddress { get; set; }
+    [MaxLength(1024)] [Required] public string DefaultFromDisplayName { get; set; }
+}
+```
+
+```json
+{
+  "smtpHost": "smtp.sendgrid.net",
+  "smtpPort": 587,
+  "smtpUserName": "apikey",
+  "smtpPassword": "SG.new-key",
+  "smtpDomain": "",
+  "smtpEnableSsl": true,
+  "smtpUseDefaultCredentials": false,
+  "defaultFromAddress": "noreply@example.com",
+  "defaultFromDisplayName": "Example"
+}
+```
+
+The implementation writes each property as a setting through
+`ISettingManager`:
+
+| Setting key | Mapped property |
+| ----------- | --------------- |
+| `Abp.Mailing.DefaultFromAddress` | `DefaultFromAddress` |
+| `Abp.Mailing.DefaultFromDisplayName` | `DefaultFromDisplayName` |
+| `Abp.Mailing.Smtp.Host` | `SmtpHost` |
+| `Abp.Mailing.Smtp.Port` | `SmtpPort` |
+| `Abp.Mailing.Smtp.UserName` | `SmtpUserName` |
+| `Abp.Mailing.Smtp.Password` | `SmtpPassword` (encrypted at rest) |
+| `Abp.Mailing.Smtp.Domain` | `SmtpDomain` |
+| `Abp.Mailing.Smtp.EnableSsl` | `SmtpEnableSsl` |
+| `Abp.Mailing.Smtp.UseDefaultCredentials` | `SmtpUseDefaultCredentials` |
+
+When the call comes from a tenant context every set goes to
+`SettingValueProviders.Tenant`; from a host context to
+`SettingValueProviders.Global`.
+
+### `POST /api/setting-management/emailing/send-test-email`
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/Volo/Abp/SettingManagement/SendTestEmailInput.cs
+public class SendTestEmailInput
+{
+    [Required] public string SenderEmailAddress { get; set; }
+    [Required] public string TargetEmailAddress { get; set; }
+    [Required] public string Subject { get; set; }
+    public string Body { get; set; }
+}
+```
+
+```json
+{
+  "senderEmailAddress": "noreply@example.com",
+  "targetEmailAddress": "admin@example.com",
+  "subject": "Test from MyApp",
+  "body": "It works!"
+}
+```
+
+Requires the `SettingManagement.Emailing.Test` policy in addition to
+`SettingManagement.Emailing`. Uses the **currently saved** SMTP settings
+— it does **not** accept an inline config — so you must save changes
+first to test them.
+
+## TimeZoneSettingsController
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.HttpApi/Volo/Abp/SettingManagement/TimeZoneSettingsController.cs
+[RemoteService(Name = SettingManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(SettingManagementRemoteServiceConsts.ModuleName)]
+[Route("api/setting-management/timezone")]
+public class TimeZoneSettingsController : AbpControllerBase, ITimeZoneSettingsAppService
+{
+    [HttpGet]
+    public Task<string> GetAsync() => _timeZoneSettingsAppService.GetAsync();
+
+    [HttpGet]
+    [Route("timezones")]
+    public Task<List<NameValue>> GetTimezonesAsync() => _timeZoneSettingsAppService.GetTimezonesAsync();
+
+    [HttpPost]
+    public Task UpdateAsync(string timezone) => _timeZoneSettingsAppService.UpdateAsync(timezone);
+}
+```
+
+### `GET /api/setting-management/timezone`
+
+```http
+GET /api/setting-management/timezone HTTP/1.1
+```
+
+```json
+"Europe/London"
+```
+
+The string is the IANA zone id or a Windows-style id depending on the
+`IClockProvider` configured in the host (`Volo.Abp.Timing` resolves
+either via `Volo.Abp.Timing.TimeZoneInfo` / `TZConvert`).
+
+### `GET /api/setting-management/timezone/timezones`
+
+```json
+[
+  { "name": "Africa/Abidjan", "value": "Africa/Abidjan" },
+  { "name": "Africa/Accra",   "value": "Africa/Accra" },
+  { "name": "Europe/London",  "value": "Europe/London" },
+  { "name": "UTC",            "value": "UTC" }
+]
+```
+
+### `POST /api/setting-management/timezone`
+
+Like `UpdateDefaultConnectionStringAsync` on the tenant controller, the
+parameter is a primitive `string` so it is bound from the query string:
+
+```http
+POST /api/setting-management/timezone?timezone=Europe%2FLondon HTTP/1.1
+```
+
+```text
+204 No Content
+```
+
+## Permission definitions
+
+```csharp modules/setting-management/src/Volo.Abp.SettingManagement.Application.Contracts/Volo/Abp/SettingManagement/SettingManagementPermissions.cs
+public class SettingManagementPermissions
+{
+    public const string GroupName = "SettingManagement";
+
+    public const string Emailing     = GroupName + ".Emailing";
+    public const string EmailingTest = Emailing  + ".Test";
+
+    public const string TimeZone     = GroupName + ".TimeZone";
+}
+```
+
+`SettingManagement.TimeZone` is the only permission that controls a
+"setting category" today; if you add a new SMTP/storage/foo setting page,
+follow the same pattern — class-level `[Authorize(...)]` and an
+override for any destructive child operation.
+
+## Multi-tenancy
+
+These endpoints are tenant-aware. A host caller writes settings into the
+**global** value provider; a tenant caller writes them into the
+**tenant** value provider. Effective resolution order is
+`UserOverride → Tenant → Global → Default`.
+
+To edit a tenant's emailing settings from a host admin:
+
+```http
+POST /api/setting-management/emailing HTTP/1.1
+__tenant: contoso
+Authorization: Bearer <host-admin-token>
+Content-Type: application/json
+```
+
+The feature
+`SettingManagement.AllowChangingEmailSettings` (defined in
+`AllowChangingEmailSettingsFeatureSimpleStateChecker`) can be disabled
+for a tenant to remove the email page entirely from the tenant's view —
+the host still sees it.
+
+## Common error envelope
+
+```json
+{
+  "error": {
+    "code": "Volo.SettingManagement:Test",
+    "message": "Failed to send test email: 5.7.8 Authentication credentials invalid.",
+    "details": null
+  }
+}
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Feature management endpoints" icon="flag" href="/reference/api/feature-management-endpoints">
+    Toggle the `AllowChangingEmailSettings` tenant feature.
+  </Card>
+  <Card title="Dynamic controllers" icon="bolt" href="/reference/api/dynamic-controllers">
+    The convention used when an app service is exposed without a hand-written controller.
+  </Card>
+</CardGroup>

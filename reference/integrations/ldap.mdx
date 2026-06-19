@@ -1,0 +1,271 @@
+---
+title: "LDAP / Active Directory"
+description: "External-service reference for LDAP and Active Directory — Volo.Abp.Ldap module, ABP setting names, server configuration, bind formats, and TLS guidance."
+---
+
+`Volo.Abp.Ldap` lets ABP authenticate users against an LDAPv3 directory — typically Active Directory, but also OpenLDAP, FreeIPA, 389 Directory Server, Apache DS, and Samba 4. It uses the [LdapForNet](https://github.com/flamencist/ldap4net) library, which is a cross-platform LDAP client (it works on Linux containers without `System.DirectoryServices`).
+
+This page is the **directory-server side**: bind formats, ports, TLS, ABP's setting keys, and the failure modes you'll see in production. For the auth pipeline see [LDAP login](/framework/auth/ldap).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.Ldap.Abstractions` | `ILdapManager`, `ILdapSettingProvider`, setting names. |
+| `Volo.Abp.Ldap` | Default `LdapManager`, settings, setting definitions. |
+
+```csharp
+[DependsOn(typeof(AbpLdapAbstractionsModule), typeof(AbpSettingsModule))]
+public class AbpLdapModule : AbpModule { }
+```
+
+## Setting names
+
+`Volo.Abp.Ldap.LdapSettingNames`:
+
+```csharp
+public const string ServerHost  = "Abp.Ldap.ServerHost";
+public const string ServerPort  = "Abp.Ldap.ServerPort";
+public const string BaseDc      = "Abp.Ldap.BaseDc";
+public const string Domain      = "Abp.Ldap.Domain";
+public const string UserName    = "Abp.Ldap.UserName";
+public const string Password    = "Abp.Ldap.Password";
+```
+
+`LdapSettingDefinitionProvider` declares them with defaults:
+
+| Key | Default | Encrypted | Notes |
+| --- | --- | --- | --- |
+| `Abp.Ldap.ServerHost` | empty | no | LDAP server FQDN or IP. |
+| `Abp.Ldap.ServerPort` | `389` | no | 389 (LDAP), 636 (LDAPS). |
+| `Abp.Ldap.BaseDc` | empty | no | Base DN, e.g. `DC=example,DC=com`. |
+| `Abp.Ldap.Domain` | empty | no | NT domain for AD (`EXAMPLE`). |
+| `Abp.Ldap.UserName` | empty | no | Bind account UPN or DN (used by app, not user). |
+| `Abp.Ldap.Password` | empty | **yes** | Bind account password — ABP encrypts at rest. |
+
+Settings live in the standard ABP setting store (per-tenant or global). Manage via the settings UI; pre-seed in dev by setting them via `ISettingManager`.
+
+## What `LdapManager.AuthenticateAsync` actually does
+
+```csharp
+public virtual async Task<bool> AuthenticateAsync(string username, string password)
+{
+    using var conn = await CreateLdapConnectionAsync();
+    await AuthenticateLdapConnectionAsync(conn, username, password);
+    return true;
+}
+
+protected virtual async Task ConnectAsync(ILdapConnection ldapConnection)
+{
+    ldapConnection.Connect(
+        await LdapSettingProvider.GetServerHostAsync(),
+        await LdapSettingProvider.GetServerPortAsync());
+}
+
+protected virtual async Task AuthenticateLdapConnectionAsync(...)
+{
+    await connection.BindAsync(Native.LdapAuthType.Simple, new LdapCredential {
+        UserName = username,
+        Password = password
+    });
+}
+```
+
+So the default `LdapManager`:
+
+1. Connects to `Abp.Ldap.ServerHost:ServerPort` without TLS by default.
+2. Performs a **simple bind** with the supplied user credentials.
+3. Returns success if the bind doesn't throw.
+
+It does **not** by default:
+
+- Perform a separate "search-then-bind" with a service account.
+- Look up extra group memberships.
+- Validate account-locked / account-expired flags.
+
+Override `LdapManager` to add those steps — typically: bind as the service account (`UserName`/`Password` settings), search for the user DN by `sAMAccountName`/`mail`/`userPrincipalName`, then re-bind as the found DN with the user-supplied password.
+
+## Bind formats
+
+| Server | Bind value | Example |
+| --- | --- | --- |
+| AD — UPN | `username@domain.com` | `alice@example.com` |
+| AD — pre-Windows-2000 | `DOMAIN\\username` | `EXAMPLE\\alice` |
+| Any LDAP — DN | full distinguished name | `CN=Alice,OU=Users,DC=example,DC=com` |
+| OpenLDAP | DN | `uid=alice,ou=People,dc=example,dc=com` |
+
+For Active Directory, **UPN is easiest**: users type their email-style name and AD resolves the underlying account. With pure LDAP you typically need search-then-bind.
+
+## Sample setting seed
+
+```csharp
+// In your data seeder:
+await SettingManager.SetGlobalAsync(LdapSettingNames.ServerHost, "ldap.example.com");
+await SettingManager.SetGlobalAsync(LdapSettingNames.ServerPort, "636");
+await SettingManager.SetGlobalAsync(LdapSettingNames.BaseDc,     "DC=example,DC=com");
+await SettingManager.SetGlobalAsync(LdapSettingNames.Domain,     "EXAMPLE");
+await SettingManager.SetGlobalAsync(LdapSettingNames.UserName,   "svc-abp@example.com");
+await SettingManager.SetGlobalAsync(LdapSettingNames.Password,   "Sup3rS3cret!");
+```
+
+## TLS — strongly recommended
+
+By default `LdapForNet` connects in cleartext on 389 — passwords go on the wire in the bind. Always use one of:
+
+- **LDAPS** on port 636 (TLS from the start). Subclass `LdapManager.ConfigureLdapConnectionAsync` to call `ldapConnection.SetClientCertificate` / `TrustAllCertificates` flags or call `ldapConnection.StartTransportLayerSecurity()` post-connect.
+- **STARTTLS** on port 389: connect plaintext, then upgrade with `ldap_start_tls_s`.
+
+Example override for LDAPS:
+
+```csharp
+public class TlsLdapManager : LdapManager
+{
+    protected override async Task ConnectAsync(ILdapConnection ldapConnection)
+    {
+        var host = await LdapSettingProvider.GetServerHostAsync();
+        var port = await LdapSettingProvider.GetServerPortAsync();
+        ldapConnection.Connect(host, port, LdapSchema.LDAPS);
+    }
+}
+```
+
+Mount the directory's CA cert (or root) into the container's trust store (`/etc/ssl/certs`) so certificate validation works.
+
+## Server / directory requirements
+
+| Directory | Compatible | Notes |
+| --- | --- | --- |
+| Active Directory (Win Server 2012R2+) | ✅ | Simple bind by default; consider Kerberos for AD-native security. |
+| AD LDS | ✅ | |
+| OpenLDAP (2.4 / 2.5 / 2.6) | ✅ | |
+| 389 Directory Server / Red Hat IdM / FreeIPA | ✅ | |
+| Samba 4 | ✅ | |
+| Azure AD Domain Services | ✅ | Hosted AD; LDAPS only over a secure connection. |
+| Azure AD (Entra ID) directly | ❌ | No LDAP surface; use OIDC. |
+
+ABP supports unencrypted simple bind, so any LDAPv3 server works.
+
+## Multi-tenant strategies
+
+`Volo.Abp.Ldap` reads its settings via `ISettingProvider`, which is tenant-aware. So:
+
+- Set `Abp.Ldap.ServerHost`, etc. per-tenant via `ISettingManager.SetForTenantAsync`.
+- Each tenant can authenticate against a different AD / LDAP.
+- Tenants that don't configure LDAP fall back to global settings (or no LDAP at all).
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `LdapException: Can't contact LDAP server` | Wrong host/port, firewall blocks 389/636. | Test with `ldapsearch -H ldap://host:389 -x`; open egress. |
+| `LdapException: Invalid credentials` | Wrong bind value or password. | For AD use UPN; for OpenLDAP use full DN. |
+| `Strong(er) authentication required` (AD) | Domain controller enforces signing / channel binding. | Switch to LDAPS or implement SASL/GSSAPI bind. |
+| `Server is unwilling to perform` | AD policy denies anonymous bind, or password expired. | Provide credentials; reset password. |
+| `LdapForNet.LdapException: Operations error` | DN refers to a missing object. | Verify base DN and that the search returns the user. |
+| Authentication works locally, fails in container | Container can't resolve domain controller DNS, or NTLM/Kerberos unavailable. | Use FQDN, not NetBIOS; rely on simple bind. |
+| TLS handshake fails | CA not trusted in container. | Add CA bundle to `/etc/ssl/certs`. |
+| Password leaks in logs | Default exception logger included credential. | Subclass `LdapManager`; do not log the password parameter. |
+
+## Observability hints
+
+- **Bind-attempt metrics.** Subclass `LdapManager` and emit a counter (`ldap_bind_attempt_total{result=success|fail}`).
+- **Latency.** Wrap `BindAsync` in `Activity`; spikes correlate with DC promotion or network issues.
+- **Account lockouts.** Mirror the directory's lockout policy — track repeated `Invalid credentials` per username and back off before lockout.
+- **Server-side.** AD's "Account Management" event log records failed binds with caller IP. OpenLDAP has `cn=monitor` for op stats; export via Prometheus.
+
+## Hardening checklist
+
+- Use LDAPS (636) or STARTTLS (389→TLS upgrade). Never simple bind over 389 in production.
+- Run the bind account with least privilege — read access to user OUs only.
+- Rotate the bind account password and re-set the `Abp.Ldap.Password` setting (it's encrypted at rest in the setting store).
+- Pin DCs by hostname; for HA point at the AD site name so DNS resolves to a healthy DC.
+- Consider Kerberos (SSPI/GSSAPI) for AD-internal apps — avoids passing user passwords at all.
+
+## Search-then-bind override
+
+For LDAP servers where users don't have UPN-style logins, you must:
+
+1. Bind as a service account.
+2. Search for the user DN by attribute (`sAMAccountName`, `uid`, `mail`).
+3. Re-bind with the user-supplied password.
+
+```csharp
+public class SearchThenBindLdapManager : LdapManager
+{
+    public SearchThenBindLdapManager(ILdapSettingProvider provider) : base(provider) { }
+
+    public override async Task<bool> AuthenticateAsync(string username, string password)
+    {
+        try
+        {
+            using var conn = await CreateLdapConnectionAsync();
+            // 1. service bind
+            await conn.BindAsync(LdapAuthType.Simple, new LdapCredential
+            {
+                UserName = await LdapSettingProvider.GetUserNameAsync(),
+                Password = await LdapSettingProvider.GetPasswordAsync()
+            });
+
+            // 2. search
+            var baseDn = await LdapSettingProvider.GetBaseDcAsync();
+            var entries = await conn.SearchAsync(baseDn,
+                $"(&(objectClass=user)(sAMAccountName={LdapEscape(username)}))");
+            if (entries.Count == 0) return false;
+            var userDn = entries[0].Dn;
+
+            // 3. user bind
+            using var userConn = await CreateLdapConnectionAsync();
+            await userConn.BindAsync(LdapAuthType.Simple, new LdapCredential
+            {
+                UserName = userDn,
+                Password = password
+            });
+            return true;
+        }
+        catch (Exception ex) { Logger.LogException(ex); return false; }
+    }
+
+    private static string LdapEscape(string input) =>
+        input.Replace("\\", "\\5c").Replace("*", "\\2a")
+             .Replace("(", "\\28").Replace(")", "\\29").Replace("\0", "\\00");
+}
+```
+
+Always escape user input before composing the search filter — concatenating raw username allows LDAP injection (`*)(uid=*` style).
+
+## Group membership
+
+ABP doesn't pull AD group membership by default. To map AD groups to ABP roles:
+
+1. After successful bind, search the user's DN for `memberOf` attribute.
+2. Map the returned group DNs to ABP role names via your own table.
+3. Add the roles to the signed-in principal (use a custom `IClaimsTransformation`).
+
+For nested groups, AD supports a transitive search filter: `(member:1.2.840.113556.1.4.1941:=<userDn>)`.
+
+## Referral handling
+
+AD forests with multiple domains return referrals (the result includes a `ref` URL pointing to another DC). `LdapForNet` follows referrals by default; disable for performance with:
+
+```csharp
+ldapConnection.SetOption(LdapOption.LDAP_OPT_REFERRALS, IntPtr.Zero);
+```
+
+If your service account exists only in one domain, disabling referrals avoids cross-domain hops on every search.
+
+## Channel binding (CB) / LDAP signing requirements
+
+Modern AD enforces channel binding for LDAPS to defend against relay attacks (KB4520412 onwards). `LdapForNet` supports channel binding via `LdapOption.LDAP_OPT_SSPI_FLAGS` on Windows; on Linux this requires recent `libldap` with SASL support and a `GSSAPI` bind type. Until then, fall back to LDAPS without channel binding **and** restrict DC policies to a controlled list of clients — or use Kerberos.
+
+## Setting changes propagation
+
+The setting store caches values in `IDistributedCache`; changes via the settings UI invalidate the cache on the same node, but other nodes refresh on TTL expiry (default ~30 s). For an immediate cluster-wide flush, publish a custom event after `SettingManager.SetGlobalAsync` and have nodes call `ISettingProvider.RefreshAsync`.
+
+## Connection lifetime
+
+Each `AuthenticateAsync` opens and closes one connection. For high-traffic logins (> 100/sec) cache the *service* bind in a pooled `ILdapConnection`. User binds must stay per-request — recycling them risks leaking previous-user identity.
+
+## Related references
+
+- [LDAP login](/framework/auth/ldap) — how ABP wires LDAP into the user signin pipeline.
+- [Settings](/framework/cross/settings) — the setting store backing `Abp.Ldap.*` keys.

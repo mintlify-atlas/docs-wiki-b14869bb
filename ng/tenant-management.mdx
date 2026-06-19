@@ -1,0 +1,284 @@
+---
+title: "@abp/ng.tenant-management"
+description: "Tenant CRUD page with embedded feature editor and connection-string overrides — extension hooks for columns, actions and form props mirror @abp/ng.identity."
+---
+
+`@abp/ng.tenant-management` ships a single screen at `/tenant-management/tenants` that lists tenants for a host, lets administrators create / rename / delete them, and embeds the *Features* and *Connection strings* editors as row actions.
+
+Three secondary entries are published:
+
+| Import | Purpose |
+| ------ | ------- |
+| `@abp/ng.tenant-management` | lazy feature module |
+| `@abp/ng.tenant-management/config` | eager routes + menu providers |
+| `@abp/ng.tenant-management/proxy` | `TenantService`, DTOs, `apiName: 'AbpTenantManagement'` |
+
+## File tree
+
+```text
+packages/tenant-management/
+├── package.json            # "@abp/ng.tenant-management" — version 7.4.0
+├── ng-package.json
+├── config/                 # @abp/ng.tenant-management/config
+├── proxy/                  # @abp/ng.tenant-management/proxy
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── tenant-management.module.ts
+        ├── tenant-management-routing.module.ts
+        ├── components/tenants/
+        │   ├── tenants.component.ts
+        │   └── tenants.component.html
+        ├── defaults/         # contributors for entity-actions / props / form-props
+        ├── enums/
+        │   └── components.ts (eTenantManagementComponents)
+        ├── guards/
+        │   ├── extensions.guard.ts
+        │   └── index.ts
+        ├── models/config-options.ts
+        └── tokens/
+            ├── extensions.token.ts
+            └── index.ts
+```
+
+## `public-api.ts`
+
+```typescript
+// packages/tenant-management/src/public-api.ts
+export * from './lib/components';
+export * from './lib/enums';
+export * from './lib/guards';
+export * from './lib/models';
+export * from './lib/tenant-management.module';
+export * from './lib/tokens';
+```
+
+```typescript
+// packages/tenant-management/src/lib/enums/components.ts
+export const enum eTenantManagementComponents {
+  Tenants = 'TenantManagement.TenantsComponent',
+}
+```
+
+A single replaceable key — replace the component to fork the UI without forking the data flow.
+
+## TenantManagementModule
+
+```typescript
+// packages/tenant-management/src/lib/tenant-management.module.ts (excerpt)
+@NgModule({
+  declarations: [TenantsComponent],
+  exports: [TenantsComponent],
+  imports: [
+    TenantManagementRoutingModule,
+    NgxValidateCoreModule,
+    CoreModule,
+    ThemeSharedModule,
+    NgbDropdownModule,
+    FeatureManagementModule,    // <abp-feature-management> embedded as row action
+    UiExtensionsModule,
+    PageModule,
+  ],
+})
+export class TenantManagementModule {
+  static forChild(options: TenantManagementConfigOptions = {}): ModuleWithProviders<TenantManagementModule> {
+    return {
+      ngModule: TenantManagementModule,
+      providers: [
+        { provide: TENANT_MANAGEMENT_ENTITY_ACTION_CONTRIBUTORS,   useValue: options.entityActionContributors },
+        { provide: TENANT_MANAGEMENT_TOOLBAR_ACTION_CONTRIBUTORS, useValue: options.toolbarActionContributors },
+        { provide: TENANT_MANAGEMENT_ENTITY_PROP_CONTRIBUTORS,    useValue: options.entityPropContributors },
+        { provide: TENANT_MANAGEMENT_CREATE_FORM_PROP_CONTRIBUTORS, useValue: options.createFormPropContributors },
+        { provide: TENANT_MANAGEMENT_EDIT_FORM_PROP_CONTRIBUTORS,   useValue: options.editFormPropContributors },
+      ],
+    };
+  }
+}
+```
+
+Same pattern as `IdentityModule.forChild` — five contributor maps keyed by `eTenantManagementComponents`.
+
+## Routing
+
+```typescript
+// packages/tenant-management/src/lib/tenant-management-routing.module.ts
+const routes: Routes = [
+  { path: '', redirectTo: 'tenants', pathMatch: 'full' },
+  {
+    path: '',
+    component: RouterOutletComponent,
+    canActivate: mapToCanActivate([AuthGuard, PermissionGuard, TenantManagementExtensionsGuard]),
+    children: [
+      {
+        path: 'tenants',
+        component: ReplaceableRouteContainerComponent,
+        data: {
+          requiredPolicy: 'AbpTenantManagement.Tenants',
+          replaceableComponent: {
+            key: eTenantManagementComponents.Tenants,
+            defaultComponent: TenantsComponent,
+          } as ReplaceableComponents.RouteData<TenantsComponent>,
+        },
+      },
+    ],
+  },
+];
+```
+
+The `requiredPolicy` matches the backend permission name verbatim.
+
+## TenantsComponent
+
+```typescript
+// packages/tenant-management/src/lib/components/tenants/tenants.component.ts (excerpt)
+@Component({
+  selector: 'abp-tenants',
+  templateUrl: './tenants.component.html',
+  providers: [
+    ListService,
+    {
+      provide: EXTENSIONS_IDENTIFIER,
+      useValue: eTenantManagementComponents.Tenants,
+    },
+  ],
+})
+export class TenantsComponent implements OnInit {
+  data: PagedResultDto<TenantDto> = { items: [], totalCount: 0 };
+  selected!: TenantDto;
+  tenantForm!: UntypedFormGroup;
+  isModalVisible!: boolean;
+  visibleFeatures = false;
+  providerKey!: string;
+  modalBusy = false;
+
+  featureManagementKey = eFeatureManagementComponents.FeatureManagement;
+
+  get hasSelectedTenant(): boolean {
+    return Boolean(this.selected.id);
+  }
+
+  onVisibleFeaturesChange = (value: boolean) => {
+    this.visibleFeatures = value;
+  };
+
+  constructor(
+    public readonly list: ListService<GetTenantsInput>,
+    private injector: Injector,
+    private confirmationService: ConfirmationService,
+    private service: TenantService,
+    private toasterService: ToasterService,
+    private fb: UntypedFormBuilder,
+  ) {}
+
+  ngOnInit() { this.hookToQuery(); }
+
+  private createTenantForm() {
+    const data = new FormPropData(this.injector, this.selected);
+    this.tenantForm = generateFormFromProps(data);
+  }
+
+  addTenant() {
+    this.selected = {} as TenantDto;
+    this.createTenantForm();
+    this.isModalVisible = true;
+  }
+
+  editTenant(id: string) {
+    this.service.get(id).subscribe(res => {
+      this.selected = res;
+      this.createTenantForm();
+      this.isModalVisible = true;
+    });
+  }
+}
+```
+
+Key observations:
+
+* `FormPropData` + `generateFormFromProps` build the create/edit form dynamically from contributor lists registered on `TENANT_MANAGEMENT_CREATE_FORM_PROP_CONTRIBUTORS` / `..._EDIT_FORM_PROP_CONTRIBUTORS`. Adding a field is a contributor call — no template edits required.
+* The Features row action sets `providerKey = row.id` and flips `visibleFeatures = true`, which the template wires to the embedded `<abp-feature-management>` modal with `providerName="T"`.
+* Pagination/sort/filter state lives in `ListService<GetTenantsInput>`. The `hookToQuery()` helper triggers `TenantService.getList(...)` whenever the query state changes.
+
+## Contributor defaults
+
+The shipped defaults under `defaults/` deliver:
+
+* `DEFAULT_TENANT_ENTITY_PROPS` — `tenantName` column.
+* `DEFAULT_TENANT_ENTITY_ACTIONS` — *Edit*, *Delete*, *Manage features*, *Manage connection strings*.
+* `DEFAULT_TENANT_TOOLBAR_ACTIONS` — *New tenant*.
+* `DEFAULT_TENANT_CREATE_FORM_PROPS` / `..._EDIT_FORM_PROPS` — name field + admin email/password for create.
+
+Each constant is keyed by `eTenantManagementComponents.Tenants`, matching the dictionary shape expected by the contributor tokens.
+
+## Connection-string editor
+
+The *Manage connection strings* row action opens a modal whose form is also generated from contributors (under `defaults/`). Saving calls `TenantService.updateDefaultConnectionString(id, defaultConnectionString)` or the equivalent service method for non-default modules.
+
+## Adding a column
+
+```typescript
+import { ePropType, EntityProp } from '@abp/ng.theme.shared/extensions';
+import { eTenantManagementComponents } from '@abp/ng.tenant-management';
+import { TenantDto } from '@abp/ng.tenant-management/proxy';
+
+const createdAt = propList => propList.addLast(new EntityProp<TenantDto>({
+  type: ePropType.DateTime,
+  name: 'creationTime',
+  displayName: 'AbpUi::CreationTime',
+  sortable: true,
+}));
+
+// in your AppModule
+{
+  path: 'tenant-management',
+  loadChildren: () => import('@abp/ng.tenant-management').then(m => m.TenantManagementModule.forLazy({
+    entityPropContributors: {
+      [eTenantManagementComponents.Tenants]: [createdAt],
+    },
+  })),
+}
+```
+
+## Proxy
+
+`@abp/ng.tenant-management/proxy` exports:
+
+* `TenantService` with `apiName: 'AbpTenantManagement'`:
+  * `getList(input: GetTenantsInput)`
+  * `get(id: string)`, `create(input: TenantCreateDto)`, `update(id, input)`
+  * `delete(id: string)`
+  * `getDefaultConnectionString(id)`, `updateDefaultConnectionString(id, defaultConnectionString)`, `deleteDefaultConnectionString(id)`
+* DTOs: `TenantDto`, `TenantCreateDto`, `TenantUpdateDto`, `GetTenantsInput`.
+
+## Usage
+
+```typescript
+// app.module.ts
+@NgModule({
+  imports: [
+    TenantManagementConfigModule.forRoot(),
+  ],
+})
+export class AppModule {}
+
+// app-routing.module.ts
+{
+  path: 'tenant-management',
+  loadChildren: () =>
+    import('@abp/ng.tenant-management').then(m => m.TenantManagementModule.forLazy()),
+}
+```
+
+## Gotchas
+
+* Embedding `<abp-feature-management>` requires `providerName="T"` (literal `T`). Passing `'Tenant'` will yield an empty modal because the backend lookup compares the provider key against the registered providers using the short code.
+* `TENANT_MANAGEMENT_*_CONTRIBUTORS` tokens are *map* tokens, not list tokens. Each value is `Record<string, ContributorCallback[]>` keyed by `eTenantManagementComponents`.
+* The form builder uses `UntypedFormBuilder` rather than the typed `FormBuilder` so contributors can attach arbitrary controls. Migrating to typed forms requires sub-classing the component.
+* `TenantsComponent.selected` is reused for both *create* and *edit* — toggling `isModalVisible = false` while the save observable is still in-flight may surface stale state on the next open. The component guards this with `modalBusy` but custom row actions should respect it.
+* `AbpTenantManagement.Tenants.ManageFeatures` (host) and `AbpTenantManagement.Tenants.ManageConnectionStrings` are *separate* permissions — the default contributors check them individually and hide the row action when not granted.
+
+## Related pages
+
+* `ng/feature-management.mdx` — modal embedded in the row actions.
+* `ng/identity.mdx` — sibling implementation of the contributor pattern.
+* `ng/core.mdx` — `ListService`, `PermissionGuard`, multi-tenancy semantics.

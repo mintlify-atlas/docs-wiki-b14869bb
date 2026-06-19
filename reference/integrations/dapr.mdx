@@ -1,0 +1,275 @@
+---
+title: "Dapr"
+description: "External-service reference for the Dapr sidecar — Volo.Abp.Dapr client, HTTP/gRPC endpoints, API tokens, and how ABP layers event bus, distributed lock and HTTP client on top."
+---
+
+[Dapr](https://dapr.io) is a sidecar runtime that abstracts service-to-service calls, state, pub/sub, secrets and distributed locking. ABP has a family of Dapr-integrated packages — for the event bus, distributed lock, and HTTP client proxies — all built on top of `Volo.Abp.Dapr`, which configures the Dapr client (`DaprClient`) and the sidecar token plumbing. This reference focuses on the **sidecar side** — how the host application talks to its sidecar, what tokens are exchanged, and what to set in `appsettings.json`.
+
+For ABP-side internals see [Dapr Transport](/framework/brokers/dapr), [Distributed Event Bus — Dapr](/framework/eventbus/dapr), and [Distributed Locking — Dapr](/framework/cross/distributed-locking).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.Dapr` | Configures `DaprClient`, exposes `IAbpDaprClientFactory`, manages API tokens. |
+| `Volo.Abp.EventBus.Dapr` | Distributed event bus over Dapr pub/sub. |
+| `Volo.Abp.DistributedLocking.Dapr` | Distributed locks via Dapr lock building block. |
+| `Volo.Abp.Http.Client.Dapr` | Service-to-service HTTP calls routed through the sidecar. |
+| `Volo.Abp.AspNetCore.Mvc.Dapr` | MVC integration helpers (controller endpoints exposed to sidecar). |
+| `Volo.Abp.AspNetCore.Mvc.Dapr.EventBus` | Maps Dapr-delivered events into MVC pipeline. |
+
+The base module:
+
+```csharp
+[DependsOn(typeof(AbpJsonModule))]
+public class AbpDaprModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        ConfigureDaprOptions(configuration);
+        context.Services.TryAddSingleton(
+            sp => sp.GetRequiredService<IAbpDaprClientFactory>().Create());
+    }
+}
+```
+
+## Options model
+
+```csharp
+public class AbpDaprOptions
+{
+    public string? HttpEndpoint  { get; set; }
+    public string? GrpcEndpoint  { get; set; }
+    public string? DaprApiToken  { get; set; }
+    public string? AppApiToken   { get; set; }
+}
+```
+
+| Property | Source if unset | Notes |
+| --- | --- | --- |
+| `HttpEndpoint` | `DaprClient` default (`http://localhost:3500`) | Sidecar HTTP port; override only for non-default sidecars. |
+| `GrpcEndpoint` | `DaprClient` default (`http://localhost:50001`) | Sidecar gRPC port. |
+| `DaprApiToken` | `Dapr:DaprApiToken` configuration → `DAPR_API_TOKEN` configuration → `DAPR_API_TOKEN` env var | Sent to the sidecar as `dapr-api-token` header. |
+| `AppApiToken` | `Dapr:AppApiToken` → `APP_API_TOKEN` configuration → `APP_API_TOKEN` env var | Sidecar sends this to the app on inbound calls; the app validates it. |
+
+The module reads them in this order — explicit configuration first, then env vars — so Kubernetes secrets surfaced as env vars Just Work.
+
+## Sidecar version requirements
+
+| Component | Minimum | Recommended |
+| --- | --- | --- |
+| Dapr runtime (`daprd`) | 1.10 | 1.13 / 1.14 (latest LTS) |
+| Dapr Operator (Kubernetes) | matches runtime | latest LTS |
+| `Dapr.Client` NuGet | 1.10 | matches runtime |
+| Dapr CLI | 1.10 | latest |
+
+ABP's `Volo.Abp.Dapr` depends on `Dapr.Client` and the ASP.NET Core Dapr packages. Pinning the client to a major version close to the runtime is the safest stance.
+
+## Sample `appsettings.json`
+
+```json
+{
+  "Dapr": {
+    "HttpEndpoint": "http://localhost:3500",
+    "GrpcEndpoint": "http://localhost:50001",
+    "DaprApiToken": "",
+    "AppApiToken": ""
+  }
+}
+```
+
+In Kubernetes you'd typically leave tokens empty in JSON and inject them via env from a secret:
+
+```yaml
+env:
+  - name: DAPR_API_TOKEN
+    valueFrom:
+      secretKeyRef: { name: dapr-tokens, key: daprApiToken }
+  - name: APP_API_TOKEN
+    valueFrom:
+      secretKeyRef: { name: dapr-tokens, key: appApiToken }
+```
+
+The ABP module picks them up automatically.
+
+## Sidecar discovery
+
+`DaprClient` defaults to `localhost:3500` (HTTP) / `localhost:50001` (gRPC). In Kubernetes with the Dapr sidecar injected, the sidecar runs in the same pod and these defaults are correct. Outside Kubernetes (Docker Compose, dapr CLI run), you need to set the ports the sidecar exposes:
+
+```bash
+dapr run --app-id catalog-service --dapr-http-port 3500 --dapr-grpc-port 50001 -- dotnet run
+```
+
+If you change ports (`--dapr-http-port 3600`), reflect it in `Dapr:HttpEndpoint`.
+
+## Components
+
+Dapr building blocks ABP consumes:
+
+| Block | Module | Component name resolution |
+| --- | --- | --- |
+| Pub/Sub | `Volo.Abp.EventBus.Dapr` | `AbpDaprEventBusOptions.PubSubName` (default `pubsub`). |
+| State | (used indirectly) | `AbpDistributedLockingDaprOptions.StoreName` (default `statestore`) for locks. |
+| Lock | `Volo.Abp.DistributedLocking.Dapr` | Same option. Requires a Dapr 1.10+ lock component. |
+| Service invocation | `Volo.Abp.Http.Client.Dapr` | App id from `AbpDaprRemoteServiceOptions.AppId`. |
+
+Components are declared as YAML files in the Dapr `components/` directory (self-hosted) or as `Component` Custom Resources (Kubernetes). Example pub/sub on RabbitMQ:
+
+```yaml
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub
+spec:
+  type: pubsub.rabbitmq
+  version: v1
+  metadata:
+    - name: host
+      value: amqp://user:pass@rabbit:5672
+    - name: consumerID
+      value: catalog-service
+```
+
+The `name: pubsub` matches `AbpDaprEventBusOptions.PubSubName`.
+
+## API tokens
+
+Two distinct tokens:
+
+- **`dapr-api-token`** — protects calls from the app to the sidecar. The sidecar will reject unauthenticated app calls if `DAPR_API_TOKEN` is set on the daprd side.
+- **`app-api-token`** — protects calls from the sidecar to the app (`/dapr/subscribe`, pub/sub callbacks). The daprd sends it as `dapr-api-token` header on inbound calls (yes, the header is shared); the app validates against `AbpDaprOptions.AppApiToken`. ABP middleware does this when you add `app.UseDaprAppApiTokenAuthorization()` (or equivalent in the MVC integration).
+
+Both tokens should be random 32+ byte strings stored as secrets and rotated together.
+
+## Network setup
+
+1. **Sidecar lives in the pod** in Kubernetes; `localhost` works.
+2. **Self-hosted with dapr CLI** — the sidecar listens on the ports you pass.
+3. **Standalone Docker Compose** — run `daprd` as a separate container, expose 3500/50001, point `Dapr:HttpEndpoint` at the container host.
+4. **TLS between app and sidecar** — not common because the sidecar is local. mTLS is used between sidecars (placement service issues SPIFFE IDs); set `--enable-mtls` on the control plane.
+5. **TLS for components** (RabbitMQ, Redis, etc.) — configured in component YAML, not in ABP.
+
+## Health and readiness
+
+`daprd` exposes:
+
+- `GET /v1.0/healthz` — liveness.
+- `GET /v1.0/healthz/outbound` — readiness (returns 200 once components are ready).
+
+Configure the application's Kubernetes readinessProbe against the sidecar's outbound healthz so the pod isn't admitted to the service before components are wired.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `DaprClient` calls return `Unavailable: connection refused` | Sidecar not yet started or different port. | Wait for sidecar readiness; verify `Dapr:HttpEndpoint`/`GrpcEndpoint`. |
+| `403 Forbidden: invalid api token` from sidecar | `DAPR_API_TOKEN` set on sidecar, app didn't send it. | Set `Dapr:DaprApiToken` or `DAPR_API_TOKEN` env in app. |
+| Pub/sub messages never arrive at app endpoint | Subscriptions not registered or component name mismatch. | Check `/dapr/subscribe` response served by the app; ensure `PubSubName` matches the component. |
+| Distributed lock returns null immediately | Lock component not registered, or older Dapr (< 1.10). | Upgrade Dapr; add `lock.redis`/`lock.postgresql` component. |
+| Service invocation 404s the other app | App id mismatch (`AppId` in `AbpDaprRemoteServiceOptions`). | Match Dapr `--app-id` of the target. |
+| Messages duplicated on every replay | Component lacks dedup metadata. | Configure broker-specific dedup; for at-most-once apps that's expected. |
+| `appcallback` 500s on event | App threw, no retry policy. | Configure Dapr resiliency policy YAML for retries; ABP returns 500 on handler exception. |
+
+## Observability hints
+
+- **Sidecar metrics** — daprd exposes Prometheus metrics at `:9090/metrics`. Look for `dapr_runtime_actor_status_report_total`, `dapr_http_server_request_latency_seconds`, `dapr_component_pubsub_egress_count`.
+- **Distributed tracing** — Dapr propagates W3C traceparent. Enable a tracing component (Zipkin/OTLP) in `config.yaml`. ABP `IDistributedEventBus` adds its own spans on publish.
+- **Dapr Dashboard** — `dapr dashboard` shows components, sidecars, and live message flow in self-hosted mode.
+- **Component health** — `GET /v1.0/metadata` from the sidecar lists all loaded components and their status.
+- **Logging** — daprd logs in JSON via stdout; ship through your log aggregator. App correlation via `traceparent`.
+
+## Multi-tenancy
+
+ABP's `IDistributedEventBus` adds `tenant-id` metadata on each published event. Pub/sub components route by topic name, not tenant; tenant isolation comes from event filtering on the consumer side. If you need tenant-scoped topics, override `AbpDaprEventBusOptions.PubSubName` per tenant or use Dapr scope routing.
+
+## Resiliency policies
+
+Dapr 1.10+ supports per-component resiliency policies declared in YAML:
+
+```yaml
+apiVersion: dapr.io/v1alpha1
+kind: Resiliency
+metadata:
+  name: catalog-resiliency
+spec:
+  policies:
+    retries:
+      pubsubRetry:
+        policy: exponential
+        maxInterval: 30s
+        maxRetries: 10
+    circuitBreakers:
+      pubsubCb:
+        maxRequests: 1
+        interval: 60s
+        timeout: 30s
+        trip: consecutiveFailures >= 5
+  targets:
+    components:
+      pubsub:
+        inbound:
+          retry: pubsubRetry
+          circuitBreaker: pubsubCb
+```
+
+ABP code remains unchanged — the sidecar applies the policy before calling the app endpoint. Use this to absorb transient broker hiccups without bloating handlers.
+
+## Sidecar config CRD
+
+The sidecar reads runtime config from a `Configuration` resource:
+
+```yaml
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: catalog-config
+spec:
+  tracing:
+    samplingRate: "0.1"
+    otel:
+      endpointAddress: "otel-collector:4317"
+      isSecure: false
+      protocol: grpc
+  metric:
+    enabled: true
+  features:
+    - name: ResiliencyPolicies
+      enabled: true
+```
+
+Attach to the pod via the `dapr.io/config: "catalog-config"` annotation. ABP doesn't read this — it's between the sidecar and the control plane.
+
+## Pub/sub topic conventions
+
+`AbpDaprEventBusOptions.PubSubName` chooses the component; topic names default to the event type's full name (`Volo.Abp.Identity.Etos.UserEto`). For interop with non-ABP services:
+
+```csharp
+Configure<AbpDaprEventBusOptions>(options =>
+{
+    options.PubSubName = "pubsub";
+    options.TopicNameResolver = type => type.GetCustomAttribute<EventNameAttribute>()?.Name
+                                        ?? type.FullName!;
+});
+```
+
+Couple with `[EventName("user.created.v1")]` on event ETOs for stable topic names.
+
+## Distributed lock semantics
+
+Dapr's lock building block is **non-reentrant** and **owner-bound** — the same `LockOwner` ID must call unlock. ABP's `IAbpDistributedLock` wraps this. Choose lock store wisely:
+
+- `lock.redis` — fast, fits transient locks (~ ms acquisition).
+- `lock.postgresql` — durable, fits long-held locks.
+
+Don't hold a Dapr lock across HTTP boundaries; the sidecar's lease defaults to seconds and renewal is owner-driven.
+
+## Mutual TLS between sidecars
+
+`mtls: enabled: true` in the control plane Configuration enables Dapr's certificate authority (Sentry). Sidecars exchange SPIFFE IDs (`spiffe://public/ns/<ns>/<app-id>`) and ABP code is unaware. Access control policies (`AccessControl` Configuration spec) restrict which app IDs may invoke which endpoints — useful for zero-trust between microservices.
+
+## Related references
+
+- [Dapr Transport](/framework/brokers/dapr) — `IAbpDaprClientFactory` internals.
+- [Distributed Event Bus — Dapr](/framework/eventbus/dapr) — pub/sub semantics.
+- [Distributed Locking](/framework/cross/distributed-locking) — provider model with Dapr backend.

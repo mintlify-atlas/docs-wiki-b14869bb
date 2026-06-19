@@ -1,0 +1,288 @@
+---
+title: "Amazon S3"
+description: "External-service reference for AWS S3 — Volo.Abp.BlobStoring.Aws provider, bucket regions, permanent vs. temporary credentials, IAM policies, and operational guidance."
+---
+
+`Volo.Abp.BlobStoring.Aws` plugs AWS S3 into ABP's `IBlobContainer<T>` abstraction. It uses the official `AWSSDK.S3` client and supports static keys, AWS profiles, STS temporary credentials, and STS federated tokens (the last two are cached via ABP's distributed cache). This page covers the **bucket side** — credential modes, IAM policies, lifecycle, encryption, and the configuration keys the provider exposes.
+
+For the ABP-side BLOB abstraction see [Blob Storing](/framework/imaging-blob/blob-storing) and [Blob Storing — AWS](/framework/imaging-blob/blob-storing-aws).
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.BlobStoring.Aws` | `AbpBlobStoringAwsModule` |
+
+```csharp
+[DependsOn(typeof(AbpBlobStoringModule), typeof(AbpCachingModule))]
+public class AbpBlobStoringAwsModule : AbpModule { }
+```
+
+`AbpCachingModule` is a dependency because temporary credentials (STS) are cached.
+
+The provider entry point in user code:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseAws(aws =>
+        {
+            aws.AccessKeyId       = "...";
+            aws.SecretAccessKey   = "...";
+            aws.Region            = "us-east-1";
+            aws.ContainerName     = "my-bucket";
+            aws.CreateContainerIfNotExists = false;
+        });
+    });
+});
+```
+
+## Provider configuration keys
+
+`Volo.Abp.BlobStoring.Aws.AwsBlobProviderConfigurationNames`:
+
+```csharp
+public const string AccessKeyId                  = "Aws.AccessKeyId";
+public const string SecretAccessKey              = "Aws.SecretAccessKey";
+public const string UseCredentials               = "Aws.UseCredentials";
+public const string UseTemporaryCredentials      = "Aws.UseTemporaryCredentials";
+public const string UseTemporaryFederatedCredentials = "Aws.UseTemporaryFederatedCredentials";
+public const string ProfileName                  = "Aws.ProfileName";
+public const string ProfilesLocation             = "Aws.ProfilesLocation";
+public const string DurationSeconds              = "Aws.DurationSeconds";
+public const string TemporaryCredentialsCacheKey = "Aws.TemporaryCredentialsCacheKey";
+public const string Name                         = "Aws.Name";
+public const string Policy                       = "Aws.Policy";
+public const string Region                       = "Aws.Region";
+public const string ContainerName                = "Aws.ContainerName";
+public const string CreateContainerIfNotExists   = "Aws.CreateContainerIfNotExists";
+```
+
+| Key | Purpose |
+| --- | --- |
+| `Aws.AccessKeyId` / `Aws.SecretAccessKey` | Static IAM user keys. |
+| `Aws.UseCredentials` | `true` to fall back to the AWS SDK credential provider chain (env vars, EC2 IMDS, ECS task role, EKS IRSA). |
+| `Aws.UseTemporaryCredentials` | `true` to call `AssumeRole` and use STS short-lived creds. |
+| `Aws.UseTemporaryFederatedCredentials` | `true` to call `GetFederationToken`. |
+| `Aws.ProfileName` / `Aws.ProfilesLocation` | Named profile from `~/.aws/credentials` or a custom path. |
+| `Aws.Name` | Role/federation session name. |
+| `Aws.Policy` | Inline IAM policy attached to the temporary session. |
+| `Aws.DurationSeconds` | Lifetime of STS credentials (900–43 200 for AssumeRole, 900–129 600 for FederationToken). |
+| `Aws.TemporaryCredentialsCacheKey` | Override the cache key. |
+| `Aws.Region` | Bucket region. Must match the bucket's region. |
+| `Aws.ContainerName` | S3 bucket name. |
+| `Aws.CreateContainerIfNotExists` | `true` → `CreateBucketAsync` on first use. Requires `s3:CreateBucket`. |
+
+The provider is implemented by `AwsBlobProvider` and uses `IAmazonS3ClientFactory` (default `DefaultAmazonS3ClientFactory`) to construct the client.
+
+## Credential modes — pick one
+
+1. **EKS Pod Identity / IRSA / EC2 instance role / ECS task role** — set `Aws.UseCredentials=true` and **omit** the keys. SDK reads from the metadata service. Recommended for production on AWS.
+2. **Static IAM user keys** — fine for on-prem-to-S3 and for dev/test buckets. Rotate at least every 90 days.
+3. **AssumeRole (STS)** — set `Aws.UseTemporaryCredentials=true` + `Aws.Name` (RoleArn) + `Aws.Policy` (inline scope-down). Useful for cross-account or per-tenant role mapping.
+4. **GetFederationToken** — set `Aws.UseTemporaryFederatedCredentials=true`. Used to hand short-lived creds to user agents.
+5. **Profile** — set `Aws.ProfileName` and optionally `Aws.ProfilesLocation`. Pulls from the AWS CLI credentials file.
+
+Only one of `UseCredentials`, `UseTemporaryCredentials`, `UseTemporaryFederatedCredentials`, and `ProfileName` should be set per container.
+
+## IAM policy — minimum required
+
+For a single bucket, attach this to the role/user the app runs as:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AbpBlobAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::catalog-blobs",
+        "arn:aws:s3:::catalog-blobs/*"
+      ]
+    }
+  ]
+}
+```
+
+Add `s3:CreateBucket` and `s3:PutBucketAcl` only if `Aws.CreateContainerIfNotExists=true`. For server-side encryption with KMS, add `kms:Decrypt`, `kms:Encrypt`, `kms:GenerateDataKey` on the relevant CMK.
+
+## Bucket configuration
+
+| Setting | Recommendation |
+| --- | --- |
+| Region | Pick the same region as the workload to minimise latency and egress cost. |
+| Versioning | Enable in production — ABP overwrites blobs in place, versioning gives a recycle bin. |
+| Default encryption | SSE-S3 (`AES256`) or SSE-KMS. For SSE-KMS use a customer-managed key for audit. |
+| Block public access | Always **on**. ABP never needs public buckets. |
+| Object Lock | Optional. Use for compliance / WORM. |
+| Lifecycle | Tier objects > N days to S3-IA, > M days to Glacier. ABP doesn't read archived objects. |
+
+## Sample `appsettings.json`
+
+```json
+{
+  "AwsBlobStorage": {
+    "Region": "us-east-1",
+    "ContainerName": "catalog-blobs",
+    "UseCredentials": true,
+    "CreateContainerIfNotExists": false
+  }
+}
+```
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.ConfigureDefault(container =>
+    {
+        container.UseAws(aws =>
+        {
+            aws.UseCredentials = true;
+            aws.Region         = configuration["AwsBlobStorage:Region"];
+            aws.ContainerName  = configuration["AwsBlobStorage:ContainerName"];
+        });
+    });
+});
+```
+
+If you must use static keys, prefer environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) and let `UseCredentials=true` pick them up — that way you don't ship secrets in JSON.
+
+## STS temporary credentials — caching
+
+When `UseTemporaryCredentials=true` the provider:
+
+1. Calls `STS.AssumeRoleAsync(RoleArn=Aws.Name, RoleSessionName=..., DurationSeconds=Aws.DurationSeconds, Policy=Aws.Policy)`.
+2. Caches the resulting `Credentials` in ABP's `IDistributedCache<AwsTemporaryCredentialsCacheItem>` with key `Aws.TemporaryCredentialsCacheKey` (defaults to a derived key).
+3. Reuses the cached creds until ~5 minutes before expiry.
+
+If you observe an `ExpiredToken` error mid-request, check the cache TTL versus `DurationSeconds`. The default `DurationSeconds` is 3600 (1 h); raise it for long-running batches but never above the role's max session duration.
+
+## S3-compatible alternatives
+
+The provider speaks plain S3 API. It also works (with appropriate endpoint override) against:
+
+- **Cloudflare R2** — set the endpoint and use HMAC keys; `Region` should be `auto`.
+- **Backblaze B2** (S3 endpoint).
+- **DigitalOcean Spaces**.
+- **Wasabi**.
+- **Ceph RGW** / **OpenIO** / **OpenStack Swift S3 gateway**.
+
+To override the endpoint you must implement `IAmazonS3ClientFactory` and set `AmazonS3Config.ServiceURL` + `ForcePathStyle`. For MinIO use the dedicated `Volo.Abp.BlobStoring.Minio` package — it has first-class path-style support.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `AccessDenied` on `PutObject` | Missing `s3:PutObject` or bucket policy denies. | Update IAM policy + bucket policy; check SCPs. |
+| `InvalidAccessKeyId` | Static key revoked or wrong key. | Rotate. |
+| `SignatureDoesNotMatch` | System clock skew. | Sync NTP; SDK signing tolerance is ±5 min. |
+| `PermanentRedirect: The bucket you are attempting to access must be addressed using the specified endpoint` | Wrong region in `Aws.Region`. | Set to the bucket's region. |
+| `ExpiredToken` after long-running upload | STS creds expired mid-call. | Increase `DurationSeconds`; the SDK auto-refreshes but only at start of a call. |
+| `BucketAlreadyOwnedByYou` | `CreateContainerIfNotExists=true` racing with another pod. | Pre-create the bucket via IaC. |
+| Slow uploads, occasional 5xx | Bucket request rate exceeded per-prefix limits (3 500 PUT/COPY/POST/DELETE per prefix). | Use random prefixes (multi-tenant `tenant-id/...` already helps). |
+| Object visible to other tenants | Shared bucket and bug in tenant routing. | ABP uses `<tenant-id>/<blob>` prefix; verify multi-tenancy is wired in the container. |
+| `Unable to find credentials` | `UseCredentials=true` but no IMDS, no env vars, no profile. | Verify IRSA role attached, or set explicit keys. |
+
+## Observability hints
+
+- **CloudTrail data events.** Enable for the bucket if you need per-object audit. Bucket-level events come free.
+- **CloudWatch metrics.** Bucket: `BucketSizeBytes`, `NumberOfObjects` (daily). Request metrics: `AllRequests`, `4xxErrors`, `5xxErrors`, `FirstByteLatency`, `TotalRequestLatency`.
+- **S3 Storage Lens.** Aggregated views across accounts; useful for capacity planning.
+- **Server access logs.** Enable to a separate logging bucket — they record IP, requester, S3 operation, response code. Keep retention short.
+- **Request rate.** Per-prefix limit is 5 500 GET/HEAD and 3 500 mutating req/sec. Spread writes across prefixes (multi-tenant or hashed names).
+- **SDK metrics.** `AWSSDK.S3` exposes `IClientConfig.MetricsEnabled` and emits log entries for retries and exceptions. Pair with OpenTelemetry's `AWSSDK.Extensions.NETCore.Setup` for traced spans.
+
+## Encryption
+
+| Mode | Configure how | Notes |
+| --- | --- | --- |
+| SSE-S3 | Default bucket encryption. | Free; no key management. |
+| SSE-KMS | Bucket policy + `kms:GenerateDataKey` on role. | Adds latency; supports audit and cross-account boundaries. |
+| SSE-C (customer-provided) | Override `PutObjectRequest.ServerSideEncryptionCustomerMethod` in a subclass. | Rare; you manage the key. |
+| Client-side encryption | Encrypt before passing the stream to `SaveAsync`. | Highest control. |
+
+ABP's provider does not directly expose KMS key id — when default bucket encryption is set to SSE-KMS, S3 applies it transparently.
+
+## Presigned URLs
+
+For direct browser uploads/downloads, generate a presigned URL outside of ABP's provider:
+
+```csharp
+var client = new AmazonS3Client(RegionEndpoint.USEast1);
+var req = new GetPreSignedUrlRequest
+{
+    BucketName = "catalog-blobs",
+    Key = $"{currentTenantId}/{filename}",
+    Verb = HttpVerb.PUT,
+    Expires = DateTime.UtcNow.AddMinutes(15),
+    ContentType = "application/pdf"
+};
+var url = client.GetPreSignedURL(req);
+```
+
+ABP doesn't expose a presigned-URL API — call the SDK directly from an application service. Combine with bucket CORS for browser PUT.
+
+## Bucket CORS for direct upload
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://app.example.com"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+Apply via `aws s3api put-bucket-cors`. Required for SPA uploads via `fetch(presignedUrl, { method: 'PUT' })`.
+
+## S3 Object Lambda (read transform)
+
+For on-the-fly resize / watermarking without re-storing, use S3 Object Lambda Access Points. ABP's provider doesn't know about them — point `Aws.ContainerName` at the access-point name. The Lambda runs server-side and the response replaces the stored bytes.
+
+## Cross-region access patterns
+
+| Pattern | Setup |
+| --- | --- |
+| Same-region access | Default. Lowest latency, no egress. |
+| Cross-region read | `Aws.Region` = bucket region; expect higher latency + inter-region egress cost. |
+| Cross-region replication (CRR) | Bucket-level replication; each region has its own bucket name; ABP container points to the local one. |
+| Multi-Region Access Points | Single ARN routes to nearest copy; supported by SDK. Override `IAmazonS3ClientFactory` to construct a client with the MRAP. |
+
+## S3 Transfer Acceleration
+
+For globally distributed uploads, enable Transfer Acceleration on the bucket and point the SDK at `s3-accelerate.amazonaws.com`. Adds latency for in-region clients — only worthwhile for far-flung users. Override `AmazonS3Config.UseAccelerateEndpoint=true` in a custom factory.
+
+## VPC endpoints and gateway endpoints
+
+For pods running inside a private VPC, an S3 gateway endpoint (free) routes traffic through the VPC backbone, avoiding internet egress. No client changes — the SDK uses public DNS and the endpoint intercepts. Add `s3:*` permissions in the endpoint policy and you're done.
+
+For interface endpoints (paid), the SDK needs an explicit endpoint URL; supply via `AmazonS3Config.ServiceURL`.
+
+## Object versioning recovery
+
+When versioning is on, every overwrite/delete keeps history. Recover with:
+
+```bash
+aws s3api list-object-versions --bucket catalog-blobs --prefix "<tenant>/<file>"
+aws s3api copy-object --bucket catalog-blobs --copy-source "catalog-blobs/<key>?versionId=..." --key "<key>"
+```
+
+ABP's provider doesn't expose version listing — add an admin endpoint for support staff.
+
+## Related references
+
+- [Blob Storing](/framework/imaging-blob/blob-storing) — container abstractions and the provider model.
+- [Blob Storing — AWS](/framework/imaging-blob/blob-storing-aws) — provider internals.
+- [MinIO](/reference/integrations/minio) — the S3-compatible alternative for on-prem.

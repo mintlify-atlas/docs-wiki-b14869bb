@@ -1,0 +1,255 @@
+---
+title: "AuthServer Project"
+description: "Dedicated OpenIddict authorization server hosting login, consent, and OIDC discovery endpoints — used in tiered solutions where the API and identity provider run as separate processes."
+---
+
+`MyCompanyName.MyProjectName.AuthServer` is a **stand-alone authorization server** that runs `/connect/authorize`, `/connect/token`, `/.well-known/openid-configuration`, and the Account module's login, registration, password reset and consent Razor Pages. It is generated when you create the solution with the *separated AuthServer* flavour (tiered MVC, tiered Blazor Server, Angular-with-separate-auth, etc.) and runs on `https://localhost:44301` in development.
+
+The `HttpApi.Host` then validates the tokens this server mints — see [HttpApi.Host](/templates/aspnetcore/httpapi-host) for the validator side.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.AuthServer/
+├── Pages/
+│   └── ...
+├── Properties/
+│   └── launchSettings.json
+├── wwwroot/
+│   └── ...
+├── MyCompanyName.MyProjectName.AuthServer.csproj
+├── MyProjectNameAuthServerModule.cs
+├── MyProjectNameBrandingProvider.cs
+├── Program.cs
+├── abp.resourcemapping.js
+├── appsettings.Development.json
+├── appsettings.json
+├── package.json
+└── web.config
+```
+
+`Pages/`, `wwwroot/` and `abp.resourcemapping.js` exist because this project serves real UI — login pages, error pages, account management screens.
+
+## csproj at a glance
+
+| Property                        | Value                                              |
+| ------------------------------- | -------------------------------------------------- |
+| `Sdk`                           | `Microsoft.NET.Sdk.Web`                            |
+| `TargetFramework`               | `net7.0`                                           |
+| `PreserveCompilationReferences` | `true`                                             |
+| `MvcRazorExcludeRefAssembliesFromPublish` | `false`                                  |
+
+| Project / Package reference                                                                 | Purpose                                |
+| ------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `Volo.Abp.Autofac`                                                                          | Property-injection DI                  |
+| `Volo.Abp.Caching.StackExchangeRedis`                                                       | Distributed cache                      |
+| `Volo.Abp.DistributedLocking`                                                               | Distributed lock provider              |
+| `Volo.Abp.AspNetCore.Serilog`                                                               | HTTP context enrichers                 |
+| `Volo.Abp.Account.Web.OpenIddict`                                                           | OIDC server + Razor Pages              |
+| `Volo.Abp.Account.Application`                                                              | Account application services           |
+| `Volo.Abp.Account.HttpApi`                                                                  | Account API endpoints (`/api/account`) |
+| `MyCompanyName.MyProjectName.EntityFrameworkCore`                                           | Persistence (shared identity DB)       |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite` (`2.4.*-*` package)                          | Default theme                          |
+| `Microsoft.AspNetCore.DataProtection.StackExchangeRedis` (`7.0.10`)                         | Shared data-protection keyring         |
+| `DistributedLock.Redis` (`1.0.2`)                                                           | `IDistributedLockProvider`             |
+| `Serilog.AspNetCore` / `Serilog.Sinks.Async`                                                | Structured logging                     |
+
+Note that `AuthServer` does **not** reference `MyProjectName.HttpApi`, `Application`, or `Application.Contracts`. It is intentionally isolated from your business code — its only contract with the rest of the system is the OpenIddict client database it shares with `HttpApi.Host`.
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(AbpAutofacModule),
+    typeof(AbpCachingStackExchangeRedisModule),
+    typeof(AbpDistributedLockingModule),
+    typeof(AbpAccountWebOpenIddictModule),
+    typeof(AbpAccountApplicationModule),
+    typeof(AbpAccountHttpApiModule),
+    typeof(AbpAspNetCoreMvcUiLeptonXLiteThemeModule),
+    typeof(MyProjectNameEntityFrameworkCoreModule),
+    typeof(AbpAspNetCoreSerilogModule))]
+public class MyProjectNameAuthServerModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<OpenIddictBuilder>(builder =>
+        {
+            builder.AddValidation(options =>
+            {
+                options.AddAudiences("MyProjectName");
+                options.UseLocalServer();
+                options.UseAspNetCore();
+            });
+        });
+    }
+    // ConfigureServices + OnApplicationInitialization
+}
+```
+
+`UseLocalServer()` works because `AbpAccountWebOpenIddictModule` registers the OpenIddict server inside the same process — the validation handler can read keys directly from the in-memory OpenIddict configuration.
+
+### Localization, bundling, auditing
+
+```csharp
+Configure<AbpLocalizationOptions>(options =>
+{
+    options.Resources
+        .Get<MyProjectNameResource>()
+        .AddBaseTypes(typeof(AbpUiResource));
+});
+
+Configure<AbpBundlingOptions>(options =>
+{
+    options.StyleBundles.Configure(
+        LeptonXLiteThemeBundles.Styles.Global,
+        bundle => bundle.AddFiles("/global-styles.css"));
+});
+
+Configure<AbpAuditingOptions>(options =>
+{
+    options.ApplicationName = "AuthServer";
+});
+```
+
+Setting `ApplicationName = "AuthServer"` tags every audit log entry produced by this host so you can distinguish login events from API calls in `AbpAuditLogs`.
+
+### URL configuration
+
+```csharp
+Configure<AppUrlOptions>(options =>
+{
+    options.Applications["MVC"].RootUrl = configuration["App:SelfUrl"];
+    options.RedirectAllowedUrls.AddRange(
+        configuration["App:RedirectAllowedUrls"]?.Split(',') ?? Array.Empty<string>());
+    options.Applications["Angular"].RootUrl = configuration["App:ClientUrl"];
+    options.Applications["Angular"].Urls[AccountUrlNames.PasswordReset] = "account/reset-password";
+});
+```
+
+Tells the password-reset email which client to send users back to.
+
+### Background jobs disabled
+
+```csharp
+Configure<AbpBackgroundJobOptions>(options =>
+{
+    options.IsJobExecutionEnabled = false;
+});
+```
+
+This host should not execute background jobs — that responsibility belongs to a dedicated worker (or to the API host).
+
+### Data protection + distributed locking
+
+Same pattern as `HttpApi.Host`: in production keys persist to Redis, and a `RedisDistributedSynchronizationProvider` powers `IDistributedLockProvider`.
+
+### CORS
+
+```csharp
+context.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(builder =>
+    {
+        builder
+            .WithOrigins(configuration["App:CorsOrigins"]?
+                .Split(",", StringSplitOptions.RemoveEmptyEntries)
+                .Select(o => o.RemovePostFix("/")).ToArray() ?? Array.Empty<string>())
+            .WithAbpExposedHeaders()
+            .SetIsOriginAllowedToAllowWildcardSubdomains()
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials();
+    });
+});
+```
+
+`AllowCredentials()` is mandatory — the silent-renew iframe in SPA clients needs to send the authentication cookie cross-origin.
+
+### Virtual file system
+
+In development, embedded resources are replaced by physical paths inside the `framework/` and `modules/` source trees so you can edit Razor Pages and re-launch without `dotnet pack`-ing intermediate packages.
+
+## OnApplicationInitialization (the request pipeline)
+
+```csharp
+app.UseAbpRequestLocalization();
+if (!env.IsDevelopment()) app.UseErrorPage();
+app.UseCorrelationId();
+app.UseStaticFiles();
+app.UseRouting();
+app.UseCors();
+app.UseAuthentication();
+app.UseAbpOpenIddictValidation();
+
+if (MultiTenancyConsts.IsEnabled) app.UseMultiTenancy();
+
+app.UseUnitOfWork();
+app.UseAuthorization();
+app.UseAuditing();
+app.UseAbpSerilogEnrichers();
+app.UseConfiguredEndpoints();
+```
+
+The pipeline is intentionally identical to `HttpApi.HostWithIds`, minus the Swagger middleware (there is no API documentation to expose here).
+
+## appsettings.json
+
+```json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44301",
+    "ClientUrl": "http://localhost:4200",
+    "CorsOrigins": "https://*.MyProjectName.com,http://localhost:4200,https://localhost:44307,https://localhost:44300",
+    "RedirectAllowedUrls": "http://localhost:4200,https://localhost:44302,https://localhost:44307,https://localhost:44309"
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(LocalDb)\\MSSQLLocalDB;Database=MyProjectName;Trusted_Connection=True;TrustServerCertificate=True"
+  },
+  "Redis": { "Configuration": "127.0.0.1" },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+The `RedirectAllowedUrls` list explicitly enumerates every URL that may receive the post-login redirect — `44302` (Web), `44307` (Blazor WASM), `44309` (Blazor Server Tiered), plus the Angular SPA at `4200`. Any client URL missing from this list is rejected with `OpenIddictException: invalid redirect_uri`.
+
+## OpenIddict client seeding
+
+Client records are seeded by `OpenIddictDataSeedContributor` in `Domain` using the configuration in `DbMigrator/appsettings.json`:
+
+```json
+"OpenIddict": {
+  "Applications": {
+    "MyProjectName_Web":               { "ClientId": "MyProjectName_Web",               "ClientSecret": "1q2w3e*", "RootUrl": "https://localhost:44302" },
+    "MyProjectName_Blazor":            { "ClientId": "MyProjectName_Blazor",                                      "RootUrl": "https://localhost:44307" },
+    "MyProjectName_App":               { "ClientId": "MyProjectName_App",                                         "RootUrl": "http://localhost:4200"  },
+    "MyProjectName_BlazorServerTiered":{ "ClientId": "MyProjectName_BlazorServerTiered", "ClientSecret": "1q2w3e*", "RootUrl": "https://localhost:44309" },
+    "MyProjectName_Swagger":           { "ClientId": "MyProjectName_Swagger",                                      "RootUrl": "https://localhost:44305" }
+  }
+}
+```
+
+A confidential client (Hybrid flow) has a `ClientSecret`; a public client (PKCE) does not. The contributor uses the existence of the secret to pick the correct grant types.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Branded login UI                      | Override `Pages/Account/Login.cshtml` (copies the layout from `Volo.Abp.Account.Web`) |
+| Custom branding                       | `MyProjectNameBrandingProvider`                                  |
+| Add an external provider (Google, AAD)| `services.AddAuthentication().AddGoogle(...)` in `ConfigureServices` |
+| Rotate signing keys                   | `OpenIddictBuilder.AddServer(b => b.AddSigningCertificate(...))` |
+| Persistent encryption certificate     | `OpenIddictBuilder.AddServer(b => b.AddEncryptionCertificate(...))` |
+| Enable refresh-token rotation         | `OpenIddictBuilder.AddServer(b => b.RegisterScopes("offline_access").UseRollingRefreshTokens())` |
+
+## Gotchas
+
+- **Development uses ephemeral keys.** `AbpAccountWebOpenIddictModule` registers ephemeral signing and encryption keys when no certificates are configured — restart the host and existing tokens become invalid. Provision real X.509 certificates for staging/production via the `OpenIddictBuilder.AddServer` extension.
+- **Redis is required across replicas.** Without a shared data-protection keyring, replica A signs the antiforgery token but replica B cannot validate it, causing intermittent login failures.
+- **`AbpBackgroundJobOptions.IsJobExecutionEnabled = false` is intentional.** This host has the application contracts assembly loaded transitively but should not pick up scheduled jobs. If you turn it back on you risk running expensive jobs on what should be a hot login path.
+- **Client redirect URIs are *case-sensitive*.** `https://localhost:44307/` and `https://localhost:44307` are treated differently by OpenIddict. Make sure the URL in the seed file ends with `/` (the contributor calls `.EnsureEndsWith('/')` on `RootUrl`).
+- **No HTTP API surface here.** Don't try to add `MyProjectNameApplicationModule` as a dependency — you would end up authorizing API calls inside a process that is also the issuer, which is the exact scenario `HttpApi.HostWithIds` covers. Choose one host model.
+- **`CorsOrigins` must include every Web/Blazor/SPA self-URL.** Missing the Angular dev URL produces a CORS failure during silent-renew that surfaces in the browser console as `Refused to display...` without any server log entry.
+- **`MultiTenancyConsts.IsEnabled = false` removes the tenant switch from the login UI** but does **not** remove the tenant cookie middleware from the pipeline. Both are gated by the same boolean so behaviour stays consistent.

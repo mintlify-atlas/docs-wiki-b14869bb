@@ -1,0 +1,337 @@
+---
+title: "Volo.Abp.Sms: ISmsSender abstraction and providers"
+sidebarTitle: "SMS"
+description: "The Volo.Abp.Sms module ships ISmsSender, SmsMessage, and a NullSmsSender — plus Volo.Abp.Sms.Aliyun as a reference provider implementation."
+---
+
+`Volo.Abp.Sms` is the smallest module in the ABP framework — five files defining a one-method interface, a DTO with a property bag, a no-op default, and an extension. There is no template engine, no queue, no retry policy. By design: SMS providers differ wildly (template IDs, signed sender names, region-specific compliance) so the abstraction is *just* "send this text to that phone number" and provider modules layer their semantics on top via the `Properties` dictionary.
+
+ABP v7.4.0 ships one concrete provider in `Volo.Abp.Sms.Aliyun`. This page documents both, plus the recipe for writing your own (Twilio, Vonage/Nexmo, AWS SNS, etc.).
+
+## Package layout
+
+```text framework/src/Volo.Abp.Sms/
+Volo/Abp/Sms/
+  AbpSmsModule.cs
+  ISmsSender.cs
+  NullSmsSender.cs
+  SmsMessage.cs
+  SmsSenderExtensions.cs
+
+framework/src/Volo.Abp.Sms.Aliyun/
+Volo/Abp/Sms/Aliyun/
+  AbpAliyunSmsOptions.cs
+  AbpSmsAliyunModule.cs
+  AliyunSmsSender.cs
+```
+
+## Key abstractions
+
+| Type | Role |
+|------|------|
+| `ISmsSender` | One method: `Task SendAsync(SmsMessage)`. |
+| `SmsMessage` | Immutable `PhoneNumber` + `Text` + mutable `Properties` dictionary. |
+| `NullSmsSender` | Singleton fallback that logs warnings instead of sending. |
+| `SmsSenderExtensions.SendAsync` | Convenience overload: `ISmsSender.SendAsync(phoneNumber, text)`. |
+| `AbpSmsModule` | Empty module — references guarantee assembly is loaded. |
+
+## The contract
+
+```csharp framework/src/Volo.Abp.Sms/ISmsSender.cs
+public interface ISmsSender
+{
+    Task SendAsync(SmsMessage smsMessage);
+}
+```
+
+```csharp framework/src/Volo.Abp.Sms/SmsMessage.cs
+public class SmsMessage
+{
+    public string PhoneNumber { get; }
+    public string Text { get; }
+    public IDictionary<string, object> Properties { get; }
+
+    public SmsMessage([NotNull] string phoneNumber, [NotNull] string text)
+    {
+        PhoneNumber = Check.NotNullOrWhiteSpace(phoneNumber, nameof(phoneNumber));
+        Text = Check.NotNullOrWhiteSpace(text, nameof(text));
+        Properties = new Dictionary<string, object>();
+    }
+}
+```
+
+`Properties` is the escape hatch. Provider implementations read keys like `"SignName"`, `"TemplateCode"`, `"TwilioFrom"`, `"MessagingServiceSid"`, etc., to fill provider-specific fields. The base SMS abstraction stays clean and providers don't have to define their own message types.
+
+## The convenience extension
+
+```csharp framework/src/Volo.Abp.Sms/SmsSenderExtensions.cs
+public static class SmsSenderExtensions
+{
+    public static Task SendAsync([NotNull] this ISmsSender smsSender,
+        [NotNull] string phoneNumber, [NotNull] string text)
+    {
+        Check.NotNull(smsSender, nameof(smsSender));
+        return smsSender.SendAsync(new SmsMessage(phoneNumber, text));
+    }
+}
+```
+
+Most callers use this overload:
+
+```csharp
+await SmsSender.SendAsync(user.PhoneNumber, $"Your verification code is {code}.");
+```
+
+## The null fallback
+
+```csharp framework/src/Volo.Abp.Sms/NullSmsSender.cs
+[Dependency(TryRegister = true)]
+public class NullSmsSender : ISmsSender, ISingletonDependency
+{
+    public ILogger<NullSmsSender> Logger { get; set; } = NullLogger<NullSmsSender>.Instance;
+
+    public Task SendAsync(SmsMessage smsMessage)
+    {
+        Logger.LogWarning($"SMS Sending was not implemented! Using {nameof(NullSmsSender)}:");
+        Logger.LogWarning("Phone Number : " + smsMessage.PhoneNumber);
+        Logger.LogWarning("SMS Text     : " + smsMessage.Text);
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+`[Dependency(TryRegister = true)]` is the important attribute — it registers the null sender only if nothing else registers `ISmsSender` first. So adding `Volo.Abp.Sms.Aliyun` (or your custom provider) automatically wins.
+
+## Aliyun (Alibaba Cloud Dysmsapi) provider
+
+```csharp framework/src/Volo.Abp.Sms.Aliyun/AliyunSmsSender.cs
+public class AliyunSmsSender : ISmsSender, ITransientDependency
+{
+    protected AbpAliyunSmsOptions Options { get; }
+
+    public AliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> options)
+    {
+        Options = options.CurrentValue;
+    }
+
+    public async Task SendAsync(SmsMessage smsMessage)
+    {
+        var client = CreateClient();
+
+        await client.SendSmsAsync(new AliyunSendSmsRequest
+        {
+            PhoneNumbers = smsMessage.PhoneNumber,
+            SignName = smsMessage.Properties.GetOrDefault("SignName") as string,
+            TemplateCode = smsMessage.Properties.GetOrDefault("TemplateCode") as string,
+            TemplateParam = smsMessage.Text
+        });
+    }
+
+    protected virtual AliyunClient CreateClient()
+    {
+        return new(new AliyunConfig
+        {
+            AccessKeyId = Options.AccessKeyId,
+            AccessKeySecret = Options.AccessKeySecret,
+            Endpoint = Options.EndPoint
+        });
+    }
+}
+```
+
+Notice how `Text` is mapped to `TemplateParam` — Aliyun sends *template-based* SMS, not free text. The "message text" in ABP's abstraction becomes the JSON parameter object Aliyun expects (e.g., `"{\"code\":\"123456\"}"`).
+
+### Options
+
+```csharp framework/src/Volo.Abp.Sms.Aliyun/AbpAliyunSmsOptions.cs
+public class AbpAliyunSmsOptions
+{
+    public string AccessKeySecret { get; set; } = default!;
+    public string AccessKeyId { get; set; } = default!;
+    public string EndPoint { get; set; } = default!;
+}
+```
+
+### Calling pattern
+
+```csharp
+var msg = new SmsMessage(
+    phoneNumber: "+8613800138000",
+    text: "{\"code\":\"123456\"}"); // TemplateParam JSON
+msg.Properties.Add("SignName", "Contoso");
+msg.Properties.Add("TemplateCode", "SMS_123456789");
+
+await _smsSender.SendAsync(msg);
+```
+
+Or wrapped in your own helper that knows the templates:
+
+```csharp
+public class OtpService
+{
+    private readonly ISmsSender _sms;
+    public OtpService(ISmsSender sms) => _sms = sms;
+
+    public Task SendOtpAsync(string phoneNumber, string code)
+    {
+        var msg = new SmsMessage(phoneNumber, $"{{\"code\":\"{code}\"}}");
+        msg.Properties.Add("SignName", "Contoso");
+        msg.Properties.Add("TemplateCode", "SMS_OTP_001");
+        return _sms.SendAsync(msg);
+    }
+}
+```
+
+## Writing a Twilio provider
+
+The same pattern adapts to Twilio (free-text SMS, no template required):
+
+```csharp
+public class TwilioSmsSender : ISmsSender, ITransientDependency
+{
+    private readonly AbpTwilioSmsOptions _options;
+
+    public TwilioSmsSender(IOptionsMonitor<AbpTwilioSmsOptions> options)
+    {
+        _options = options.CurrentValue;
+        TwilioClient.Init(_options.AccountSid, _options.AuthToken);
+    }
+
+    public async Task SendAsync(SmsMessage smsMessage)
+    {
+        var from = smsMessage.Properties.GetOrDefault("From") as string ?? _options.DefaultFrom;
+
+        await MessageResource.CreateAsync(
+            to: new PhoneNumber(smsMessage.PhoneNumber),
+            from: new PhoneNumber(from),
+            body: smsMessage.Text);
+    }
+}
+
+public class AbpTwilioSmsOptions
+{
+    public string AccountSid { get; set; } = default!;
+    public string AuthToken { get; set; } = default!;
+    public string DefaultFrom { get; set; } = default!;
+}
+
+[DependsOn(typeof(AbpSmsModule))]
+public class AbpSmsTwilioModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpTwilioSmsOptions>(configuration.GetSection("AbpTwilioSms"));
+    }
+}
+```
+
+Because `NullSmsSender` uses `[Dependency(TryRegister = true)]`, simply having `AbpSmsTwilioModule` in the module graph causes the Twilio sender to win — no explicit `Replace` call needed.
+
+## Integration test pattern
+
+The Aliyun tests show the canonical shape: `AbpIntegratedTest<TStartup>` plus a tiny test module that depends on the provider module and binds options from `appsettings.json`:
+
+```csharp framework/test/Volo.Abp.Sms.Aliyun.Tests/AbpSmsAliyunTestBase.cs
+public class AbpSmsAliyunTestBase : AbpIntegratedTest<AbpSmsAliyunTestsModule>
+{
+    protected override void SetAbpApplicationCreationOptions(AbpApplicationCreationOptions options)
+    {
+        options.UseAutofac();
+    }
+}
+```
+
+```csharp framework/test/Volo.Abp.Sms.Aliyun.Tests/AbpSmsAliyunTestsModule.cs
+[DependsOn(typeof(AbpSmsAliyunModule))]
+public class AbpSmsAliyunTestsModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpAliyunSmsOptions>(configuration.GetSection("AbpAliyunSms"));
+    }
+}
+```
+
+```csharp framework/test/Volo.Abp.Sms.Aliyun.Tests/AliyunSmsSender_Tests.cs
+public class AliyunSmsSender_Tests : AbpSmsAliyunTestBase
+{
+    [Fact]
+    public async Task SendSms_Test()
+    {
+        var config = _configuration.GetSection("AbpAliyunSms");
+        if (config["AccessKeyId"] == "<Enter your AccessKeyId from Aliyun>") return;
+
+        var msg = new SmsMessage(config["TargetPhoneNumber"], config["TemplateParam"]);
+        msg.Properties.Add("SignName", config["SignName"]);
+        msg.Properties.Add("TemplateCode", config["TemplateCode"]);
+
+        await _smsSender.SendAsync(msg);
+    }
+}
+```
+
+The conditional `return` lets the test live in CI without real credentials.
+
+## When to add a queue
+
+`ISmsSender` is synchronous. If you need durability (don't lose messages on crash) or rate-limiting (provider quotas), wrap a sender with a background job:
+
+```csharp
+public class QueuedSmsArgs
+{
+    public string PhoneNumber { get; set; } = default!;
+    public string Text { get; set; } = default!;
+    public Dictionary<string, object>? Properties { get; set; }
+}
+
+public class QueuedSmsJob : AsyncBackgroundJob<QueuedSmsArgs>, ITransientDependency
+{
+    private readonly ISmsSender _sender;
+    public QueuedSmsJob(ISmsSender sender) => _sender = sender;
+
+    public override async Task ExecuteAsync(QueuedSmsArgs args)
+    {
+        var msg = new SmsMessage(args.PhoneNumber, args.Text);
+        if (args.Properties != null)
+            foreach (var (k, v) in args.Properties) msg.Properties[k] = v;
+
+        await _sender.SendAsync(msg);
+    }
+}
+```
+
+Then call `_jobs.EnqueueAsync(new QueuedSmsArgs { ... })` instead of `_sms.SendAsync(...)` for fire-and-forget paths.
+
+## Gotchas
+
+<Warning>
+  `SmsMessage.Properties` is `IDictionary<string,object>`. Provider implementations cast freely (`as string`) and silently fall through to `null` on miscast — so a typo in the property key gives you `null SignName` and an opaque API error.
+</Warning>
+
+<Warning>
+  `NullSmsSender` is `ISingletonDependency` with `[Dependency(TryRegister = true)]`. If you provide your own sender with `ITransientDependency` but forget to reference the provider module, the null fallback wins and your OTPs vanish into the log.
+</Warning>
+
+<Note>
+  There is **no** message-template engine in `Volo.Abp.Sms`. Some providers (Aliyun) require template IDs server-side; others (Twilio) accept free text. Centralize template selection in your own service, not in `ISmsSender`.
+</Note>
+
+## Cross-links
+
+<CardGroup cols={2}>
+  <Card title="Emailing module" icon="envelope" href="/framework/messaging/emailing">
+    Parallel abstraction with background queuing built in.
+  </Card>
+  <Card title="Mailgun guidance" icon="envelope-open" href="/framework/messaging/emailing-mailgun">
+    The same registration pattern applied to email.
+  </Card>
+  <Card title="Background jobs" icon="clock" href="/framework/background/background-jobs">
+    Wrap ISmsSender in a job for durability and retries.
+  </Card>
+  <Card title="Settings" icon="sliders" href="/framework/core/settings">
+    Store provider credentials as ABP settings.
+  </Card>
+</CardGroup>

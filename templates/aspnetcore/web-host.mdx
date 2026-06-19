@@ -1,0 +1,256 @@
+---
+title: "Web.Host Project"
+description: "Tiered MVC host that consumes the HTTP API and AuthServer through OpenID Connect — the UI tier of the split (tiered) ASP.NET Core MVC solution."
+---
+
+`MyCompanyName.MyProjectName.Web.Host` is the **UI tier** of the tiered MVC template. It is generated when you pass `--tiered` to `abp new ... -u mvc`. It hosts the same Razor Pages and menu contributors as the non-tiered [Web](/templates/aspnetcore/web) project, but talks to the application services over HTTP through `HttpApi.Client` rather than calling them in-process.
+
+The accompanying `HttpApi.Host` and `AuthServer` projects must be running for this host to operate; the architecture is:
+
+```
+Browser  ⇄  Web.Host (this project, port 44302)
+                    ⇄ AuthServer (port 44301) via OpenID Connect (Authorization Code + PKCE)
+                    ⇄ HttpApi.Host (port 44300) via HTTP, access token forwarded
+```
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.Web.Host/
+├── Components/
+│   └── ...
+├── Controllers/
+│   └── ...
+├── Menus/
+│   ├── MyProjectNameMenuContributor.cs
+│   └── MyProjectNameMenus.cs
+├── Pages/
+│   └── ...
+├── Properties/
+│   └── launchSettings.json
+├── Views/
+│   └── ...
+├── wwwroot/
+│   └── ...
+├── MyCompanyName.MyProjectName.Web.Host.csproj
+├── MyProjectNameBrandingProvider.cs
+├── MyProjectNameWebAutoMapperProfile.cs
+├── MyProjectNameWebModule.cs
+├── Program.cs
+├── abp.resourcemapping.js
+├── appsettings.Development.json
+├── appsettings.json
+├── package.json
+└── web.config
+```
+
+## csproj at a glance
+
+| Property                        | Value                                              |
+| ------------------------------- | -------------------------------------------------- |
+| `Sdk`                           | `Microsoft.NET.Sdk.Web`                            |
+| `TargetFramework`               | `net7.0`                                           |
+| `RootNamespace`                 | `MyCompanyName.MyProjectName.Web`                  |
+| `PreserveCompilationReferences` | `true`                                             |
+
+| Project / Package reference                                                                 | Purpose                                |
+| ------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `Volo.Abp.Autofac`                                                                          | Property-injection DI                  |
+| `Volo.Abp.Caching.StackExchangeRedis`                                                       | Distributed cache                      |
+| `Volo.Abp.DistributedLocking`                                                               | Distributed lock provider              |
+| `Volo.Abp.AspNetCore.Mvc.Client`                                                            | UI-side MVC client integration         |
+| `Volo.Abp.AspNetCore.Authentication.OpenIdConnect`                                          | OIDC client middleware                 |
+| `Volo.Abp.Http.Client.Web`                                                                  | Token-acquisition for HttpClient        |
+| `Volo.Abp.AspNetCore.Serilog`                                                               | HTTP context enrichers                 |
+| `Volo.Abp.Http.Client.IdentityModel.Web`                                                    | Client-credentials helpers              |
+| `Volo.Abp.Swashbuckle`                                                                      | Swagger UI                              |
+| `Volo.Abp.Identity.Web`                                                                     | User/role admin UI                      |
+| `Volo.Abp.TenantManagement.Web`                                                             | Tenant admin UI                         |
+| `Volo.Abp.SettingManagement.Web`                                                            | Settings UI                             |
+| `MyCompanyName.MyProjectName.HttpApi.Client`                                                | HTTP proxy implementations             |
+| `MyCompanyName.MyProjectName.HttpApi`                                                       | Manual controllers + base               |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonXLite` (`2.4.*-*`)                                  | Default theme                           |
+| `Microsoft.AspNetCore.DataProtection.StackExchangeRedis` (`7.0.10`)                         | Shared keyring                          |
+| `DistributedLock.Redis` (`1.0.2`)                                                           | Distributed lock primitive              |
+| `Serilog.AspNetCore` / `Serilog.Sinks.Async`                                                | Structured logging                      |
+
+`Web.Host` does **not** reference `Application` or `EntityFrameworkCore`. The application services are reached exclusively through `HttpApi.Client` — that is the entire point of the tiered model.
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameHttpApiClientModule),
+    typeof(MyProjectNameHttpApiModule),
+    typeof(AbpAspNetCoreAuthenticationOpenIdConnectModule),
+    typeof(AbpAspNetCoreMvcClientModule),
+    typeof(AbpHttpClientWebModule),
+    typeof(AbpAspNetCoreMvcUiLeptonXLiteThemeModule),
+    typeof(AbpAutofacModule),
+    typeof(AbpCachingStackExchangeRedisModule),
+    typeof(AbpDistributedLockingModule),
+    typeof(AbpSettingManagementWebModule),
+    typeof(AbpHttpClientIdentityModelWebModule),
+    typeof(AbpIdentityWebModule),
+    typeof(AbpTenantManagementWebModule),
+    typeof(AbpAspNetCoreSerilogModule),
+    typeof(AbpSwashbuckleModule))]
+public class MyProjectNameWebModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpMvcDataAnnotationsLocalizationOptions>(options =>
+        {
+            options.AddAssemblyResource(
+                typeof(MyProjectNameResource),
+                typeof(MyProjectNameDomainSharedModule).Assembly,
+                typeof(MyProjectNameApplicationContractsModule).Assembly,
+                typeof(MyProjectNameWebModule).Assembly);
+        });
+    }
+    // ConfigureServices, OnApplicationInitialization
+}
+```
+
+Notice the smaller assembly list passed to `AddAssemblyResource`: there is **no Domain or Application reference** because this host never sees those assemblies. Validation messages for DTOs still resolve because `MyProjectNameApplicationContractsModule` contains the localization markers.
+
+### Authentication
+
+```csharp
+context.Services.AddAuthentication(options =>
+    {
+        options.DefaultScheme = "Cookies";
+        options.DefaultChallengeScheme = "oidc";
+    })
+    .AddCookie("Cookies", options =>
+    {
+        options.ExpireTimeSpan = TimeSpan.FromDays(365);
+        options.CheckTokenExpiration();
+    })
+    .AddAbpOpenIdConnect("oidc", options =>
+    {
+        options.Authority = configuration["AuthServer:Authority"];
+        options.RequireHttpsMetadata = Convert.ToBoolean(configuration["AuthServer:RequireHttpsMetadata"]);
+        options.ResponseType = OpenIdConnectResponseType.CodeIdToken;
+        options.ClientId = configuration["AuthServer:ClientId"];
+        options.ClientSecret = configuration["AuthServer:ClientSecret"];
+        options.UsePkce = true;
+        options.SaveTokens = true;
+        options.GetClaimsFromUserInfoEndpoint = true;
+        options.Scope.Add("roles");
+        options.Scope.Add("email");
+        options.Scope.Add("phone");
+        options.Scope.Add("MyProjectName");
+    });
+```
+
+The cookie is the **session container** (long-lived, 365 days), the OIDC handler is the **login mechanism**. `CheckTokenExpiration` is an ABP extension that refreshes the cookie if the underlying access token has expired but the refresh token is still valid.
+
+`SaveTokens = true` is the critical line — without it the access token cannot be re-read later to forward to the API tier.
+
+`GetClaimsFromUserInfoEndpoint = true` fetches `email`, `phone`, etc. after a successful login so the cookie contains the full user profile.
+
+### URLs, cache, bundles
+
+```csharp
+Configure<AppUrlOptions>(options =>
+{
+    options.Applications["MVC"].RootUrl = configuration["App:SelfUrl"];
+});
+
+Configure<AbpDistributedCacheOptions>(options =>
+{
+    options.KeyPrefix = "MyProjectName:";
+});
+
+Configure<AbpBundlingOptions>(options =>
+{
+    options.StyleBundles.Configure(
+        LeptonXLiteThemeBundles.Styles.Global,
+        bundle => bundle.AddFiles("/global-styles.css"));
+});
+```
+
+### Multi-tenancy
+
+```csharp
+Configure<AbpMultiTenancyOptions>(options =>
+{
+    options.IsEnabled = MultiTenancyConsts.IsEnabled;
+});
+```
+
+The tenant resolver lives in `Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy` (transitively pulled in by the theme module). The cookie-based tenant selection persists across the OIDC round trip because the cookie domain is the Web.Host URL.
+
+### Data protection + distributed locking
+
+Same Redis-backed pattern as the other hosts. Mandatory whenever you scale this Web.Host horizontally because the cookie's protection keys must be shared.
+
+## OnApplicationInitialization
+
+```csharp
+app.UseAbpRequestLocalization();
+if (!env.IsDevelopment()) app.UseErrorPage();
+app.UseCorrelationId();
+app.UseStaticFiles();
+app.UseRouting();
+app.UseAuthentication();
+if (MultiTenancyConsts.IsEnabled) app.UseMultiTenancy();
+app.UseUnitOfWork();
+app.UseAuthorization();
+app.UseSwagger();
+app.UseAbpSwaggerUI(...);
+app.UseAuditing();
+app.UseAbpSerilogEnrichers();
+app.UseConfiguredEndpoints();
+```
+
+There is no `UseAbpOpenIddictValidation()` here — this host is a **client**, not a validator. Bearer tokens are not accepted; cookies are.
+
+## appsettings.json
+
+```json
+{
+  "App": {
+    "SelfUrl": "https://localhost:44302"
+  },
+  "RemoteServices": {
+    "Default": { "BaseUrl": "https://localhost:44300/" }
+  },
+  "Redis": { "Configuration": "127.0.0.1" },
+  "AuthServer": {
+    "Authority": "https://localhost:44301",
+    "RequireHttpsMetadata": "true",
+    "ClientId": "MyProjectName_Web",
+    "ClientSecret": "1q2w3e*"
+  },
+  "StringEncryption": {
+    "DefaultPassPhrase": "gsKnGZ041HLL4IM8"
+  }
+}
+```
+
+- `RemoteServices.Default.BaseUrl` — the URL of `HttpApi.Host`. Every HttpClient proxy from `MyProjectNameHttpApiClientModule` targets this base.
+- `AuthServer.Authority` — the URL of the standalone `AuthServer`.
+- `AuthServer.ClientId` / `ClientSecret` — confidential client credentials. The seed file in `DbMigrator/appsettings.json` registers `MyProjectName_Web` with `ClientSecret: "1q2w3e*"`.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Custom menu                           | `Menus/MyProjectNameMenuContributor`                              |
+| Custom branding                       | `MyProjectNameBrandingProvider`                                  |
+| Add an OAuth scope                    | `options.Scope.Add("...")` in `ConfigureAuthentication`           |
+| Extend cookie lifetime                | `options.ExpireTimeSpan = TimeSpan.FromDays(N)` in the cookie handler |
+| Custom HttpClient base path           | `RemoteServices.Default.BaseUrl` in `appsettings.json`           |
+| Forward additional claims             | `OnTokenValidated` event on the OIDC handler                     |
+
+## Gotchas
+
+- **Cookies require Redis-backed Data Protection to scale.** Without a shared keyring, replica A signs the cookie and replica B rejects it.
+- **`SaveTokens = true` puts the access token in the cookie.** Cookies expand quickly — keep request size limits high on any reverse proxy in front of the host. Without `SaveTokens` the HttpClient proxies cannot forward the access token to the API host.
+- **`ClientSecret` is confidential.** Use User Secrets locally and a secret store (Azure Key Vault, AWS Parameter Store) in production. Committing it to `appsettings.json` works for the template demo but is unsafe.
+- **The OIDC handler does NOT honour `AppUrlOptions["Angular"]`.** That URL is only used by the AuthServer when sending password-reset emails to Angular SPA users. If your tiered MVC users live on a different DNS, set `App:SelfUrl` accordingly *and* add the URL to `RedirectAllowedUrls` in `AuthServer/appsettings.json`.
+- **There is no `EntityFrameworkCore` reference.** Trying to inject `IRepository<Book>` here fails at startup. All data access must go through the application service interfaces resolved as HTTP proxies.
+- **Tenant cookie domain.** When the AuthServer and Web.Host are on different subdomains (e.g. `auth.example.com` and `app.example.com`) the tenant cookie has to be domain-scoped — configure `AbpMultiTenancyCookieOptions.CookieDomain = ".example.com"` to keep tenant selection across the OIDC round trip.
+- **No `Volo.Abp.Account.Web` reference here.** Trying to load `/Account/Login` will 404 because the login pages live on the AuthServer. The OIDC handler redirects users there automatically.

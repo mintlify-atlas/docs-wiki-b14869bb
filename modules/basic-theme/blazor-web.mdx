@@ -1,0 +1,431 @@
+---
+title: "Basic Theme — Blazor Web (Shared Components & Blazor Web App)"
+sidebarTitle: "Blazor Web"
+description: "Walkthrough of Volo.Abp.AspNetCore.Components.Web.BasicTheme — the shared Razor Class Library that contains MainLayout, NavMenu, Branding, NavToolbar, and the routing components used by both Blazor Server and Blazor WebAssembly, plus how the .NET 8+ Blazor Web App host wires them together."
+---
+
+`Volo.Abp.AspNetCore.Components.Web.BasicTheme` is the **shared Razor Class Library** that every Blazor variant of the [Basic Theme](/modules/basic-theme/overview) consumes. It contains the actual UI — `MainLayout`, `NavMenu`, `Branding`, `NavToolbar`, the per-level menu item components, `App.razor` and the auth-free `AppWithoutAuth.razor`, `RedirectToLogin`, and the `BasicTheme : ITheme` implementation. The Server and WebAssembly packages each depend on this library and add only the hosting-mode-specific pieces (auth-aware Login/Language components, bundle contributors, router options).
+
+This page also covers the **Blazor Web App** host model introduced in .NET 8, where a single ASP.NET Core host serves static SSR, interactive Server, and interactive WebAssembly render modes in the same project. The Basic theme has no dedicated `BlazorWebApp` NuGet package — the host simply references both the Server and (optionally) WebAssembly theme packages and lets the render-mode attribute decide which one renders each component.
+
+## Module wiring
+
+```csharp
+[DependsOn(typeof(AbpAspNetCoreComponentsWebThemingModule))]
+public class AbpAspNetCoreComponentsWebBasicThemeModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpThemingOptions>(options =>
+        {
+            options.Themes.Add<BasicTheme>();
+            if (options.DefaultThemeName == null)
+                options.DefaultThemeName = BasicTheme.Name;
+        });
+    }
+}
+```
+
+The shared module is intentionally small — it only registers the theme. It does **not** configure toolbars or bundles, because those are render-mode-specific concerns delegated to the Server and WebAssembly packages.
+
+## `BasicTheme : ITheme`
+
+```csharp
+[ThemeName(Name)]
+public class BasicTheme : ITheme, ITransientDependency
+{
+    public const string Name = "Basic";
+
+    public virtual Type GetLayout(string name, bool fallbackToDefault = true)
+    {
+        switch (name)
+        {
+            case StandardLayouts.Application:
+            case StandardLayouts.Account:
+            case StandardLayouts.Empty:
+                return typeof(MainLayout);
+            default:
+                return fallbackToDefault ? typeof(MainLayout) : typeof(NullLayout);
+        }
+    }
+}
+```
+
+All three standard layout names resolve to `typeof(MainLayout)`. There is no per-layout component — Blazor's reactive nature lets a single layout adapt at render time to the kind of page it is hosting. `NullLayout` is a placeholder for the "no layout, fallback disabled" path; it renders only `@Body` and is used by the framework when an unrecognised layout name comes through with `fallbackToDefault: false`.
+
+## File inventory
+
+Under `modules/basic-theme/src/Volo.Abp.AspNetCore.Components.Web.BasicTheme/`:
+
+| Path | Role |
+| --- | --- |
+| `AbpAspNetCoreComponentsWebBasicThemeModule.cs` | Module class (above). |
+| `BasicTheme.cs` | `ITheme` implementation. |
+| `Navigation/BasicThemeNavigationExtensions.cs` | `UseComponent` / `GetComponentTypeOrDefault` extension on `ApplicationMenuItem` — lets a menu item render a custom Razor component instead of an `<a href>`. |
+| `Themes/Basic/App.razor` | Top-level `<Router>` wrapped in `<CascadingAuthenticationState>`. |
+| `Themes/Basic/AppWithoutAuth.razor` | Same as `App.razor` but without auth. Used by hosts without an `AuthenticationStateProvider`. |
+| `Themes/Basic/MainLayout.razor(.cs)` | The single layout — dark navbar, container body, alert / toast / progress overlays. |
+| `Themes/Basic/Branding.razor` | Logo + app name. |
+| `Themes/Basic/NavMenu.razor(.cs)` | Top-level menu, fetches `IMenuManager.GetMainMenuAsync()`. |
+| `Themes/Basic/NavToolbar.razor(.cs)` | Renders the right-side toolbar from `IToolbarManager`. |
+| `Themes/Basic/FirstLevelNavMenuItem.razor(.cs)` | Top-level menu item with dropdown support. |
+| `Themes/Basic/SecondLevelNavMenuItem.razor(.cs)` | Nested dropdown menu item, recursively renders deeper levels. |
+| `Themes/Basic/NullLayout.razor` | Empty layout for the fallback path. |
+| `Themes/Basic/RedirectToLogin.razor` | Forces a full-page navigation to `/account/login?returnUrl=...`. |
+| `Themes/Basic/_Imports.razor` | Common `@using` declarations. |
+| `libs/abp/css/theme.css` | The theme CSS file consumed by every host package. |
+
+## `App.razor` — the top-level router
+
+```razor
+@using Microsoft.Extensions.Options
+@using Volo.Abp.AspNetCore.Components.Web.Theming.Routing
+@inject IOptions<AbpRouterOptions> RouterOptions
+
+<CascadingAuthenticationState>
+    <Router AppAssembly="RouterOptions.Value.AppAssembly"
+            AdditionalAssemblies="RouterOptions.Value.AdditionalAssemblies">
+        <Found Context="routeData">
+            <AuthorizeRouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)">
+                <NotAuthorized>
+                    @if (!context.User.Identity.IsAuthenticated)
+                    {
+                        <RedirectToLogin />
+                    }
+                    else
+                    {
+                        <p>You are not authorized to access this resource.</p>
+                    }
+                </NotAuthorized>
+            </AuthorizeRouteView>
+        </Found>
+        <NotFound>
+            <LayoutView Layout="@typeof(MainLayout)">
+                <p>Sorry, there's nothing at this address.</p>
+            </LayoutView>
+        </NotFound>
+    </Router>
+</CascadingAuthenticationState>
+```
+
+Three things worth knowing:
+
+1. The `Router`'s assembly list comes from `AbpRouterOptions.AppAssembly` and `AdditionalAssemblies`. Module packages append their own assemblies via:
+   ```csharp
+   Configure<AbpRouterOptions>(options =>
+   {
+       options.AdditionalAssemblies.Add(typeof(MyBlazorModule).Assembly);
+   });
+   ```
+   This is how modules contribute their `[Route]`-attributed components without the host having to enumerate them.
+
+2. `<NotAuthorized>` distinguishes "not signed in" (→ `<RedirectToLogin />`) from "signed in but forbidden" (→ a plain "Not authorised" message). Override this branch in a custom `App.razor` to localise the 403 message.
+
+3. `<AuthorizeRouteView>` is used unconditionally — every route is treated as if it may carry an `[Authorize]` attribute, even unauthenticated ones (the attribute simply does not require authentication). This is more permissive than `<RouteView>` and slightly more expensive.
+
+For hosts without authentication (rare — public-only marketing site rendered in Blazor) the package ships `AppWithoutAuth.razor`:
+
+```razor
+<Router AppAssembly="RouterOptions.Value.AppAssembly"
+        AdditionalAssemblies="RouterOptions.Value.AdditionalAssemblies">
+    <Found Context="routeData">
+        <RouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)" />
+    </Found>
+    <NotFound>
+        <LayoutView Layout="@typeof(MainLayout)">
+            <p>Sorry, there's nothing at this address.</p>
+        </LayoutView>
+    </NotFound>
+</Router>
+```
+
+Pick one or the other in the host's `_Host.cshtml` / `App.razor`. The default ABP Blazor templates use `App.razor`.
+
+## `MainLayout.razor`
+
+```razor
+@using Volo.Abp.Ui.LayoutHooks
+@using Volo.Abp.AspNetCore.Components.Web.Theming.Components.LayoutHooks
+@using Volo.Abp.AspNetCore.Components.Web.Theming.Components
+@inherits LayoutComponentBase
+<nav class="navbar navbar-expand-md navbar-dark bg-dark shadow-sm flex-column flex-md-row mb-4"
+     id="main-navbar" style="min-height: 4rem;">
+    <div class="container">
+        <Branding />
+        <button @onclick="ToggleCollapse" class="navbar-toggler" type="button"
+                data-bs-toggle="collapse" data-bs-target="#main-navbar-collapse"
+                aria-controls="main-navbar-collapse" aria-expanded="false"
+                aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse @(IsCollapseShown ? "show" : "")"
+             id="main-navbar-collapse">
+            <ul class="navbar-nav mx-auto">
+                <NavMenu />
+            </ul>
+            <NavToolbar />
+        </div>
+    </div>
+</nav>
+<div class="container">
+    <PageAlert />
+    <LayoutHook Name="@LayoutHooks.Body.First" Layout="@StandardLayouts.Application" />
+    @Body
+    <LayoutHook Name="@LayoutHooks.Body.Last" Layout="@StandardLayouts.Application" />
+    <DynamicLayoutComponent />
+    <UiMessageAlert />
+    <UiNotificationAlert />
+    <UiPageProgress />
+</div>
+```
+
+Code-behind:
+
+```csharp
+public partial class MainLayout : IDisposable
+{
+    [Inject] private NavigationManager NavigationManager { get; set; }
+    private bool IsCollapseShown { get; set; }
+
+    protected override void OnInitialized()
+        => NavigationManager.LocationChanged += OnLocationChanged;
+
+    private void ToggleCollapse() => IsCollapseShown = !IsCollapseShown;
+
+    private void OnLocationChanged(object sender, LocationChangedEventArgs e)
+    {
+        IsCollapseShown = false;
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => NavigationManager.LocationChanged -= OnLocationChanged;
+}
+```
+
+The collapse toggle is handled in C# rather than Bootstrap's data attributes because Blazor's `@onclick` integrates with the diff renderer — a Bootstrap-only solution would not survive a circuit reconnect cleanly.
+
+Visually: a dark Bootstrap navbar with brand on the left (logo if present, app name beside it), a hamburger toggle below the `md` breakpoint, a centered horizontal `<NavMenu />` and a right-aligned `<NavToolbar />`. Below the navbar is a Bootstrap container with the `<PageAlert />` strip, then layout-hook slots, the body, more layout hooks, and four overlay components (`DynamicLayoutComponent`, `UiMessageAlert`, `UiNotificationAlert`, `UiPageProgress`) that render modals/toasts/progress bars from the framework's UI services.
+
+The four overlay components are crucial — without them `IUiMessageService.Info("Saved")` (the ABP equivalent of a toast) would have nowhere to render. They live in `Volo.Abp.AspNetCore.Components.Web.Theming.Components` and are theme-agnostic; LeptonX renders them too.
+
+## `NavMenu.razor` and `NavToolbar.razor`
+
+`NavMenu` is two lines of markup plus a code-behind that subscribes to `ApplicationConfigurationChangedService.Changed` so the menu refreshes after a permission/feature change:
+
+```razor
+@if (Menu != null)
+{
+    foreach (var menuItem in Menu.Items)
+    {
+        <FirstLevelNavMenuItem MenuItem="menuItem" />
+    }
+}
+```
+
+```csharp
+public partial class NavMenu : IDisposable
+{
+    [Inject] protected IMenuManager MenuManager { get; set; }
+    [Inject] protected ApplicationConfigurationChangedService ApplicationConfigurationChangedService { get; set; }
+    protected ApplicationMenu Menu { get; set; }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Menu = await MenuManager.GetMainMenuAsync();
+        ApplicationConfigurationChangedService.Changed += ApplicationConfigurationChanged;
+    }
+
+    private async void ApplicationConfigurationChanged()
+    {
+        Menu = await MenuManager.GetMainMenuAsync();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+        => ApplicationConfigurationChangedService.Changed -= ApplicationConfigurationChanged;
+}
+```
+
+The `ApplicationConfigurationChangedService` is fired by ABP after `Account/Login`, tenant switch, or any client-side update of `AbpApplicationConfiguration`. Hooking into it ensures the menu reflects the new permissions immediately, without requiring a full page reload.
+
+`NavToolbar` does the same pattern but iterates `IToolbarManager.GetAsync(StandardToolbars.Main)` and renders each `ToolbarItem.ComponentType` through a `RenderFragment`:
+
+```csharp
+private async Task GetToolbarItemRendersAsync()
+{
+    var toolbar = await ToolbarManager.GetAsync(StandardToolbars.Main);
+    ToolbarItemRenders.Clear();
+    var sequence = 0;
+    foreach (var item in toolbar.Items)
+    {
+        ToolbarItemRenders.Add(builder =>
+        {
+            builder.OpenComponent(sequence++, item.ComponentType);
+            builder.CloseComponent();
+        });
+    }
+}
+```
+
+```razor
+<ul class="navbar-nav">
+    @foreach (var render in ToolbarItemRenders)
+    {
+        <BarItem>
+            @render
+        </BarItem>
+    }
+</ul>
+```
+
+`<BarItem>` is a Blazorise wrapper that styles list items consistently inside a Blazorise `<Bar>` / `<BarMenu>`. The render fragment opens the component dynamically — this is why the Server and WebAssembly packages can contribute their own `LoginDisplay` / `LanguageSwitch` types without the shared library having to depend on either.
+
+## `FirstLevelNavMenuItem` / `SecondLevelNavMenuItem`
+
+These two components do the actual `<li>` rendering. Both support:
+
+- A custom `componentType` via `BasicThemeNavigationExtensions.UseComponent(...)` — if set, the entire menu item is replaced with `<DynamicComponent Type="@customComponentType" />`. This is how the toolbar contributor adds, e.g., a custom widget instead of a plain anchor.
+- `IsLeaf` — leaves render as a single `<a class="nav-link">` (level 1) or `<a class="dropdown-item">` (level 2); non-leaves render as dropdown toggles with recursive `SecondLevelNavMenuItem` children.
+- `MenuItem.Icon` — if it starts with `fa`, rendered as `<i class="@MenuItem.Icon me-1"></i>`.
+- `MenuItem.CssClass`, `MenuItem.IsDisabled`, `MenuItem.ElementId`, `MenuItem.Target` — standard menu item knobs.
+- Manual `ToggleSubMenu` handling — Blazor again manages the dropdown state in C# rather than via Bootstrap data attributes, so circuit reconnects work cleanly.
+
+The `BasicThemeNavigationExtensions` API:
+
+```csharp
+public static ApplicationMenuItem UseComponent(this ApplicationMenuItem menu, Type componentType)
+    => menu.WithCustomData(BasicThemeNavigationExtensions.CustomDataComponentKey, componentType);
+
+[CanBeNull]
+public static Type GetComponentTypeOrDefault(this ApplicationMenuItem menu)
+    => menu.CustomData.TryGetValue(CustomDataComponentKey, out var t) ? t as Type : null;
+```
+
+Use it in a menu contributor:
+
+```csharp
+context.Menu.Items.Add(
+    new ApplicationMenuItem("MyDashboard", "Dashboard", icon: "fa fa-tachometer-alt")
+        .UseComponent(typeof(MyDashboardMenuItem)));
+```
+
+The component receives no parameters — it renders the entire `<li>` itself.
+
+## `Branding.razor`
+
+```razor
+@using Volo.Abp.Ui.Branding
+@inject IBrandingProvider BrandingProvider
+<a class="navbar-brand" href="">
+    @if (!BrandingProvider.LogoUrl.IsNullOrWhiteSpace())
+    {
+        <img src="@BrandingProvider.LogoUrl.TrimStart('/', '~')" alt="@BrandingProvider.AppName">
+    }
+    @BrandingProvider.AppName
+</a>
+```
+
+Identical to the MVC `MainNavbarBrandViewComponent` except the `href` is empty (Blazor's `NavigationManager` resolves that to base path) and the logo URL is trimmed of leading `/~` because Blazor static assets are served from `_content/<RCL>/` paths.
+
+## `RedirectToLogin.razor`
+
+```razor
+@inject NavigationManager Navigation
+@code {
+    protected override void OnInitialized()
+    {
+        Navigation.NavigateTo(
+            $"account/login?returnUrl={Uri.EscapeDataString(Navigation.Uri)}",
+            true);
+    }
+}
+```
+
+The `true` second argument forces a full page reload — which is necessary because the Account module's `/account/login` is a Razor Page, not a Blazor component, and the cookie/OIDC flow that follows it cannot run inside a circuit.
+
+The WebAssembly package replaces this with `WebAssemblyRedirectToLogin` which calls `Navigation.NavigateToLogin("authentication/login")` from `Microsoft.AspNetCore.Components.WebAssembly.Authentication` — see [blazor-webassembly.mdx](/modules/basic-theme/blazor-webassembly).
+
+## Blazor Web App (.NET 8+) hosting topology
+
+A Blazor Web App can render components in three modes:
+
+1. **Static SSR** — server-rendered HTML, no JavaScript, no circuit. This is the default for any page without `@rendermode`.
+2. **InteractiveServer** — Blazor Server circuit over SignalR. Set with `@rendermode InteractiveServer` or via the `RenderMode.InteractiveServer` constant.
+3. **InteractiveWebAssembly** — downloaded WebAssembly runtime in the browser. Set with `@rendermode InteractiveWebAssembly`.
+4. (Combined: `InteractiveAuto` — start Server, switch to WebAssembly once it finishes loading.)
+
+For the Basic Theme, the practical mapping is:
+
+| Render mode | Theme packages to reference |
+| --- | --- |
+| Static SSR only | `Volo.Abp.AspNetCore.Components.Web.BasicTheme` (shared) + `Volo.Abp.AspNetCore.Components.Server.BasicTheme` (server-rendered toolbar items). |
+| Interactive Server | Same as above. |
+| Interactive WebAssembly | Add `Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme` to the client project. |
+| InteractiveAuto | Reference both server and webassembly packages; the shared package is transitive. |
+
+In the host `Program.cs`:
+
+```csharp
+builder.Services.AddRazorComponents()
+    .AddInteractiveServerComponents()
+    .AddInteractiveWebAssemblyComponents();
+
+// ABP wiring
+await builder.Services.AddApplicationAsync<MyHostBlazorModule>();
+```
+
+The host module would chain `[DependsOn(typeof(AbpAspNetCoreComponentsServerBasicThemeModule))]` and (for InteractiveWebAssembly) reference the WebAssembly client assembly so its `AdditionalAssemblies` flow through `AbpRouterOptions`.
+
+The `MainLayout` from the shared package renders identically in all three modes. The catch: **state is not shared between modes**. A Razor component rendered Static SSR cannot inject `AuthenticationStateProvider` and have it match what a sibling Interactive component sees, because the SSR pass runs in a different DI scope. ABP's `MainLayout` therefore relies entirely on framework services (`IBrandingProvider`, `IMenuManager`, `IAlertManager`) which are scoped per request — all three modes see consistent values.
+
+### `App.razor` for Blazor Web App
+
+The .NET 8 template's `App.razor` is **not** the same file as the Blazor Server/WebAssembly `App.razor` in this package. The shared package's `App.razor` is meant to be used inside a circuit (Server) or runtime (WebAssembly). For a Blazor Web App host you keep the .NET 8 template's `App.razor` with the `<HeadOutlet>`, `<Routes>`, and `<script src="_framework/blazor.web.js">` elements, and you set `<Routes @rendermode="@InteractiveServer" />` (or whichever mode) to opt the router into interactive rendering.
+
+The Basic theme does not ship a Blazor Web App `App.razor` because the template-level file is too host-specific to standardise. The shared `MainLayout` is what matters — and that file is identical regardless of host model.
+
+## Customisation recipes
+
+### Replace `MainLayout`
+
+Add `Themes/Basic/MainLayout.razor` to the host project under the same `@namespace`. Blazor's compilation will pick up the host file in preference to the RCL file. Keep the `<LayoutHook>` calls — third-party widgets depend on them.
+
+### Add a menu badge
+
+Use `BasicThemeNavigationExtensions.UseComponent(...)` to replace the menu item with a custom component that renders a `<span class="badge">`:
+
+```csharp
+public class NotificationMenuItem : ComponentBase
+{
+    [Inject] INotificationCountService Svc { get; set; }
+    protected override async Task OnInitializedAsync() { /* fetch count */ }
+
+    protected override void BuildRenderTree(RenderTreeBuilder b) { /* render <li><a>… <span class="badge">@Count</span></a></li> */ }
+}
+
+// In your menu contributor:
+context.Menu.Items.Add(
+    new ApplicationMenuItem("Notifications", "Notifications", icon: "fa fa-bell")
+        .UseComponent(typeof(NotificationMenuItem)));
+```
+
+### Replace `<NavToolbar />`
+
+Override `MainLayout` and swap the `<NavToolbar />` tag for your own component. Note that you lose the `IToolbarManager` integration — re-implement it if you still want module-contributed toolbar items.
+
+## Gotchas
+
+- **`FirstLevelNavMenuItem` and `SecondLevelNavMenuItem` use `data-toggle` (Bootstrap 4 style)** for the deprecated dropdown attribute — but the actual show/hide is driven by Blazor's `@onclick` so the attribute is decorative. Some accessibility scanners still flag it; if you need pure Bootstrap 5 attributes, override both components.
+- **`<DynamicComponent Type="@customComponentType" />`** does not pass `MenuItem` to the custom component. If your custom component needs the item, fetch it via DI or hard-code it.
+- **`<NotAuthorized>` in `App.razor` shows a hard-coded English string** "You are not authorized to access this resource." Override `App.razor` to localise.
+- **`Branding.razor`'s `<a href="">`** is intentionally empty, but some link-checkers will flag this. The Blazor `NavigationManager` rewrites empty links to the base path; do not "fix" it to `~/` because that emits a literal tilde.
+- **Razor Class Library static-web-assets paths** (`_content/Volo.Abp.AspNetCore.Components.Web.BasicTheme/...`) only work when the host project references this package as a NuGet (or project-reference with `<ItemGroup><PackageReference ... /></ItemGroup>`). A loose DLL reference will not publish the `wwwroot` files.
+
+## See also
+
+- [Overview](/modules/basic-theme/overview) — package map and shared visual contract.
+- [Blazor Server](/modules/basic-theme/blazor-server) — server-side Login / Language components and bundling.
+- [Blazor WebAssembly](/modules/basic-theme/blazor-webassembly) — WebAssembly counterpart with OIDC routing.
+- [Blazor UI overview](/framework/ui-blazor/) — framework-level Blazor abstractions, `IThemeManager`, `AbpRouterOptions`.
+- [Theme Shared (MVC)](/framework/ui-mvc/mvc-ui-theme-shared) — the `ITheme`, `StandardLayouts`, and `StandardToolbars` constants that the Blazor theme shares with MVC.
+- [MVC walkthrough](/modules/basic-theme/mvc) — Razor Pages equivalent.

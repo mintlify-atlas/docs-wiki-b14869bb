@@ -1,0 +1,384 @@
+---
+title: "Volo.Abp.Imaging.Abstractions — Resize and compress via contributors"
+description: "Deep dive into ABP's provider-agnostic image-processing core: how IImageResizer and IImageCompressor delegate to an ordered chain of IImageResizerContributor / IImageCompressorContributor, return ImageProcessResult<T> with Done/Canceled/Unsupported states, and pair with stream- or byte[]-based ImageResizeArgs."
+---
+
+`Volo.Abp.Imaging.Abstractions` is to image processing what `Volo.Abp.BlobStoring` is to storage: it owns the abstractions and a contributor-based dispatcher, but no actual pixel-pushing code. The two real engines — [ImageSharp](imaging-imagesharp) and [Magick.NET](imaging-magickdotnet) — register their own `IImageResizerContributor` and `IImageCompressorContributor` and are picked up automatically.
+
+The whole API surface is two interfaces, two resulting types, and a `ImageResizeArgs`. That's deliberate: image libraries change every couple of years, and ABP wants application code to keep working when you swap the backend.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/Imaging/AbpImagingAbstractionsModule.cs` | Empty module — only registers the two contributors-based dispatchers via convention. |
+| `Volo/Abp/Imaging/IImageResizer.cs` | `Task<ImageResizeResult<Stream>> ResizeAsync(...)` / `byte[]` overload. |
+| `Volo/Abp/Imaging/IImageCompressor.cs` | `Task<ImageCompressResult<Stream>> CompressAsync(...)` / `byte[]` overload. |
+| `Volo/Abp/Imaging/ImageResizer.cs` | Default dispatcher. Iterates contributors, returns first non-`Unsupported` result. |
+| `Volo/Abp/Imaging/ImageCompressor.cs` | Default dispatcher for compression. Same shape. |
+| `Volo/Abp/Imaging/IImageResizerContributor.cs` | The interface ImageSharp / Magick implement. |
+| `Volo/Abp/Imaging/IImageCompressorContributor.cs` | Companion interface for compression. |
+| `Volo/Abp/Imaging/ImageResizeArgs.cs` | `Width`, `Height`, `Mode`. Validates non-negative dimensions. |
+| `Volo/Abp/Imaging/ImageResizeMode.cs` | `None`, `Stretch`, `BoxPad`, `Min`, `Max`, `Crop`, `Pad`, `Default`. |
+| `Volo/Abp/Imaging/ImageResizeOptions.cs` | `DefaultResizeMode` (resolves the sentinel `Default` mode). |
+| `Volo/Abp/Imaging/ImageResizeResult.cs` / `ImageCompressResult.cs` | `ImageProcessResult<T>` specializations. |
+| `Volo/Abp/Imaging/ImageProcessResult.cs` | `Result` + `State`. |
+| `Volo/Abp/Imaging/ImageProcessState.cs` | `Done = 1`, `Canceled = 2`, `Unsupported = 3`. |
+
+There is no `IImageFormatConverter` shipped today; the contributor pattern is the extension point if you need one.
+
+## The two-overload contract
+
+```csharp title="IImageResizer.cs"
+public interface IImageResizer
+{
+    Task<ImageResizeResult<Stream>> ResizeAsync(
+        Stream stream,
+        ImageResizeArgs resizeArgs,
+        [CanBeNull] string mimeType = null,
+        CancellationToken cancellationToken = default);
+
+    Task<ImageResizeResult<byte[]>> ResizeAsync(
+        byte[] bytes,
+        ImageResizeArgs resizeArgs,
+        [CanBeNull] string mimeType = null,
+        CancellationToken cancellationToken = default);
+}
+```
+
+```csharp title="IImageCompressor.cs"
+public interface IImageCompressor
+{
+    Task<ImageCompressResult<Stream>> CompressAsync(
+        Stream stream, string mimeType = null, CancellationToken cancellationToken = default);
+
+    Task<ImageCompressResult<byte[]>> CompressAsync(
+        byte[] bytes, string mimeType = null, CancellationToken cancellationToken = default);
+}
+```
+
+Both shapes exist because:
+
+- `Stream` is what you get from `IBlobContainer.GetAsync` and HTTP request bodies.
+- `byte[]` is what you'd serialize into an event or a database column.
+
+Each contributor implements both overloads. The dispatchers always pick the matching overload, never silently convert.
+
+## `ImageResizeArgs` and `ImageResizeMode`
+
+```csharp title="ImageResizeArgs.cs"
+public class ImageResizeArgs
+{
+    private int _width;
+    public int Width
+    {
+        get => _width;
+        set
+        {
+            if (value < 0) throw new ArgumentException("Width cannot be negative!", nameof(value));
+            _width = value;
+        }
+    }
+
+    private int _height;
+    public int Height
+    {
+        get => _height;
+        set
+        {
+            if (value < 0) throw new ArgumentException("Height cannot be negative!", nameof(value));
+            _height = value;
+        }
+    }
+
+    public ImageResizeMode Mode { get; set; } = ImageResizeMode.Default;
+
+    public ImageResizeArgs(int? width = null, int? height = null, ImageResizeMode? mode = null)
+    {
+        if (mode.HasValue) Mode = mode.Value;
+        Width = width ?? 0;
+        Height = height ?? 0;
+    }
+}
+```
+
+```csharp title="ImageResizeMode.cs"
+public enum ImageResizeMode : byte
+{
+    None    = 0, // resize freely; aspect ratio decided by the contributor
+    Stretch = 1, // ignore aspect ratio
+    BoxPad  = 2, // never upscale; pad transparent
+    Min     = 3, // never upscale
+    Max     = 4, // fit inside the box, preserve ratio
+    Crop    = 5, // fill the box, preserve ratio, crop overflow
+    Pad     = 6, // fit inside the box, pad transparent
+    Default = 7  // resolved at runtime from ImageResizeOptions.DefaultResizeMode
+}
+```
+
+Setting `Width = 0` or `Height = 0` means *"derive this dimension from the other one"*. The Magick contributor's `GetTargetWidth` / `GetTargetHeight` show the math:
+
+```csharp title="MagickImageResizerContributor.cs (excerpt)"
+protected virtual int GetTargetWidth(ImageResizeArgs resizeArgs, int min, int sourceWidth, int sourceHeight)
+{
+    if (resizeArgs.Width == 0 && resizeArgs.Height > 0)
+    {
+        return Math.Max(min, (int)Math.Round(sourceWidth * resizeArgs.Height / (float)sourceHeight));
+    }
+    return resizeArgs.Width;
+}
+```
+
+So `new ImageResizeArgs(width: 0, height: 200, mode: ImageResizeMode.Max)` means *"make it 200px tall, scale width proportionally"*. ImageSharp implements the same behavior, but via its native `ResizeOptions.Size` with the missing dimension left as zero.
+
+## `ImageResizeOptions` and the `Default` mode
+
+```csharp title="ImageResizeOptions.cs"
+public class ImageResizeOptions
+{
+    public ImageResizeMode DefaultResizeMode { get; set; } = ImageResizeMode.None;
+}
+```
+
+The dispatcher resolves `ImageResizeMode.Default` to whatever you configured here:
+
+```csharp title="ImageResizer.cs (excerpt)"
+protected virtual void ChangeDefaultResizeMode(ImageResizeArgs resizeArgs)
+{
+    if (resizeArgs.Mode == ImageResizeMode.Default)
+    {
+        resizeArgs.Mode = ImageResizeOptions.DefaultResizeMode;
+    }
+}
+```
+
+If you don't `Configure<ImageResizeOptions>(...)`, callers that leave `Mode` at its default end up with `ImageResizeMode.None`, which on ImageSharp falls into the `ResizeModeMap` entry `{ ImageResizeMode.None, default }` (i.e., the ImageSharp library default) and on Magick falls into `ResizeModeNone`, which only honors width/height directly.
+
+## Result and state
+
+```csharp title="ImageProcessResult.cs"
+public abstract class ImageProcessResult<T>
+{
+    public T Result { get; }
+    public ImageProcessState State { get; }
+    protected ImageProcessResult(T result, ImageProcessState state)
+    {
+        Result = result;
+        State = state;
+    }
+}
+
+public enum ImageProcessState : byte
+{
+    Done = 1,        // the contributor produced new bytes
+    Canceled = 2,    // the contributor refused (e.g. compressed result was bigger than input)
+    Unsupported = 3, // the contributor doesn't handle this MIME type
+}
+```
+
+`Done` is the success path. `Canceled` is "I tried, but the result wasn't worth keeping" — the ImageSharp compressor returns this when the recompressed file is **larger** than the source (a sign the source was already optimal). `Unsupported` is "I can't read this format". The result `T` is always set; when `State != Done`, `Result` is the **original** input you passed in, so you can chain `.Result` without null-checks.
+
+## The dispatcher: first non-`Unsupported` wins
+
+```csharp title="ImageResizer.cs"
+public class ImageResizer : IImageResizer, ITransientDependency
+{
+    protected IEnumerable<IImageResizerContributor> ImageResizerContributors { get; }
+    protected ImageResizeOptions ImageResizeOptions { get; }
+    protected ICancellationTokenProvider CancellationTokenProvider { get; }
+
+    public ImageResizer(
+        IEnumerable<IImageResizerContributor> imageResizerContributors,
+        IOptions<ImageResizeOptions> imageResizeOptions,
+        ICancellationTokenProvider cancellationTokenProvider)
+    {
+        ImageResizerContributors = imageResizerContributors.Reverse();
+        CancellationTokenProvider = cancellationTokenProvider;
+        ImageResizeOptions = imageResizeOptions.Value;
+    }
+
+    public virtual async Task<ImageResizeResult<Stream>> ResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs,
+        string mimeType = null, CancellationToken cancellationToken = default)
+    {
+        Check.NotNull(stream, nameof(stream));
+        ChangeDefaultResizeMode(resizeArgs);
+
+        foreach (var contributor in ImageResizerContributors)
+        {
+            var result = await contributor.TryResizeAsync(
+                stream, resizeArgs, mimeType,
+                CancellationTokenProvider.FallbackToProvider(cancellationToken));
+
+            if (result.State == ImageProcessState.Unsupported)
+            {
+                continue;
+            }
+            return result;
+        }
+        return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+    }
+}
+```
+
+Two things to call out:
+
+- **`.Reverse()`** — contributors are tried in registration order *reversed*. Since ImageSharp's module is the one most apps depend on first, your custom contributor registered later in `ConfigureServices` runs **first**. This is how you override the built-in engines without unregistering them.
+- **The dispatcher does not try to parse the MIME type.** It passes the (optional) hint straight to each contributor. Contributors use the hint as a fast path; if it's missing they fall back to sniffing the magic bytes — ImageSharp via `Image.LoadWithFormatAsync`, Magick via `new MagickImage(stream).FormatInfo?.MimeType`.
+
+`ImageCompressor` is structurally identical:
+
+```csharp title="ImageCompressor.cs"
+public class ImageCompressor : IImageCompressor, ITransientDependency
+{
+    protected IEnumerable<IImageCompressorContributor> ImageCompressorContributors { get; }
+
+    public ImageCompressor(
+        IEnumerable<IImageCompressorContributor> imageCompressorContributors,
+        ICancellationTokenProvider cancellationTokenProvider)
+    {
+        ImageCompressorContributors = imageCompressorContributors.Reverse();
+        // ...
+    }
+    // ... identical dispatch loop
+}
+```
+
+## The contributor interfaces
+
+```csharp title="IImageResizerContributor.cs"
+public interface IImageResizerContributor
+{
+    Task<ImageResizeResult<Stream>> TryResizeAsync(
+        Stream stream, ImageResizeArgs resizeArgs,
+        string mimeType = null, CancellationToken cancellationToken = default);
+
+    Task<ImageResizeResult<byte[]>> TryResizeAsync(
+        byte[] bytes, ImageResizeArgs resizeArgs,
+        string mimeType = null, CancellationToken cancellationToken = default);
+}
+```
+
+```csharp title="IImageCompressorContributor.cs"
+public interface IImageCompressorContributor
+{
+    Task<ImageCompressResult<Stream>> TryCompressAsync(
+        Stream stream, string mimeType = null, CancellationToken cancellationToken = default);
+
+    Task<ImageCompressResult<byte[]>> TryCompressAsync(
+        byte[] bytes, string mimeType = null, CancellationToken cancellationToken = default);
+}
+```
+
+A contributor is just an `ITransientDependency` that:
+
+1. Inspects `mimeType` (or sniffs if null). If it can't handle the format, returns `ImageProcessState.Unsupported` immediately so the dispatcher moves on.
+2. Decodes, processes, encodes.
+3. Returns `Done` with the new bytes/stream, or `Canceled` if the result is worse than the input.
+
+That is the entire extensibility surface. To add WebP-only resizing on top of an existing engine, register a new contributor with a higher service ordinal — the dispatcher's `.Reverse()` puts you at the head of the chain.
+
+## End-to-end sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application code
+    participant R as IImageResizer (ImageResizer)
+    participant Opt as ImageResizeOptions
+    participant C1 as Contributor #1 (custom)
+    participant C2 as Contributor #2 (ImageSharp / Magick)
+    participant Tok as ICancellationTokenProvider
+
+    App->>R: ResizeAsync(stream, args(0,200,Default), "image/png")
+    R->>Opt: read DefaultResizeMode
+    Note over R,Opt: args.Mode = Default → Max (e.g.)
+    R->>Tok: FallbackToProvider(callerToken)
+    R->>C1: TryResizeAsync(stream, args, "image/png", token)
+    C1-->>R: ImageResizeResult<Stream>(stream, Unsupported)
+    R->>C2: TryResizeAsync(stream, args, "image/png", token)
+    C2->>C2: decode → resize → encode
+    C2-->>R: ImageResizeResult<Stream>(newStream, Done)
+    R-->>App: ImageResizeResult<Stream>(newStream, Done)
+```
+
+If every contributor returns `Unsupported`, the dispatcher returns the original input with `State = Unsupported`. Callers should check `result.State` before trusting `result.Result`.
+
+## Pairing with `IBlobContainer`
+
+The intended pattern is to resize/compress between two BLOB containers:
+
+```csharp title="ProfilePictureAppService.cs"
+public class ProfilePictureAppService
+{
+    private readonly IBlobContainer<RawAvatarContainer> _raw;
+    private readonly IBlobContainer<ThumbnailContainer> _thumb;
+    private readonly IImageResizer _resizer;
+    private readonly IImageCompressor _compressor;
+
+    public async Task ProcessAsync(Guid userId, Stream upload, string mime)
+    {
+        await _raw.SaveAsync(userId.ToString("N"), upload, overrideExisting: true);
+
+        var rawBytes = await _raw.GetAllBytesAsync(userId.ToString("N"));
+
+        var resized = await _resizer.ResizeAsync(
+            rawBytes,
+            new ImageResizeArgs(width: 256, height: 256, mode: ImageResizeMode.Crop),
+            mime);
+
+        if (resized.State != ImageProcessState.Done)
+        {
+            throw new UserFriendlyException("Unsupported image format.");
+        }
+
+        var compressed = await _compressor.CompressAsync(resized.Result, mime);
+        // Use compressed.Result when Done, else fall back to resized.Result
+        var finalBytes = compressed.State == ImageProcessState.Done
+            ? compressed.Result
+            : resized.Result;
+
+        await _thumb.SaveAsync(userId.ToString("N"), finalBytes, overrideExisting: true);
+    }
+}
+```
+
+## Module wiring
+
+```csharp title="AbpImagingAbstractionsModule.cs"
+public class AbpImagingAbstractionsModule : AbpModule
+{
+}
+```
+
+Yes — completely empty. `ImageResizer` and `ImageCompressor` are `ITransientDependency`, so the convention scanner picks them up automatically. The two MIME helpers they use (`MimeTypes.Image.Jpeg` etc.) live in `Volo.Abp.Http`, which is a transitive dependency through the rest of the framework.
+
+## Configuring the default mode
+
+```csharp title="ConfigureServices"
+Configure<ImageResizeOptions>(options =>
+{
+    options.DefaultResizeMode = ImageResizeMode.Max;
+});
+```
+
+This is global. There is no per-call or per-container override at the abstractions layer — if you want different defaults per use case, build them into your application service.
+
+## Gotchas
+
+- **`Mode = ImageResizeMode.None` is not the same as "don't resize"**. It means *"resize using the contributor's library-default mode"*. To skip resizing entirely, skip the `IImageResizer` call.
+- **`Width = 0` and `Height = 0` are valid inputs**, but the contributors handle this differently:
+  - The Magick `ResizeModeNone` path will resize to `0×0` after the `Max(min, …)` clamp returns the source width unchanged for one dimension and `Min = 1` for the other — effectively producing a 1-pixel sliver.
+  - The ImageSharp path constructs a `Size {}` with both dimensions zero, which ImageSharp interprets as "no resize". So the same input produces different output across backends.
+
+  Always set at least one dimension.
+- **`ImageProcessState.Canceled` only appears from the compressor**. The resizer never returns it — every resize result is either `Done` or `Unsupported`.
+- **`Reverse()` ordering is undocumented but contractual.** If you register a custom contributor, expect it to run **before** the built-ins. If you want it to run **after** them as a fallback, register it earlier — for example, in a module that ImageSharp's module `[DependsOn]`'s.
+- **`Image.LoadWithFormatAsync` (ImageSharp) reads the whole stream.** Passing a non-seekable HTTP body works, but if you also need to keep the original bytes around, buffer to a `MemoryStream` first or use the `byte[]` overload.
+- **`MagickImage` is `IDisposable` and not used cooperatively in the byte[] resize path.** That path uses `using var image = new MagickImage(bytes)` and `image.ToByteArray()` — fine for short images, but it does keep the entire encoded result in memory twice during conversion. For very large images prefer the `Stream` overload, which writes back into the source `MemoryStream` and only doubles memory once.
+
+## See also
+
+- [Volo.Abp.Imaging.ImageSharp](imaging-imagesharp) — the pure-managed contributor.
+- [Volo.Abp.Imaging.MagickNet](imaging-magickdotnet) — the ImageMagick-backed contributor.
+- [Volo.Abp.BlobStoring](blob-storing) — the storage layer these processors typically read from and write to.

@@ -1,0 +1,456 @@
+---
+title: "abp add-package & add-module"
+description: "How AddPackageCommand and AddModuleCommand mutate your solution — finding the right .csproj, calling dotnet add package, wiring [DependsOn(…)] attributes and downloading sources when requested."
+---
+
+`abp add-package` and `abp add-module` are the two surgical verbs of the
+CLI. They take an existing ABP solution and:
+
+- pick the right `.csproj` (or every related project for a module),
+- run `dotnet add package …`,
+- add `typeof(SomeModule)` to the `DependsOn` attribute on your
+  application module class,
+- optionally download the package source code and convert
+  `<PackageReference>` to `<ProjectReference>`.
+
+Together they are the runtime equivalent of "manually editing the
+solution"; everything else in the CLI ultimately reuses these two
+classes. This page covers both, plus the shared helpers
+(`ProjectNugetPackageAdder`, `ProjectNpmPackageAdder`,
+`SolutionPackageVersionFinder`, `SolutionModuleAdder`,
+`ModuleClassDependcyAdder`).
+
+> The parent task brief referenced `AddSolutionCommand`; this verb does
+> not exist in `Volo.Abp.Cli.Core` for v7.4. Solution-wide work happens
+> through `AddModuleCommand` instead.
+
+## File inventory
+
+```text
+framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/
+├── Commands/
+│   ├── AddPackageCommand.cs   # Single package (NuGet or @abp NPM)
+│   └── AddModuleCommand.cs    # Multi-package module
+└── ProjectModification/
+    ├── ProjectNugetPackageAdder.cs    # dotnet add package + DependsOn
+    ├── ProjectNpmPackageAdder.cs      # Patches package.json for @abp/*
+    ├── ProjectFinder.cs               # Project ↔ NuGet package mapping
+    ├── SolutionModuleAdder.cs         # Orchestrator behind add-module
+    ├── SolutionPackageVersionFinder.cs# Reads existing Volo.Abp version
+    ├── ModuleClassDependcyAdder.cs    # Adds typeof(X) to [DependsOn(...)]
+    ├── DerivedClassFinder.cs          # Finds your AbpModule-derived class
+    ├── DbContextFileBuilderConfigureAdder.cs # Calls ConfigureXyz() in DbContext
+    ├── NugetPackageToLocalReferenceConverter.cs # Swaps PackageRef→ProjectRef
+    └── AngularSourceCodeAdder.cs      # Mirrors angular libs into your repo
+```
+
+## AddPackageCommand — one package, one project
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/AddPackageCommand.cs
+public class AddPackageCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "add-package";
+
+    protected ProjectNugetPackageAdder ProjectNugetPackageAdder { get; }
+    public ProjectNpmPackageAdder ProjectNpmPackageAdder { get; }
+
+    public AddPackageCommand(ProjectNugetPackageAdder projectNugetPackageAdder,
+                             ProjectNpmPackageAdder projectNpmPackageAdder)
+    {
+        ProjectNugetPackageAdder = projectNugetPackageAdder;
+        ProjectNpmPackageAdder   = projectNpmPackageAdder;
+    }
+
+    public virtual async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        if (commandLineArgs.Target == null)
+            throw new CliUsageException("Package name is missing!" + … + GetUsageInfo());
+
+        var isAngularPackage = commandLineArgs.Target.StartsWith("@");
+        var isNugetPackage   = !isAngularPackage;
+
+        var version        = commandLineArgs.Options.GetOrNull(Options.Version.Short,
+                                                               Options.Version.Long);
+        var withSourceCode = commandLineArgs.Options.ContainsKey(Options.SourceCode.Long);
+
+        if (isNugetPackage)
+        {
+            var addSourceCodeToSolutionFile =
+                withSourceCode && commandLineArgs.Options.ContainsKey("add-to-solution-file");
+
+            await ProjectNugetPackageAdder.AddAsync(
+                GetSolutionFile(commandLineArgs),
+                GetProjectFile(commandLineArgs),
+                commandLineArgs.Target,
+                version,
+                useDotnetCliToInstall: true,
+                withSourceCode,
+                addSourceCodeToSolutionFile);
+        }
+        else
+        {
+            await ProjectNpmPackageAdder.AddAngularPackageAsync(
+                GetAngularDirectory(commandLineArgs),
+                commandLineArgs.Target,
+                version,
+                withSourceCode);
+        }
+    }
+}
+```
+
+### Flag reference
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `<package-name>` | (required) | NuGet ID, or `@scope/name` for Angular. |
+| `-p`, `--project <file>` | First `*.csproj` in current dir | Target project. |
+| `-s`, `--solution <file>` | First `*.sln` in current dir | Used to find the version baseline. |
+| `-ad`, `--angular-directory <dir>` | Current directory | For `@…` packages. |
+| `-v`, `--version <version>` | Solution's existing ABP version or latest | Forwarded to NuGet/NPM. |
+| `--with-source-code` | off | Download the package source under your solution. |
+| `--add-to-solution-file` | off | When source code is downloaded, also add to `.sln`. |
+
+`@`-prefix detection is how the command decides NuGet vs NPM:
+
+```csharp
+if (commandLineArgs.Target.StartsWith("@"))
+{
+    isAngularPackage = true;
+    isNugetPackage   = false;
+}
+```
+
+So `abp add-package Volo.Abp.FluentValidation` → NuGet route,
+`abp add-package @abp/ng.theme.basic` → Angular route.
+
+### Target project resolution
+
+`GetProjectFile` looks at `-p`/`--project` first, then falls back to the
+first `*.csproj` in the current directory:
+
+```csharp
+protected virtual string GetProjectFile(CommandLineArgs args)
+{
+    var provided = PathHelper.NormalizePath(
+        args.Options.GetOrNull(Options.Project.Short, Options.Project.Long));
+
+    if (!provided.IsNullOrWhiteSpace()) return provided;
+
+    return Directory.GetFiles(Directory.GetCurrentDirectory(), "*.csproj")
+                    .FirstOrDefault();
+}
+```
+
+`GetSolutionFile` is symmetric. `GetAngularDirectory` returns the
+provided `-ad` value or the current directory.
+
+### Examples
+
+```bash
+# Current folder = Acme.BookStore.Application
+abp add-package Volo.Abp.FluentValidation
+
+# Explicit project
+abp add-package Volo.Abp.FluentValidation -p ..\Acme.BookStore.Application\Acme.BookStore.Application.csproj
+
+# Pin a version
+abp add-package Volo.Abp.AspNetCore.Mvc -v 7.4.0
+
+# Angular package (NPM)
+cd angular
+abp add-package @abp/ng.theme.basic
+
+# Pull the source code into your repo
+abp add-package Volo.Abp.BlobStoring -p Acme.BookStore.Domain.csproj \
+                --with-source-code --add-to-solution-file
+```
+
+## ProjectNugetPackageAdder — what AddPackageCommand actually does
+
+`ProjectNugetPackageAdder.AddAsync` walks:
+
+```csharp
+public async Task AddAsync(string solutionFile, string projectFile,
+    string packageName, string version = null, bool useDotnetCliToInstall = true,
+    bool withSourceCode = false, bool addSourceCodeToSolutionFile = false)
+{
+    await AddAsync(solutionFile, projectFile,
+        await FindNugetPackageInfoAsync(packageName),
+        version, useDotnetCliToInstall, withSourceCode, addSourceCodeToSolutionFile);
+}
+```
+
+1. **`FindNugetPackageInfoAsync(packageName)`** queries
+   `https://abp.io/api/packages` (with the user's access token) for the
+   `NugetPackageInfo`. This is what determines whether the package
+   targets MVC, Blazor, EF Core, the Domain layer, etc.
+2. **Project resolution**. If `projectFile` is `null` the adder calls
+   `GetProjectFile(solutionFile, package)` to pick the right `.csproj`
+   from the solution based on the package's `Target` (e.g. an EF Core
+   migration package goes into `…EntityFrameworkCore`).
+3. **`dotnet add package`** — when `useDotnetCliToInstall` is `true`, the
+   adder shells out to `dotnet add <project> package <id> [--version]
+   --source <nuget.abp.io url>`. The source is fetched from
+   `AbpNuGetIndexUrlService` so commercial packages work.
+4. **`[DependsOn(...)]` patching** — `DerivedClassFinder` locates the
+   `AbpModule`-derived class in the project, then
+   `ModuleClassDependcyAdder` rewrites its `[DependsOn(...)]` attribute
+   to include `typeof(<Package>Module)`.
+5. **NPM follow-up** — for packages flagged as having an NPM peer
+   (e.g. `Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme`), the
+   matching `@abp/aspnetcore.components.webassembly.basictheme` entry is
+   added to `package.json` via `ProjectNpmPackageAdder`.
+6. **`--with-source-code`** — `SourceCodeDownloadService` pulls the
+   `<package>-<version>-source.zip` from abp.io into
+   `<solutionFolder>/modules/<package>`, then optionally rewrites the
+   `<PackageReference>` to a `<ProjectReference>` and updates the
+   `.sln` via `SolutionFileModifier`.
+
+### NPM side (`ProjectNpmPackageAdder.AddAngularPackageAsync`)
+
+```csharp
+public async Task AddAngularPackageAsync(string directory, string npmPackageName,
+                                         string version = null, bool withSourceCode = false)
+{
+    await AddAngularPackageAsync(directory,
+        await FindNpmPackageInfoAsync(npmPackageName), version, withSourceCode);
+}
+```
+
+Internally:
+
+- locates `package.json` in `directory`,
+- skips if the package is already present,
+- shells out to `yarn add` or `npm install` (depending on what is
+  installed — see [`abp install-libs`](./cli-install-libs)),
+- if `--with-source-code` is set, calls `AngularSourceCodeAdder` to mirror
+  the library into `projects/<lib>` and update `angular.json` paths.
+
+## AddModuleCommand — many packages, many projects
+
+A module (e.g. `Volo.Identity`, `Volo.Blogging`, `Volo.AuditLogging`)
+fans out into 6–10 NuGet packages. `AddModuleCommand` is essentially a
+loop over `AddPackageCommand` driven by a manifest:
+
+```csharp
+public class AddModuleCommand : IConsoleCommand, ITransientDependency
+{
+    public const string Name = "add-module";
+
+    protected SolutionModuleAdder SolutionModuleAdder { get; }
+    public SolutionPackageVersionFinder SolutionPackageVersionFinder { get; }
+
+    public async Task ExecuteAsync(CommandLineArgs commandLineArgs)
+    {
+        if (commandLineArgs.Target == null)
+            throw new CliUsageException("Module name is missing!" + … + GetUsageInfo());
+
+        if (_options.DisabledModulesToAddToSolution.Contains(commandLineArgs.Target))
+            throw new CliUsageException($"{commandLineArgs.Target} is not available for this command!");
+
+        var newTemplate    = commandLineArgs.Options.ContainsKey(Options.NewTemplate.Long);
+        var template       = commandLineArgs.Options.GetOrNull(Options.Template.Short, Options.Template.Long);
+        var newProTemplate = template == ModuleProTemplate.TemplateName;
+        var withSourceCode = newTemplate || newProTemplate
+            || commandLineArgs.Options.ContainsKey(Options.SourceCode.Long);
+        var addSourceCodeToSolutionFile =
+            withSourceCode && commandLineArgs.Options.ContainsKey("add-to-solution-file");
+        var skipDbMigrations = newTemplate || newProTemplate
+            || commandLineArgs.Options.ContainsKey(Options.DbMigrations.Skip);
+
+        var solutionFile = GetSolutionFile(commandLineArgs);
+
+        var version = commandLineArgs.Options.GetOrNull(Options.Version.Short, Options.Version.Long)
+                      ?? SolutionPackageVersionFinder.FindByCsprojVersion(solutionFile);
+
+        var moduleInfo = await SolutionModuleAdder.AddAsync(
+            solutionFile, commandLineArgs.Target, version,
+            skipDbMigrations, withSourceCode, addSourceCodeToSolutionFile,
+            newTemplate, newProTemplate);
+    }
+}
+```
+
+### Flag reference
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `<module-name>` | (required) | NuGet umbrella, e.g. `Volo.Blogging`. |
+| `--new` | off | Scaffold a brand-new custom module with this name and add it. |
+| `-t`, `--template <name>` | (none) | When `--new`, choose `module` or `module-pro`. |
+| `--with-source-code` | off | Download module source code. Auto-enabled when `--new`. |
+| `--add-to-solution-file` | off | Add downloaded module to `.sln`. |
+| `-s`, `--solution <file>` | First `*.sln` in current dir | Solution to modify. |
+| `--skip-db-migrations` | off | Don't add an EF Core migration. Auto-enabled when `--new`. |
+| `-sp`, `--startup-project <file>` | Current folder | Where `dotnet ef migrations add` runs. |
+| `-v`, `--version <ver>` | Auto-detected from the solution's existing `Volo.Abp.*` `<PackageReference>` | Module package version. |
+
+Note: `AbpCliOptions.DisabledModulesToAddToSolution` is preloaded with
+`Volo.Abp.LeptonXTheme.Pro` and `Volo.Abp.LeptonXTheme.Lite` to prevent
+adding theme modules through this verb — those come in via the solution
+template.
+
+### Examples
+
+```bash
+# Add the Blogging module to the current solution
+abp add-module Volo.Blogging
+
+# Add it but use a different startup project for migrations
+abp add-module Volo.Blogging \
+    -sp ..\Acme.BookStore.Web\Acme.BookStore.Web.csproj
+
+# Scaffold a brand-new module called ProductManagement inside the solution
+abp add-module ProductManagement --new \
+    -sp ..\Acme.BookStore.Web\Acme.BookStore.Web.csproj
+
+# Scaffold the commercial module template, register in .sln
+abp add-module ProductManagement --new -t module-pro --add-to-solution-file \
+    -sp ..\Acme.BookStore.Web\Acme.BookStore.Web.csproj
+```
+
+### Solution resolution with multiple `.sln`
+
+When `-s` is not specified and the working directory contains multiple
+solutions, the command refuses to guess:
+
+```csharp
+if (foundSolutionFiles.Length == 0)
+    throw new CliUsageException("'abp add-module' command should be used inside a folder containing a .sln file!");
+
+var sb = new StringBuilder("There are multiple solution (.sln) files… Please specify one of the files below:");
+foreach (var f in foundSolutionFiles) sb.AppendLine("* " + f);
+sb.AppendLine($"abp add-module {commandLineArgs.Target} -p {foundSolutionFiles[0]}");
+throw new CliUsageException(sb.ToString());
+```
+
+## SolutionPackageVersionFinder — auto-detecting your ABP version
+
+Most users never pass `-v`. Instead, the command walks every `.csproj`
+under the solution looking for an existing `<PackageReference Include="Volo.Abp.*" />`:
+
+```csharp
+public string FindByCsprojVersion(string solutionFile,
+    string packagePrefix = "Volo.Abp",
+    string excludedKeywords = "LeptonX",
+    string includedKeyword = null)
+{
+    var projectFiles = GetProjectFilesOfSolution(solutionFile);
+    foreach (var projectFile in projectFiles)
+    {
+        var content = File.ReadAllText(projectFile);
+        if (TryParseVersionFromCsprojViaXmlDocument(content, out var v,
+                packagePrefix, excludedKeywords, includedKeyword))
+            return v;
+    }
+    return null;
+}
+```
+
+If that still returns null (older solutions sometimes use `*` versions
+or floating ranges), the command falls back to inspecting compiled
+DLLs via `FindByDllVersion`, which reads `FileVersionInfo` from the
+build output.
+
+The `excludedKeywords = "LeptonX"` default is what prevents the
+detection from picking the theme version (which is independent of the
+core ABP version) when the user only wanted the core version.
+
+## SolutionModuleAdder — the orchestration
+
+`SolutionModuleAdder.AddAsync` is the workhorse behind `add-module`:
+
+1. Reads the module manifest from `abp.io` (umbrella → list of
+   `NugetPackageInfo`).
+2. For each package, calls `ProjectNugetPackageAdder.AddAsync` against
+   the matching project (e.g. `*.Application` for application packages,
+   `*.EntityFrameworkCore` for EF Core ones).
+3. Calls `DbContextFileBuilderConfigureAdder` to insert
+   `builder.ConfigureBlogging();` in the DbContext.
+4. Calls `EfCoreMigrationManager.AddMigrationIfNeeded(startupProject,
+   "Added_Blogging_Module")` unless `--skip-db-migrations`.
+5. If the module ships Angular libraries, calls
+   `AngularSourceCodeAdder` to wire them into the SPA.
+6. Finally calls `NugetPackageToLocalReferenceConverter` when
+   `--with-source-code` is set, to swap NuGet references for project
+   references.
+7. Returns an `AddModuleInfoOutput` so `NewCommand` (which uses the same
+   adder under the hood) can show post-install instructions.
+
+## How `[DependsOn(...)]` is rewritten
+
+`DerivedClassFinder` walks every `.cs` file under the target project,
+parses it with Roslyn, and returns the class declaration inheriting
+from `AbpModule`. `ModuleClassDependcyAdder` then takes the package's
+`ModuleClassName` (from `NugetPackageInfo`) and inserts
+`typeof(BlogModule)` into the existing `DependsOn` array literal — or,
+if the attribute is missing, adds it on a new line above the class.
+
+The transformation is text-level (string-based), not Roslyn-rewrites,
+to preserve formatting exactly. Multi-line attribute arguments are
+respected because the writer indents at the same width as the existing
+ones.
+
+## Choosing the right project for a package
+
+`ProjectFinder` knows how to map each `NugetPackageTarget` to a project
+suffix:
+
+| `NugetPackageTarget` | Project suffix it looks for |
+| --- | --- |
+| `Domain` | `*.Domain.csproj` |
+| `Application` | `*.Application.csproj` |
+| `EntityFrameworkCore` | `*.EntityFrameworkCore.csproj` |
+| `HttpApi` | `*.HttpApi.csproj` |
+| `Web` / `Mvc` / `Blazor` | `*.Web.csproj` / `*.Blazor.csproj` |
+| `MongoDB` | `*.MongoDB.csproj` |
+
+If a package has no `Target` (i.e. it's UI-agnostic), the adder defaults
+to the project file passed in, or the first `.csproj` in the current
+directory.
+
+## Gotchas
+
+- **You must be inside a solution folder.** Both verbs default to
+  globbing `*.sln` / `*.csproj` from the current directory. Use `-s` and
+  `-p` explicitly in scripts.
+- **Versioning.** Auto-detection only inspects `Volo.Abp.*` references.
+  If you're upgrading and your solution still says `7.3.x` everywhere,
+  `add-module` will install `7.3.x` of the new module. Pass `-v 7.4.0`
+  explicitly when you want to mix.
+- **`--with-source-code` modifies the `.sln`** when `--add-to-solution-file`
+  is also set. Keep it committed.
+- **`@`-prefix means Angular.** A typo like `abp add-package @abp/identity`
+  will not call `dotnet add package`; the command goes through the NPM
+  path, fails to find a `package.json`, and logs a single
+  "package.json not found!" error.
+- **`add-module` requires login for commercial modules.** Without a
+  valid `abp login`, `RemoteServiceExceptionHandler` will translate the
+  401 into a "Please login with your account" message.
+- **EF Core migration project.** If your migrations live in a different
+  project than the default `*.EntityFrameworkCore`, pass
+  `-sp <startup-project>` explicitly so `dotnet ef migrations add`
+  succeeds.
+- **`DependsOn` only edits the first module class found.** If your
+  project somehow has two `AbpModule`-derived classes, only the first
+  gets patched.
+
+## Cross-references
+
+- [CLI host](./cli) — `Volo.Abp.Cli` and the DI scope around commands.
+- [Command registry](./cli-commands) — where `AddPackageCommand` and
+  `AddModuleCommand` are registered.
+- [`abp new`](./cli-new-command) — `NewCommand` calls into
+  `SolutionModuleAdder` after extracting an `app` template so the
+  initially-bundled modules end up wired correctly.
+- [`abp install-libs`](./cli-install-libs) — automatically run after
+  Angular packages are added.
+- [`abp suite`](./cli-suite) — uses `add-module` internally when you
+  install a module from the Suite UI.
+- [`abp generate-proxy`](./cli-generate-proxy) — the natural next step
+  after adding an `HttpApi.Client` package.
+- Official docs:
+  [docs.abp.io/en/abp/latest/CLI](https://docs.abp.io/en/abp/latest/CLI),
+  [Modules list](https://abp.io/modules).

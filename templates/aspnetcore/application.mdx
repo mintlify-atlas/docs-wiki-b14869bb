@@ -1,0 +1,159 @@
+---
+title: "Application Project"
+description: "Implements the application services, AutoMapper profiles, and the base ApplicationService class that bridges Domain entities to client DTOs."
+---
+
+`MyCompanyName.MyProjectName.Application` is the **server-side implementation** of the contracts declared in `Application.Contracts`. It orchestrates domain services and repositories, maps entities to DTOs with AutoMapper, applies authorization, and is the layer at which ABP's [Dynamic API Controllers](https://docs.abp.io/en/abp/latest/API/Auto-API-Controllers) machinery converts class methods into HTTP endpoints.
+
+Unlike `Application.Contracts`, this project targets `net7.0` only — it is server code, never shipped to clients.
+
+## When to put code here
+
+Add a file to `Application` when it is:
+
+- An **application service implementation** (`BookAppService : MyProjectNameAppService, IBookAppService`).
+- An **AutoMapper profile** registering `CreateMap<Book, BookDto>()`.
+- A **server-side helper** that orchestrates repositories or domain services and is consumed only by application services.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.Application/
+├── Properties/
+│   └── ...
+├── MyCompanyName.MyProjectName.Application.csproj
+├── MyProjectNameApplicationAutoMapperProfile.cs
+├── MyProjectNameApplicationModule.cs
+└── MyProjectNameAppService.cs
+```
+
+## csproj at a glance
+
+| Property            | Value                                              |
+| ------------------- | -------------------------------------------------- |
+| `TargetFramework`   | `net7.0`                                           |
+| `Nullable`          | `enable`                                           |
+| `RootNamespace`     | `MyCompanyName.MyProjectName`                      |
+
+| Project reference                                                         | Purpose                                                  |
+| ------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `MyCompanyName.MyProjectName.Domain`                                      | Aggregate roots, repository interfaces, settings         |
+| `MyCompanyName.MyProjectName.Application.Contracts`                       | Service interfaces, DTOs, permissions                    |
+| `Volo.Abp.Account.Application`                                            | Account management implementation                        |
+| `Volo.Abp.Identity.Application`                                           | User/role management implementation                      |
+| `Volo.Abp.PermissionManagement.Application`                               | Permission management UI backend                         |
+| `Volo.Abp.TenantManagement.Application`                                   | Tenant CRUD implementation                               |
+| `Volo.Abp.FeatureManagement.Application`                                  | Feature management implementation                        |
+| `Volo.Abp.SettingManagement.Application`                                  | Setting management implementation                        |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameDomainModule),
+    typeof(AbpAccountApplicationModule),
+    typeof(MyProjectNameApplicationContractsModule),
+    typeof(AbpIdentityApplicationModule),
+    typeof(AbpPermissionManagementApplicationModule),
+    typeof(AbpTenantManagementApplicationModule),
+    typeof(AbpFeatureManagementApplicationModule),
+    typeof(AbpSettingManagementApplicationModule))]
+public class MyProjectNameApplicationModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpAutoMapperOptions>(options =>
+        {
+            options.AddMaps<MyProjectNameApplicationModule>();
+        });
+    }
+}
+```
+
+The `AddMaps<MyProjectNameApplicationModule>()` call scans **the entire assembly** for AutoMapper `Profile` subclasses and registers them, so adding a new profile only requires creating a new class.
+
+## Key types
+
+### MyProjectNameAppService
+
+Abstract base class for every application service in the project:
+
+```csharp
+public abstract class MyProjectNameAppService : ApplicationService
+{
+    protected MyProjectNameAppService()
+    {
+        LocalizationResource = typeof(MyProjectNameResource);
+    }
+}
+```
+
+Inheriting from this class gives you:
+
+- `IStringLocalizer` (via the base `ApplicationService.L` property) automatically scoped to `MyProjectNameResource`.
+- Property-injected `ICurrentUser`, `ICurrentTenant`, `IObjectMapper`, `ILogger`, and `IGuidGenerator`.
+- Conventional URL routing so `BookAppService` becomes `/api/app/book` without any attribute routing.
+
+### MyProjectNameApplicationAutoMapperProfile
+
+Empty in the template — drop your `CreateMap<,>` calls here, or create one profile per feature folder:
+
+```csharp
+public class MyProjectNameApplicationAutoMapperProfile : Profile
+{
+    public MyProjectNameApplicationAutoMapperProfile()
+    {
+        /* CreateMap<Book, BookDto>(); */
+    }
+}
+```
+
+`MapperConfiguration` validation is performed by ABP at startup (if `ValidatingInlineMappings` is enabled). Unmapped properties throw an `AutoMapperConfigurationException` immediately, which is much better than discovering missing maps in production.
+
+## How to add a new application service
+
+1. Inside `Application.Contracts`, define `IBookAppService` and the DTOs.
+2. Inside `Application/Books/BookAppService.cs`:
+
+    ```csharp
+    public class BookAppService :
+        CrudAppService<Book, BookDto, Guid, PagedAndSortedResultRequestDto, CreateUpdateBookDto>,
+        IBookAppService
+    {
+        public BookAppService(IRepository<Book, Guid> repository)
+            : base(repository)
+        {
+            GetPolicyName = MyProjectNamePermissions.Books.Default;
+            CreatePolicyName = MyProjectNamePermissions.Books.Create;
+        }
+    }
+    ```
+
+3. Add an AutoMapper profile (or extend the existing one):
+
+    ```csharp
+    CreateMap<Book, BookDto>();
+    CreateMap<CreateUpdateBookDto, Book>();
+    ```
+
+4. Build. Because the host's `ConventionalControllers.Create(typeof(MyProjectNameApplicationModule).Assembly)` is already wired, the service appears at `/api/app/book` immediately — no controller code required.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| New application service               | Implement `IBookAppService` from contracts                       |
+| Add a mapping                         | New `Profile` class in this assembly                             |
+| Change the auto-API route             | `Configure<AbpAspNetCoreMvcOptions>(...)` in the host             |
+| Background work                       | `IBackgroundJobManager.EnqueueAsync(...)` from an `AppService`    |
+| Domain event publishing               | `_localEventBus.PublishAsync(new BookCreatedEto { ... })`         |
+| Distributed event publishing          | `_distributedEventBus.PublishAsync(...)`                          |
+
+## Gotchas
+
+- **Application services are transient.** Constructor-injected services follow ABP's transient/scoped lifetime rules — never store entity references in instance fields; they would leak across requests.
+- **AutoMapper inside a service requires `IObjectMapper`, not `IMapper`.** The framework wraps AutoMapper to add multi-tenancy and current-user context to mappings. Calling raw `IMapper.Map` skips the extension property pipeline declared in `Application.Contracts`.
+- **`CrudAppService` uses your repository's `WithDetailsAsync()` chain only if you override `GetAsync`/`GetListAsync`.** Lazy-loaded navigations are off by default in ABP's EF Core repository, so include them explicitly inside the application service if your DTO maps from related entities.
+- **Permission policy names go on the service, not the DTO.** Setting `CreatePolicyName` in the constructor enables ABP's automatic authorization. Adding `[Authorize]` attributes manually is allowed but the framework will silently combine both — duplicate checks slow down hot paths.
+- **`#if DEBUG NullEmailSender` lives in `Domain`, not here.** Don't replicate the registration in `Application`; the `AbpAccountApplicationModule` dependency relies on whichever email sender the `Domain` module registers.
+- **Don't reference `EntityFrameworkCore` or `MongoDB` from here.** Application code talks to repositories through interfaces; concrete implementations are wired in the database-specific modules. Adding a direct reference forces consumers to take both database providers as transitive dependencies.

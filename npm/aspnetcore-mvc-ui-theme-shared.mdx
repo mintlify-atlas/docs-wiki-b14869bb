@@ -1,0 +1,301 @@
+---
+title: "@abp/aspnetcore.mvc.ui.theme.shared"
+description: "The MVC UI meta-package. Aggregates jQuery, Bootstrap, DataTables, SweetAlert2, Toastr, Select2, Luxon, and ships ABP's WidgetManager, ModalManager, AjaxForm, DataTables extensions, and UI extension contributor bus."
+---
+
+`@abp/aspnetcore.mvc.ui.theme.shared` is the **workhorse** of every ABP MVC/Razor application. Every
+theme — Basic, LeptonX-Lite, the commercial LeptonX — depends on this pack, and through it pulls in
+the full third-party JS/CSS catalog plus the ABP-authored extensions that give Razor pages their
+ModalManager, WidgetManager, abpAjaxForm, action contributor bus, and DataTables enhancements.
+
+## Package metadata
+
+```json
+{
+    "name": "@abp/aspnetcore.mvc.ui.theme.shared",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "@abp/aspnetcore.mvc.ui":              "~7.4.0",
+        "@abp/bootstrap":                      "~7.4.0",
+        "@abp/bootstrap-datepicker":           "~7.4.0",
+        "@abp/bootstrap-daterangepicker":      "~7.4.0",
+        "@abp/datatables.net-bs5":             "~7.4.0",
+        "@abp/font-awesome":                   "~7.4.0",
+        "@abp/jquery-form":                    "~7.4.0",
+        "@abp/jquery-validation-unobtrusive":  "~7.4.0",
+        "@abp/lodash":                         "~7.4.0",
+        "@abp/luxon":                          "~7.4.0",
+        "@abp/malihu-custom-scrollbar-plugin": "~7.4.0",
+        "@abp/moment":                         "~7.4.0",
+        "@abp/select2":                        "~7.4.0",
+        "@abp/sweetalert2":                    "~7.4.0",
+        "@abp/timeago":                        "~7.4.0",
+        "@abp/toastr":                         "~7.4.0"
+    }
+}
+```
+
+Sixteen transitive packs. Together they cover the entire JS surface that ABP-authored Razor views and
+view components ever reference, and they all get copied into `wwwroot/libs/` by the
+[`abp.resourcemapping.js`](/npm/aspnetcore-mvc-ui) mechanism.
+
+Notably **`@abp/core` is not declared here**. Each downstream theme installs `@abp/core` separately
+(because the LeptonX themes rely on the same abstractions and don't want a duplicate path), but every
+real consumer of `theme.shared` also has `@abp/core` somewhere in its `node_modules` tree.
+
+## Files shipped
+
+The pack itself only ships `package.json` and `README.md`. The "ABP additions to third-party libraries"
+that everyone associates with this pack actually live in the **C# project** at
+`framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared/wwwroot/libs/abp/aspnetcore-mvc-ui-theme-shared/`.
+They are copied to your `wwwroot/libs/` not by an `abp.resourcemapping.js` but by the bundle
+contributor in C# (because they are static files on the .NET assembly).
+
+What lands in `wwwroot/libs/abp/aspnetcore-mvc-ui-theme-shared/`:
+
+```text
+aspnetcore-mvc-ui-theme-shared/
+├── ui-extensions.js                    ← entity action / column contributor bus
+├── bootstrap/
+│   ├── dom-event-handlers.js           ← form auto-validation, confirm, dropdown helpers
+│   └── modal-manager.js                ← abp.ModalManager
+├── datatables/
+│   ├── datatables-extensions.js        ← record actions, row actions, abp.libs.datatables
+│   ├── datatables-styles.css
+│   └── datatables-styles.scss
+├── date-range-picker/date-range-picker-styles.css
+├── jquery/
+│   ├── jquery-extensions.js            ← $.fn.buttonBusy, serializeFormToObject
+│   └── widget-manager.js               ← abp.WidgetManager
+├── jquery-form/jquery-form-extensions.js  ← $.fn.abpAjaxForm
+├── sweetalert2/abp-sweetalert2.js      ← wires abp.message.*
+└── toastr/abp-toastr.js                ← wires abp.notify.*
+```
+
+## The five major APIs
+
+### 1. `abp.ModalManager`
+
+Defined in `bootstrap/modal-manager.js`. The constructor:
+
+```js
+var modal = new abp.ModalManager({
+    viewUrl: 'PostEditModal',           // server URL to load the modal partial from
+    scriptUrl: '/Pages/Posts/edit.js',  // optional client-side JS to load after the partial
+    modalClass: 'modal-lg'
+});
+
+modal.onResult(function (result) { /* called when the inner form posts successfully */ });
+modal.onOpen  (function () { /* called after the modal is shown */ });
+modal.onClose (function () { /* called after the modal is closed */ });
+
+modal.open({ id: '@(Model.PostId)' }); // query-string params passed to the server URL
+```
+
+Internally it appends the partial HTML to `<body>`, fires `shown.bs.modal`, runs jQuery Unobtrusive
+Validation on the form (`$.validator.unobtrusive.parse`), intercepts submit via `abpAjaxForm`, and
+closes the dialog on a successful response. Pairs naturally with ABP's `[AjaxOnly]` Razor handlers.
+
+`$.validator.defaults.ignore = '';` is set at the top of the file — without that line, jQuery
+Validation would skip hidden fields, breaking modals where tabs are toggled via `display: none`.
+
+### 2. `abp.WidgetManager`
+
+From `jquery/widget-manager.js`. Powers the Razor `<abp-widget>` tag helper:
+
+```js
+var widgetManager = new abp.WidgetManager({
+    wrapper:    $('#dashboard'),                       // container scope
+    filterForm: $('#dashboardFilters'),                // serialized into widget refresh params
+    filterCallback: function () { return { extra: 1 }; }
+});
+
+widgetManager.init();                                  // load every .abp-widget-wrapper inside
+widgetManager.refresh($('#dashboard').find('.abp-widget-wrapper:first'));
+```
+
+Each widget DIV gets a `data-abp-widget-api` populated by the widget script (e.g. CMS Kit's
+`abp.widgets.CmsCommenting`). The manager calls `getFilters()` on the widget, sends them in the AJAX
+refresh request, and replaces the widget's inner HTML with the server response — so a Razor
+ViewComponent can be re-rendered without a page reload.
+
+### 3. `$.fn.abpAjaxForm`
+
+In `jquery-form/jquery-form-extensions.js`. A thin layer on the venerable `jquery.form` plugin that:
+
+- Calls `$form.valid()` before submitting (returns false if invalid).
+- Sets the submit button busy via `$.fn.buttonBusy(true)`.
+- Excludes selected buttons from the busy effect via `formSubmitting.$excludedBusyButtons`.
+- Restores the button on completion.
+
+```html
+<form id="editForm" method="post" asp-page="/Posts/Edit">
+    @* ... *@
+    <button type="submit" data-busy-text="Saving…">Save</button>
+</form>
+<script>
+    $('#editForm').abpAjaxForm({
+        success: function (response) { abp.notify.success('Saved'); },
+        formSubmitting: { disableSubmitButtonBusy: false }
+    });
+</script>
+```
+
+### 4. DataTables extensions (`abp.libs.datatables`)
+
+In `datatables/datatables-extensions.js`. Adds three DataTables column "renderers":
+
+- **`rowActions`** — turns a column into a `<div class="dropdown">` of contextual actions, with
+  per-row `visible` predicates, icons, and text.
+- **`predefinedActions`** — renders standard Edit/Delete buttons with permission and i18n integration.
+- **Localization defaults** — pulls language strings from the `AbpUi` resource so DataTables UI is
+  always in the user's culture without per-page configuration.
+
+Typical usage from a Razor view (after `abp.libs.datatables` is on the page):
+
+```js
+var table = $('#postsTable').DataTable(abp.libs.datatables.normalizeConfiguration({
+    serverSide: true,
+    paging:    true,
+    order:     [[1, 'desc']],
+    ajax:      abp.libs.datatables.createAjax(volo.cms.blog.blogPosts.getList),
+    columnDefs: [
+        {
+            rowAction: {
+                items: [
+                    { text: 'Edit',   visible: abp.auth.isGranted('Posts.Edit'),
+                      action: function (data) { editModal.open({ id: data.record.id }); } },
+                    { text: 'Delete', confirmMessage: 'Are you sure?',
+                      action: function (data) { volo.cms.blog.blogPosts.delete(data.record.id); } }
+                ]
+            }
+        },
+        // ... other columns ...
+    ]
+}));
+```
+
+### 5. UI extensions (`abp.ui.extensions.entityActions` / `entityTableColumns`)
+
+In `ui-extensions.js`. Both expose `addContributor(callback, order?)` and a lazy `.actions` /
+`.columns` getter. Contributors are accumulated in an `abp.utils.common.LinkedList` (from
+[`@abp/utils`](/npm/utils)).
+
+```js
+// Add a custom action to the Identity Users table from another module:
+abp.ui.extensions.entityActions.get('identity.user').addContributor(function (actionList) {
+    actionList.addTail({
+        text: 'Send Welcome Email',
+        visible: function () { return abp.auth.isGranted('Identity.SendEmail'); },
+        action: function (data) {
+            volo.abp.identity.identityUser.sendWelcomeEmail(data.record.id);
+        }
+    });
+});
+```
+
+ABP's own Razor pages call `abp.ui.extensions.entityActions.get('identity.user').actions` when
+building their DataTable, so contributions added before `DOMContentLoaded` are reflected.
+
+## Smaller helpers that come along
+
+`jquery/jquery-extensions.js` adds:
+
+- `$.fn.buttonBusy(isBusy)` — swap a button's `<i>` icon for `fa fa-spin fa-spinner`, set `disabled`,
+  replace text with `data-busy-text` (supports HTML when `data-busy-text-is-html` is present).
+- `$.fn.serializeFormToObject(camelCase?)` — returns a JS object (rather than the array
+  `serializeArray` returns) with unchecked checkboxes set to `false`, optionally with camelCase keys.
+
+`bootstrap/dom-event-handlers.js` registers global handlers that:
+
+- Auto-call `$.validator.unobtrusive.parse` on dynamically-injected forms.
+- Honour `data-confirm` attributes on forms (and modal close buttons) by routing through
+  `abp.message.confirm`.
+
+`toastr/abp-toastr.js` and `sweetalert2/abp-sweetalert2.js` install real bodies for `abp.notify.*` and
+`abp.message.*` (the no-ops from [`@abp/core`](/npm/core)). `abp-toastr.js` sets the default position
+to `toast-bottom-right`; `abp-sweetalert2.js` exposes `abp.libs.sweetAlert.config.default/info/success/warn/error/confirm`
+so the icons can be customised globally.
+
+## Razor view example end-to-end
+
+```html
+@page
+@model Acme.BookStore.Web.Pages.Books.IndexModel
+
+<abp-script src="/Pages/Books/index.js" />
+
+<div class="card">
+    <div class="card-body">
+        <table id="booksTable" class="table table-striped"></table>
+    </div>
+</div>
+
+<abp-modal id="EditBookModal">
+    <abp-modal-header title="Edit Book"></abp-modal-header>
+    <abp-modal-body>
+        <abp-dynamic-form abp-model="@Model.Book" />
+    </abp-modal-body>
+</abp-modal>
+```
+
+```js
+// /Pages/Books/index.js
+(function () {
+    var l = abp.localization.getResource('Books');
+
+    var editModal = new abp.ModalManager('/Books/EditBookModal');
+
+    var table = $('#booksTable').DataTable(abp.libs.datatables.normalizeConfiguration({
+        serverSide: true,
+        paging:    true,
+        order:     [[1, 'asc']],
+        ajax:      abp.libs.datatables.createAjax(acme.bookStore.books.getList),
+        columnDefs: [
+            { rowAction: { items: [
+                { text: l('Edit'),   visible: abp.auth.isGranted('Books.Edit'),
+                  action: function (data) { editModal.open({ id: data.record.id }); } }
+            ] } },
+            { data: 'name' },
+            { data: 'price', render: function (v) { return v.toFixed(2); } }
+        ]
+    }));
+
+    editModal.onResult(function () {
+        abp.notify.info(l('Saved'));
+        table.ajax.reload();
+    });
+})();
+```
+
+This is the pattern repeated across every ABP module's admin UI.
+
+## Gotchas
+
+- **`$.validator.defaults.ignore = ''` is set globally** by `modal-manager.js`. If you load a third-party
+  jQuery Validation plugin that relies on the default `:hidden` ignore, things will misbehave. Restore
+  per form via `$('#myForm').validate({ ignore: ':hidden' });`.
+- **`buttonBusy` reads `data-busy-text` as text by default.** Pass HTML only when you also set
+  `data-busy-text-is-html`, else jQuery `.text()` escapes your `<i>` icon.
+- **`abp.notify` and `abp.message` are still no-ops if Toastr/SweetAlert2 don't load.** Verify their
+  `<script>` tags are emitted by the bundle contributor; both wire themselves into `abp.*` only after
+  the global library is reachable (`if (!toastr) return;` early-out at the top).
+- **`abp.ModalManager` re-parses unobtrusive validation every time you open the modal.** If you
+  programmatically toggle `data-val` attributes after `open()`, call `$.validator.unobtrusive.parse(form)`
+  yourself afterwards.
+- **`abp.libs.datatables.createAjax` expects an ABP dynamic client proxy function** (`volo.x.y.z.getList`)
+  with `maxResultCount`/`skipCount`/`sorting` parameters. Hand-written REST endpoints need a wrapper.
+- **`@abp/lodash` ships only what theme.shared needs.** It is not a full lodash — it is the standard
+  lodash distribution but limited to the modules whose `lodash.<fn>.js` files are reachable through
+  this pack. For project code you can `import` from the normal `lodash` package; for theme.shared
+  internals, stick to `_.isFunction`, `_.cloneDeep`, etc., which are guaranteed to be there.
+
+## Related pages
+
+- [`@abp/aspnetcore.mvc.ui.theme.basic`](/npm/aspnetcore-mvc-ui-theme-basic) — the Basic theme adds
+  layout JS on top of this pack.
+- [`@abp/core`](/npm/core) — defines the no-op `abp.notify` / `abp.message` that this pack fills in.
+- [`@abp/utils`](/npm/utils) — the `LinkedList<T>` behind `entityActions` and `entityTableColumns`.
+- [`@abp/third-party-packs`](/npm/third-party-packs) — the catalog of jQuery/Bootstrap/Datatables/etc.
+  shims declared in this pack's `dependencies`.

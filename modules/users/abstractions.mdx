@@ -1,0 +1,283 @@
+---
+title: "Users Abstractions: IUserData, UserEto & External Lookups"
+sidebarTitle: "Abstractions"
+description: "Volo.Abp.Users.Abstractions — the dependency-free user contract package: IUserData, UserData, UserEto, IExternalUserLookupServiceProvider."
+---
+
+`Volo.Abp.Users.Abstractions` is the *thin* package — the one you can take a dependency on without pulling ABP's DDD machinery. It defines the cross-module user contract (`IUserData`), two distributed-event payloads (`UserEto`, `UserPasswordChangeRequestedEto`), and the extension point that lets you back ABP's user system with an external directory (`IExternalUserLookupServiceProvider`). Nothing in this package references `Volo.Abp.Domain`, so it can be referenced from low-level shared libraries.
+
+## File inventory (`Volo/Abp/Users/`)
+
+| File | Role |
+| --- | --- |
+| `AbpUsersAbstractionModule.cs` | Depends on `AbpMultiTenancyModule` and `AbpEventBusModule`. |
+| `IUserData.cs` | The cross-module user contract DTO interface. |
+| `UserData.cs` | Concrete `IUserData` with three constructors. |
+| `UserEto.cs` | `[EventName("Volo.Abp.Users.User")]` distributed-event payload. |
+| `UserPasswordChangeRequestedEto.cs` | `[EventName("Volo.Abp.Users.UserPasswordChangeRequested")]`. |
+| `IExternalUserLookupServiceProvider.cs` | Plug for non-Identity user sources. |
+
+## Module wiring
+
+```csharp
+[DependsOn(typeof(AbpMultiTenancyModule), typeof(AbpEventBusModule))]
+public class AbpUsersAbstractionModule : AbpModule
+{
+}
+```
+
+Two things to note:
+
+* The module body is empty — it exists purely to declare dependencies, so a downstream module that adds `[DependsOn(typeof(AbpUsersAbstractionModule))]` automatically gets multi-tenancy services and the local/distributed event bus.
+* The source comments include a TODO from the framework team to (eventually) move this to the same assembly as `ICurrentUser`. As of today, `ICurrentUser` lives in `Volo.Abp.Security`; the abstraction split is intentional but historical.
+
+## `IUserData`
+
+```csharp
+public interface IUserData : IHasExtraProperties
+{
+    Guid Id { get; }
+    Guid? TenantId { get; }
+    string UserName { get; }
+    string Name { get; }
+    string Surname { get; }
+    bool IsActive { get; }
+    [CanBeNull] string Email { get; }
+    bool EmailConfirmed { get; }
+    [CanBeNull] string PhoneNumber { get; }
+    bool PhoneNumberConfirmed { get; }
+}
+```
+
+The contract is *flat* — there are no roles, claims, or login providers. That's the entire point: cross-cutting modules consume `IUserData` so they don't need to know whether the user came from `IdentityUser`, your custom user table, or an LDAP query result. `IHasExtraProperties` lets you tunnel domain-specific fields (e.g. `Country`, `EmployeeId`) through the DTO without modifying the interface.
+
+### Property semantics
+
+| Property | Notes |
+| --- | --- |
+| `Id` | Stable GUID. For external sources you must invent one (typically `GuidGenerator.Create()` keyed on the external identifier). |
+| `TenantId` | `null` for host users. The framework's `ICurrentTenant` filter relies on this. |
+| `UserName` | Required; case-insensitive comparison is conventional but the interface does not enforce it. |
+| `Name`, `Surname` | Display fields; both nullable in practice (interface doesn't declare `[CanBeNull]` but the EF Core mapping allows nulls). |
+| `IsActive` | Soft-disable flag. Inactive users can still be looked up; the login pipeline (in Identity) rejects them. |
+| `Email`, `PhoneNumber` | Optional and `[CanBeNull]`. |
+| `EmailConfirmed`, `PhoneNumberConfirmed` | Track whether the user proved control of the contact channel. |
+| `ExtraProperties` | The dictionary survives mapping to `UserEto` and back — use it for tenant-defined attributes. |
+
+## `UserData`
+
+```csharp
+public class UserData : IUserData
+{
+    public Guid Id { get; set; }
+    public Guid? TenantId { get; set; }
+    public string UserName { get; set; }
+    public string Name { get; set; }
+    public string Surname { get; set; }
+    public bool IsActive { get; set; }
+    public string Email { get; set; }
+    public bool EmailConfirmed { get; set; }
+    public string PhoneNumber { get; set; }
+    public bool PhoneNumberConfirmed { get; set; }
+    public ExtraPropertyDictionary ExtraProperties { get; }
+
+    public UserData() { }
+
+    public UserData(IUserData userData)
+    {
+        Id = userData.Id;
+        UserName = userData.UserName;
+        Email = userData.Email;
+        Name = userData.Name;
+        Surname = userData.Surname;
+        IsActive = userData.IsActive;
+        EmailConfirmed = userData.EmailConfirmed;
+        PhoneNumber = userData.PhoneNumber;
+        PhoneNumberConfirmed = userData.PhoneNumberConfirmed;
+        TenantId = userData.TenantId;
+        ExtraProperties = userData.ExtraProperties;
+    }
+
+    public UserData(
+        Guid id,
+        [NotNull] string userName,
+        [CanBeNull] string email = null,
+        [CanBeNull] string name = null,
+        [CanBeNull] string surname = null,
+        bool emailConfirmed = false,
+        [CanBeNull] string phoneNumber = null,
+        bool phoneNumberConfirmed = false,
+        Guid? tenantId = null,
+        bool isActive = true,
+        ExtraPropertyDictionary extraProperties = null) { ... }
+}
+```
+
+Three constructors:
+
+1. **Default** — for deserialization (`System.Text.Json` needs the parameterless ctor).
+2. **Copy** — wraps an existing `IUserData`. Used inside `AbpUserExtensions.ToAbpUserData()` and the lookup pipeline.
+3. **Scalar** — builds from primitives. `userName` is `[NotNull]`; everything else has sensible defaults. `isActive: true` and `emailConfirmed: false` are *the* defaults — when integrating an external directory that has no notion of confirmation, the user is treated as unconfirmed until proven otherwise.
+
+Note the asymmetry: `ExtraProperties` is `{ get; }` in `UserData` but `{ get; set; }` in `UserEto`. The DTO is read-only because it's typically populated in a ctor; the eto is mutable because event-bus serializers need writable setters.
+
+## `UserEto`
+
+```csharp
+[EventName("Volo.Abp.Users.User")]
+public class UserEto : IUserData, IMultiTenant
+{
+    public Guid Id { get; set; }
+    public Guid? TenantId { get; set; }
+    public string UserName { get; set; }
+    public string Name { get; set; }
+    public string Surname { get; set; }
+    public bool IsActive { get; set; }
+    public string Email { get; set; }
+    public bool EmailConfirmed { get; set; }
+    public string PhoneNumber { get; set; }
+    public bool PhoneNumberConfirmed { get; set; }
+    public ExtraPropertyDictionary ExtraProperties { get; set; }
+}
+```
+
+This is the *integration event* payload for user-state changes. The Identity module fires `EntityCreatedEto<UserEto>`, `EntityUpdatedEto<UserEto>` and `EntityDeletedEto<UserEto>` through `IDistributedEventBus` whenever an `IdentityUser` is mutated. Other services subscribe to these to keep their own local user mirrors in sync:
+
+```csharp
+public class UserSyncHandler :
+    IDistributedEventHandler<EntityCreatedEto<UserEto>>,
+    IDistributedEventHandler<EntityUpdatedEto<UserEto>>,
+    IDistributedEventHandler<EntityDeletedEto<UserEto>>
+{
+    public Task HandleEventAsync(EntityCreatedEto<UserEto> ev) { ... }
+    // ...
+}
+```
+
+The event name `Volo.Abp.Users.User` is stable across versions — your handlers won't break on minor upgrades.
+
+## `UserPasswordChangeRequestedEto`
+
+```csharp
+[Serializable]
+[EventName("Volo.Abp.Users.UserPasswordChangeRequested")]
+public class UserPasswordChangeRequestedEto : IMultiTenant
+{
+    public Guid? TenantId { get; set; }
+    public string UserName { get; set; }
+    public string Password { get; set; }
+}
+```
+
+This is the only event in the package that carries a secret. The Identity module publishes it when an admin (in the *host*) resets a *tenant* user's password while the tenant's database is unreachable — the event lands on the tenant's host queue, the tenant DB writes the new hash later. Three rules:
+
+* **Treat the event as encrypted-in-transit.** It contains a cleartext password. Run the distributed event bus over TLS (RabbitMQ + TLS, Kafka + SASL/SSL, Service Bus).
+* **`[Serializable]`** is declared so legacy binary-serializer infrastructure works; JSON is the default but the attribute is harmless and required for some integrations.
+* **`UserName + TenantId`** is the routing key — the handler resolves the local user via `UserManager.FindByNameAsync` inside the tenant scope.
+
+## `IExternalUserLookupServiceProvider`
+
+```csharp
+public interface IExternalUserLookupServiceProvider
+{
+    Task<IUserData> FindByIdAsync(Guid id, CancellationToken cancellationToken = default);
+    Task<IUserData> FindByUserNameAsync(string userName, CancellationToken cancellationToken = default);
+
+    Task<List<IUserData>> SearchAsync(
+        string sorting = null, string filter = null,
+        int maxResultCount = int.MaxValue, int skipCount = 0,
+        CancellationToken cancellationToken = default);
+
+    Task<long> GetCountAsync(string filter = null, CancellationToken cancellationToken = default);
+}
+```
+
+This is the **single hook** for backing ABP's user system with an external directory (LDAP, Active Directory, a legacy SQL table, a SaaS HR system). Implement it once, register as singleton, and `UserLookupService<TUser, TUserRepository>` will:
+
+* try the local DB first;
+* fall through to `FindByXxxAsync` when no local row is found (or `SkipExternalLookupIfLocalUserExists = false`);
+* synthesize a local row from the returned `IUserData` via the concrete `CreateUser(externalUser)` override;
+* delegate `SearchAsync` / `GetCountAsync` entirely to the external provider when one is registered (the local repository is bypassed for *search* — only for *lookup* is the local-first ordering applied).
+
+### Minimal implementation
+
+```csharp
+public class LdapUserLookupProvider : IExternalUserLookupServiceProvider, ITransientDependency
+{
+    private readonly ILdapClient _ldap;
+
+    public LdapUserLookupProvider(ILdapClient ldap) => _ldap = ldap;
+
+    public async Task<IUserData> FindByUserNameAsync(string userName, CancellationToken ct = default)
+    {
+        var entry = await _ldap.FindBySamAccountAsync(userName, ct);
+        if (entry == null) return null;
+
+        return new UserData(
+            id: GuidUtilities.DeriveFrom(entry.ObjectSid),
+            userName: entry.SamAccountName,
+            email: entry.Mail,
+            name: entry.GivenName,
+            surname: entry.Sn,
+            emailConfirmed: true,
+            tenantId: null,
+            isActive: !entry.Disabled);
+    }
+
+    // FindByIdAsync, SearchAsync, GetCountAsync …
+}
+```
+
+### Lookup flow with an external provider
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant LS as UserLookupService&lt;TUser,TRepo&gt;
+    participant Repo as TRepo
+    participant Ext as IExternalUserLookupServiceProvider
+    participant UOWM as IUnitOfWorkManager
+
+    Caller->>LS: FindByUserNameAsync("alice")
+    LS->>Repo: FindByUserNameAsync("alice")
+    alt SkipExternalLookupIfLocalUserExists && local != null
+        Repo-->>LS: local user
+        LS-->>Caller: local user
+    else
+        LS->>Ext: FindByUserNameAsync("alice")
+        Ext-->>LS: IUserData externalUser or null
+        alt externalUser == null && local != null
+            LS->>UOWM: Begin(requiresNew)
+            LS->>Repo: DeleteAsync(localUser)
+            LS-->>Caller: null
+        else externalUser != null && local == null
+            LS->>UOWM: Begin(requiresNew)
+            LS->>Repo: InsertAsync(CreateUser(externalUser))
+            LS-->>Caller: reloaded local user
+        else externalUser != null && local != null
+            alt local is IUpdateUserData && Update(extData) returned true
+                LS->>UOWM: Begin(requiresNew)
+                LS->>Repo: UpdateAsync(local)
+            end
+            LS-->>Caller: reloaded local user
+        end
+    end
+```
+
+Failure modes are explicit: if the external provider throws, the local user is returned and the exception is logged. If the external provider says "no such user" *and* a local user exists, the local user is *deleted*. The source comments this as a TODO ("instead of deleting, should be make it passive…") — be aware that an LDAP outage that returns "not found" instead of throwing will *wipe* your local cache.
+
+## Gotchas
+
+* **`UserPasswordChangeRequestedEto` carries cleartext.** Use a TLS-enabled bus. Do not enable per-event archival to a file system without encryption.
+* **`UserEto` does not include roles or claims.** Consumers that need authorization data must call back into the Identity service or maintain their own claim cache.
+* **`SearchAsync` delegates entirely to the external provider** when one is registered — the local DB is not consulted for search results. This is by design: the external directory is the source of truth for "who exists." If you need a hybrid search, override `UserLookupService.SearchAsync`.
+* **`ExternalUserLookupServiceProvider` is `null` by default.** The framework treats absence as "no external source." Property injection (`public IExternalUserLookupServiceProvider ExternalUserLookupServiceProvider { get; set; }`) is how you opt in — DI will populate it if any implementation is registered.
+* **`SkipExternalLookupIfLocalUserExists`** is protected and `true` by default. Override it to `false` in a derived lookup if you need to refresh stale local data on every read (at the cost of a directory round-trip per login).
+* **The abstractions module is tiny but transitive.** Depending on it pulls in `AbpMultiTenancyModule` (which pulls `AbpDataModule`, `AbpSettingsModule`, …). Don't expect a "logical zero-dep" package — it's *DI-zero-dep* relative to the DDD layer, not absolute zero.
+
+## Cross-links
+
+* [Overview](./overview) — how the abstractions, domain, and persistence layers fit together.
+* [Domain](./domain) — `IUser`, `UserLookupService<,>`, `IUserRepository<>`.
+* [Identity Domain](/modules/identity/domain) — `IdentityUser` aggregate, `IdentityUserLookupService`.
+* [Framework / Distributed event bus](/framework/event-bus/distributed) — how `UserEto` events flow.

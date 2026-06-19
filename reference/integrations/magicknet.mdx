@@ -1,0 +1,272 @@
+---
+title: "Magick.NET"
+description: "External-library reference for Magick.NET (ImageMagick bindings) — Volo.Abp.Imaging.MagickNet module, native dependencies, format coverage, and container packaging."
+---
+
+`Volo.Abp.Imaging.MagickNet` wires the [Magick.NET](https://github.com/dlemstra/Magick.NET) library — managed .NET bindings over the venerable ImageMagick C library — into ABP's `IImageResizer` and `IImageCompressor`. It complements `Volo.Abp.Imaging.ImageSharp` and is the right choice when you need HEIC/AVIF/RAW support, exotic operators, or an Apache-2.0-friendly licence across the board.
+
+For the abstraction layer see [Imaging](/framework/imaging-blob/imaging) and the [Magick.NET page](/framework/imaging-blob/imaging-magickdotnet).
+
+## ABP package
+
+| Package | Module |
+| --- | --- |
+| `Volo.Abp.Imaging.MagickNet` | `AbpImagingMagickNetModule` |
+
+```csharp
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingMagickNetModule : AbpModule { }
+```
+
+Registered contributors:
+
+- `MagickImageResizerContributor` (`IImageResizerContributor`).
+- `MagickImageCompressorContributor` (`IImageCompressorContributor`).
+
+## Options model
+
+```csharp
+public class MagickNetCompressOptions
+{
+    public bool OptimalCompression { get; set; }
+    public bool IgnoreUnsupportedFormats { get; set; }
+    public bool Lossless { get; set; }
+}
+```
+
+| Property | Default | Effect |
+| --- | --- | --- |
+| `OptimalCompression` | `false` | Toggles ImageMagick's `OptimalCompression` flag — slower, smaller output, particularly for PNG and JPEG. |
+| `IgnoreUnsupportedFormats` | `false` | If `true`, formats Magick can't compress (or refuses) are returned as-is rather than throwing. |
+| `Lossless` | `false` | Forces lossless output where the format supports it (PNG, lossless WebP, JPEG XL). |
+
+Configure during module setup:
+
+```csharp
+Configure<MagickNetCompressOptions>(options =>
+{
+    options.OptimalCompression = true;
+    options.IgnoreUnsupportedFormats = true;
+});
+```
+
+The resizer has no options class — like ImageSharp, it reads dimensions and mode from `ImageResizeArgs`.
+
+## NuGet variants
+
+Magick.NET ships several variants. Pick the one matching your runtime:
+
+| Variant | Native binary | Notes |
+| --- | --- | --- |
+| `Magick.NET-Q8-AnyCPU` | ImageMagick Q8 (8 bits / channel) | Smallest, fastest; sufficient for 8-bit content. |
+| `Magick.NET-Q16-AnyCPU` | ImageMagick Q16 | 16-bit channels; better for HDR / photo workflows. |
+| `Magick.NET-Q16-HDRI-AnyCPU` | Q16 + HDRI | Floating-point pipeline; needed for some scientific use. |
+| `Magick.NET-Q8-x64` / `Q16-x64` | x64 only | Older variants. |
+
+ABP's package depends on `Magick.NET-Q16-AnyCPU` by default. You can replace it with a Q8 build for smaller container images:
+
+```xml
+<PackageReference Include="Magick.NET-Q8-AnyCPU" Version="..." />
+<!-- and remove the Q16 transitive dependency -->
+```
+
+The variants ship native binaries inside the NuGet — there's nothing to install at the OS level for typical Debian / Ubuntu / Mariner containers.
+
+## Native dependencies on Alpine / Distroless
+
+Magick.NET's native binary expects glibc. On **Alpine** (musl) you must install `glibc` compat (`apk add gcompat`) or — better — switch to `mcr.microsoft.com/dotnet/aspnet:8.0` (Debian-based). On **distroless** images you need the `cc` variant that bundles glibc.
+
+A minimal Dockerfile snippet for Debian-based images:
+
+```Dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+`libgomp1` is required for ImageMagick's OpenMP parallelism. Without it some operations fall back to single-threaded.
+
+## Licensing
+
+Magick.NET is **Apache 2.0** end-to-end. ImageMagick itself is under the ImageMagick Licence (BSD-style, also commercial-friendly). For most enterprise ABP applications this is the simpler choice over ImageSharp's dual licence — see the [ImageSharp reference](/reference/integrations/imagesharp) for that comparison.
+
+## Supported formats
+
+Magick.NET supports the union of ImageMagick's delegate-driven formats, including the ones ImageSharp lacks:
+
+| Format | Decode | Encode | Notes |
+| --- | --- | --- | --- |
+| JPEG / PNG / WebP / GIF / BMP / TIFF | ✅ | ✅ | Same as ImageSharp. |
+| HEIC / HEIF | ✅ (with libheif) | ✅ | iPhone photo format. |
+| AVIF | ✅ | ✅ | Requires AV1 codec in libheif. |
+| JPEG XL | ✅ | ✅ | Modern next-gen. |
+| RAW (CR2/NEF/ARW/DNG) | ✅ | — | Read-only; you need DCRAW delegate. |
+| PSD | ✅ | ✅ | Layered. |
+| EPS / PDF | ✅ | ✅ | Requires Ghostscript delegate (manual install). |
+| SVG | ✅ | ✅ | Limited rendering; consider a dedicated SVG renderer. |
+| DICOM | ✅ | ✅ | Medical imaging. |
+
+The Magick.NET native binary embeds most modern format delegates. PDF/EPS are exceptions — they call out to Ghostscript, which must be installed on the host.
+
+## Sample configuration
+
+```csharp
+Configure<MagickNetCompressOptions>(options =>
+{
+    options.OptimalCompression = true;       // smaller output
+    options.IgnoreUnsupportedFormats = true; // pass through DICOM, etc.
+});
+
+// Cap concurrency to keep container memory predictable
+ImageMagick.MagickNET.SetTempDirectory("/tmp/magick");
+ResourceLimits.Memory  = 256 * 1024 * 1024;  // 256 MB
+ResourceLimits.Disk    = 1024 * 1024 * 1024; // 1 GB
+ResourceLimits.Thread  = 2;
+```
+
+`ResourceLimits` is a Magick.NET API (not ABP) but is essential in containers — it sets the limits ImageMagick consults internally; without them a single huge image can OOM the pod.
+
+## Resize behaviour
+
+`MagickImageResizerContributor` builds a `MagickGeometry` and calls `image.Resize(geometry)`. Modes:
+
+| `ImageResizeMode` | Behaviour |
+| --- | --- |
+| `None` / `Stretch` | Forced dimensions. |
+| `Max` | Fit inside box, preserve aspect. |
+| `Min` | Cover box, preserve aspect. |
+| `Pad` / `BoxPad` | Letterbox to exact size. |
+| `Crop` | Centre-crop to exact size. |
+
+Magick.NET reads EXIF orientation automatically when you call `AutoOrient()` — wrap the resize in it to avoid sideways thumbnails from iPhone uploads.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `Unable to load DLL 'Magick.Native-Q16-x64.dll.so'` on Alpine | Missing glibc. | Use Debian/Ubuntu base image, or install `gcompat`. |
+| `MagickResourceLimitErrorException: cache resources exhausted` | `ResourceLimits.Memory` reached. | Raise limits, or down-size the input first. |
+| `NoDecodeDelegateForThisImageFormat 'PDF'` | Ghostscript not installed. | `apt-get install ghostscript`. |
+| `OutOfMemoryException` on huge PNG | Container memory limit. | Raise `ResourceLimits.Memory` and pod memory; consider a streaming downscale. |
+| Output much larger than input | Default JPEG encoder re-encodes at higher quality. | Set `OptimalCompression = true` and lower quality via `image.Quality = 80`. |
+| Animated GIF flattened | Used `Image` instead of `ImageCollection`. | ABP's contributor handles GIF; for custom code use `MagickImageCollection`. |
+| HEIC fails to decode | Old Magick.NET that lacks libheif. | Upgrade to a recent Q16-HDRI build (libheif bundled). |
+| Container startup spikes RSS | Magick.NET initialises its native cache lazily. | Pre-warm with a small `using var img = new MagickImage(new byte[]{0xFF,0xD8,0xFF,0xD9});` in a hosted service. |
+
+## Observability hints
+
+- **Resource counters.** ImageMagick exposes `ResourceLimits.Memory` / `Map` / `Disk` consumption; surface them as gauges.
+- **Operation timing.** Wrap each resize/compress in `Activity`. Magick operations have wider variance than ImageSharp; tail latency matters.
+- **Failure rate.** Magick raises specific `MagickException` subtypes (e.g. `MagickCorruptImageErrorException`). Categorise them in metrics — corrupt input is usually a client problem (failed upload) and shouldn't page on-call.
+- **Native logs.** `MagickNET.SetLogEvents(LogEvents.All)` enables verbose native logs to a callback. Use sparingly — output volume is enormous.
+
+## Cooperating with ImageSharp
+
+You can register both modules; ABP's contributor model uses ordering. Lower-numbered contributors win. For example, you might:
+
+- Keep ImageSharp as the resizer for fast, well-known formats.
+- Add Magick.NET as a fallback for HEIC/AVIF by giving it a higher (less-priority) order and letting ImageSharp short-circuit on supported formats.
+
+In practice most teams pick one and stick with it; running both increases container size and memory pressure.
+
+## Colour profiles and ICC
+
+Magick.NET reads ICC profiles transparently; convert with `image.TransformColorSpace(targetProfile)`. Common pattern for web-bound images: convert AdobeRGB or ProPhoto inputs to sRGB so browsers render identically.
+
+```csharp
+using var image = new MagickImage(stream);
+if (image.ColorSpace != ColorSpace.sRGB)
+{
+    image.TransformColorSpace(ColorProfile.SRGB);
+}
+image.Quality = 80;
+image.Strip(); // remove non-essential metadata
+await image.WriteAsync(output, MagickFormat.Jpeg);
+```
+
+Calling `Strip()` is the equivalent of ImageSharp's `IgnoreMetadata` — drops EXIF, XMP, IPTC, leaves the ICC if you've already converted.
+
+## RAW pipeline
+
+DCRAW-supported RAW files require Magick.NET's `MagickReadSettings` to specify density and frame:
+
+```csharp
+var settings = new MagickReadSettings
+{
+    Format = MagickFormat.Cr2,
+    Density = new Density(300, 300)
+};
+using var image = new MagickImage(stream, settings);
+```
+
+RAW decode is CPU and memory heavy — pre-size container resources accordingly. Disallow RAW uploads from untrusted users; the libraw delegate has had occasional CVEs.
+
+## Animated formats
+
+For GIF / WebP / APNG use `MagickImageCollection`:
+
+```csharp
+using var collection = new MagickImageCollection(stream);
+foreach (var frame in collection)
+{
+    frame.Resize(new MagickGeometry(640, 360) { Greater = true });
+}
+collection.OptimizePlus();
+await collection.WriteAsync(output, MagickFormat.Gif);
+```
+
+`OptimizePlus()` finds duplicate frames and disposes intelligently — can shrink GIFs by 50%+.
+
+## PDF rendering
+
+Reading PDFs requires Ghostscript. Install on the image:
+
+```Dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends ghostscript
+```
+
+Then:
+
+```csharp
+var settings = new MagickReadSettings { Density = new Density(150, 150) };
+using var images = new MagickImageCollection(stream, settings);
+// images[0] is the first page rasterised at 150 DPI
+```
+
+For large multi-page PDFs use `ReadPageAsync(stream, pageIndex)` to avoid decoding the whole document.
+
+## Headless watermarks and composition
+
+ABP's contributors don't expose composition — write directly against Magick.NET:
+
+```csharp
+using var photo = new MagickImage(photoStream);
+using var watermark = new MagickImage(watermarkStream);
+watermark.Evaluate(Channels.Alpha, EvaluateOperator.Multiply, 0.4);
+photo.Composite(watermark, CompositeOperator.Over, Gravity.Southeast);
+await photo.WriteAsync(output, MagickFormat.Jpeg);
+```
+
+Composite operations are GPU-amenable on modern ImageMagick builds when OpenCL is enabled. Toggle with `MagickNET.SetUseOpenCL(true)` and bench-mark — gains are workload-dependent.
+
+## OOM and resource limits in detail
+
+`ImageMagick.ResourceLimits` (Magick.NET globals) maps to ImageMagick's `MAGICK_*` env vars:
+
+| Setting | ENV var | Recommendation |
+| --- | --- | --- |
+| `Memory` | `MAGICK_MEMORY_LIMIT` | 256–512 MB per pod. |
+| `Map` | `MAGICK_MAP_LIMIT` | 2× memory; uses mmap. |
+| `Disk` | `MAGICK_DISK_LIMIT` | Bound to scratch volume. |
+| `Thread` | `MAGICK_THREAD_LIMIT` | 1–2 per concurrent request. |
+| `Time` | `MAGICK_TIME_LIMIT` | 60 s per op; kills runaway decodes. |
+| `Width` / `Height` | — | Reject suspicious dimensions early. |
+
+Once a limit is hit Magick.NET throws `MagickResourceLimitErrorException` — catch and return 413 to the caller.
+
+## Related references
+
+- [Imaging](/framework/imaging-blob/imaging) — contributor pipeline.
+- [Imaging — Magick.NET](/framework/imaging-blob/imaging-magickdotnet) — contributor internals.
+- [ImageSharp](/reference/integrations/imagesharp) — pure-managed alternative.

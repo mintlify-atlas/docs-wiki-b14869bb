@@ -1,0 +1,286 @@
+---
+title: "OpenIddict"
+description: "External-service reference for OpenIddict — Volo.Abp.OpenIddict.AspNetCore integration, supported OAuth2/OIDC flows, signing keys, wildcard redirect domains, and store providers."
+---
+
+`Volo.Abp.OpenIddict.AspNetCore` is the modern ABP OAuth2 / OpenID Connect server, replacing the legacy IdentityServer4 integration. It builds on the open-source **OpenIddict** library and wires it into ABP's identity stack, multi-tenancy, and EF/Mongo persistence. This page covers configuration on the **server** side: endpoint paths, flows, signing/encryption, claims mapping, and the wildcard-domain support unique to ABP.
+
+For the relying-party / JWT validation side see [JWT Bearer](/framework/auth/jwt-bearer) and [OpenID Connect](/framework/auth/openid-connect).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.OpenIddict.Domain.Shared` | DTOs and constants. |
+| `Volo.Abp.OpenIddict.Domain` | Applications/Scopes/Authorizations/Tokens aggregates and managers. |
+| `Volo.Abp.OpenIddict.AspNetCore` | Hosts the OpenIddict server, claims principal handlers, extension grants. |
+| `Volo.Abp.OpenIddict.EntityFrameworkCore` | EF Core stores. |
+| `Volo.Abp.OpenIddict.MongoDB` | MongoDB stores. |
+| `Volo.Abp.PermissionManagement.Domain.OpenIddict` | Permission wiring for the management UI. |
+
+The main ASP.NET Core module:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpAspNetCoreMultiTenancyModule),
+    typeof(AbpOpenIddictDomainModule)
+)]
+public class AbpOpenIddictAspNetCoreModule : AbpModule
+{
+    /* configures OpenIddict server, scopes, endpoints, AddDevelopment* */
+}
+```
+
+## Endpoints
+
+ABP fixes the following OpenIddict endpoint paths:
+
+| Endpoint | Path |
+| --- | --- |
+| Authorization | `/connect/authorize` and `/connect/authorize/callback` |
+| Token | `/connect/token` |
+| User info | `/connect/userinfo` |
+| Logout | `/connect/logout` |
+| Introspection | `/connect/introspect` |
+| Revocation | `/connect/revocat` |
+| Device | `/device` |
+| Verification | `/connect/verify` |
+| Discovery | `/.well-known/openid-configuration` (OpenIddict default, unchanged) |
+| JWKS | `/.well-known/jwks` (OpenIddict default) |
+
+These paths are hardcoded in the module — you can override them with `services.AddOpenIddict().AddServer(...)` overrides in a pre-configure, but the defaults match the ABP UI assumption.
+
+## Supported flows
+
+Out of the box ABP enables all flows on the OpenIddict server:
+
+- Authorization Code (with PKCE) — interactive web / SPA / mobile.
+- Hybrid — code + id_token.
+- Implicit (deprecated for new SPAs).
+- Resource Owner Password — for legacy clients only.
+- Client Credentials — service-to-service.
+- Refresh Token.
+- Device Code — TV / CLI flows.
+- "None" — anonymous discovery.
+
+Restrict per-client by setting `Permissions = { ... }` on the OpenIddict application record (clients are stored, not in JSON).
+
+## Options model
+
+`AbpOpenIddictAspNetCoreOptions`:
+
+```csharp
+public class AbpOpenIddictAspNetCoreOptions
+{
+    public bool UpdateAbpClaimTypes { get; set; } = true;
+    public bool AddDevelopmentEncryptionAndSigningCertificate { get; set; } = true;
+}
+```
+
+- `UpdateAbpClaimTypes` — sets `AbpClaimTypes.UserId = sub`, `Role = role`, `UserName = preferred_username`, `Name = given_name`, `SurName = family_name`, `Email = email`, etc. Disable if you maintain your own claim mapping.
+- `AddDevelopmentEncryptionAndSigningCertificate` — calls `AddDevelopmentEncryptionCertificate()` + `AddDevelopmentSigningCertificate()`. Always **false** in production.
+
+Pre-configure to override:
+
+```csharp
+PreConfigure<AbpOpenIddictAspNetCoreOptions>(options =>
+{
+    options.AddDevelopmentEncryptionAndSigningCertificate = false;
+});
+
+PreConfigure<OpenIddictServerBuilder>(builder =>
+{
+    builder.AddSigningCertificate(LoadSigningCert());
+    builder.AddEncryptionCertificate(LoadEncryptionCert());
+    builder.DisableAccessTokenEncryption(); // ABP calls this by default — see below
+});
+```
+
+ABP calls `builder.DisableAccessTokenEncryption()` in the module by default. This means access tokens are signed JWTs (so APIs can verify offline) but **not** encrypted. ID tokens are still signed. Re-enable encryption only if every relying party can decrypt — RP support is much narrower than verification.
+
+## Signing & encryption
+
+Two distinct key roles:
+
+- **Signing key** — proves issuer identity. Must be available to every RP (via JWKS endpoint or static config).
+- **Encryption key** — used to encrypt tokens (JWE). Must be available to RPs that want to read the token; rarely used for access tokens because of compatibility cost.
+
+Default `AddDevelopment*` writes throwaway X.509 certs to the content root. In production:
+
+```csharp
+PreConfigure<OpenIddictServerBuilder>(builder =>
+{
+    builder.AddSigningCertificate(signingCert);
+    builder.AddEncryptionCertificate(encryptionCert);
+});
+```
+
+Recommended cert sources: Azure Key Vault, AWS KMS / ACM PCA, mounted Kubernetes secret, HSM via CNG. Plan **dual-cert rotation** — keep the old key as `AddValidationKey` for the access-token lifetime, then drop.
+
+## Wildcard redirect domains
+
+ABP adds an option not in vanilla OpenIddict: wildcard redirect URIs. Useful when SaaS tenants get subdomains.
+
+```csharp
+PreConfigure<AbpOpenIddictWildcardDomainOptions>(options =>
+{
+    options.EnableWildcardDomainSupport = true;
+    options.WildcardDomainsFormat.Add("https://{0}.example.com");
+});
+```
+
+When enabled the module **replaces** OpenIddict's redirect-URI validators (`ValidateClientRedirectUri`, `ValidateRedirectUriParameter`, `ValidateClientPostLogoutRedirectUri`, `ValidatePostLogoutRedirectUriParameter`, `ValidateAuthorizedParty`) with ABP versions that match the URI templates above.
+
+## Multi-tenancy
+
+`Volo.Abp.AspNetCore.MultiTenancy` is a dependency. The OpenIddict applications, scopes, authorizations and tokens carry tenant ids. Per-tenant client records are supported — issue applications scoped to a tenant id, and the data filter ensures isolation.
+
+## Claims pipeline
+
+ABP registers `AbpDefaultOpenIddictClaimsPrincipalHandler` (via `AbpOpenIddictClaimsPrincipalOptions.ClaimsPrincipalHandlers`). Custom claim handlers run during the token-issuance pipeline:
+
+```csharp
+Configure<AbpOpenIddictClaimsPrincipalOptions>(options =>
+{
+    options.ClaimsPrincipalHandlers.Add<MyExtraClaimsHandler>();
+});
+```
+
+Each handler receives `AbpOpenIddictClaimsPrincipalHandlerContext` with the principal and the application/scope being processed. Use it for tenant claims, license tier, custom roles.
+
+## Extension grants
+
+ABP also wires `AbpOpenIddictExtensionGrantsOptions` to let you register custom OAuth2 grant types (e.g. token exchange, impersonation, LinkUser):
+
+```csharp
+Configure<AbpOpenIddictExtensionGrantsOptions>(options =>
+{
+    options.Grants.Add(MyCustomGrant.GrantType, new MyCustomGrant());
+});
+```
+
+The handler implements `ITokenExtensionGrant.HandleAsync(ExtensionGrantContext)` and returns a `ForbidResult`/`SignInResult`.
+
+## Sample `appsettings.json`
+
+OpenIddict applications and scopes are stored in the DB, not in JSON; the JSON file mostly governs ASP.NET cookies and TLS:
+
+```json
+{
+  "AuthServer": {
+    "Authority": "https://auth.example.com",
+    "RequireHttpsMetadata": true
+  },
+  "OpenIddict": {
+    "Applications": {
+      "MyApp_Web": {
+        "ClientId": "MyApp_Web",
+        "RootUrl": "https://app.example.com"
+      }
+    }
+  }
+}
+```
+
+The `OpenIddict:Applications` section is typically read by the ABP data seeder, not by the module itself. The seeder upserts the application via `IOpenIddictApplicationManager`.
+
+## Store providers
+
+- `Volo.Abp.OpenIddict.EntityFrameworkCore` — adds DbSets for `OpenIddictApplication`, `OpenIddictAuthorization`, `OpenIddictScope`, `OpenIddictToken`.
+- `Volo.Abp.OpenIddict.MongoDB` — Mongo collections for the same aggregates.
+
+Both register the OpenIddict managers (`IOpenIddictApplicationManager`, etc.) and the underlying stores.
+
+## Network setup
+
+1. **Authority URL** — public HTTPS URL. RPs cache the discovery doc, so plan downtime accordingly.
+2. **Reverse proxy** — enable forwarded headers so issued tokens carry the public host.
+3. **CORS** — set per-application via the OpenIddict management UI.
+4. **Cookies** — Authentication cookies for the interactive flows live alongside OpenIddict. ABP uses the default cookie scheme; tune SameSite and secure attributes per host.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `invalid_client` on token endpoint | App not registered with that ClientId, or secret mismatch. | Verify `IOpenIddictApplicationManager.FindByClientIdAsync`; for confidential clients ensure `ClientSecret` saved as hashed value. |
+| `invalid_request: The redirect_uri is invalid` | Redirect URI not in app's `RedirectUris` or wildcard pattern wrong. | Add the URI; enable wildcard domains if needed. |
+| `unsupported_grant_type` | Grant disabled on client `Permissions`. | Add `Permissions.GrantTypes.AuthorizationCode` (etc.) to the application record. |
+| Tokens validate locally but fail at the gateway | RP cached old JWKS. | Force refresh; in production set `Microsoft.IdentityModel.Tokens` cache lifetime ≤ 1 h. |
+| Cert reload on every restart | Development cert flag still on. | Disable `AddDevelopmentEncryptionAndSigningCertificate`. |
+| Multi-tenant user can't sign in | Wrong tenant resolution. | Confirm domain-based tenant resolver active; OpenIddict reads `ICurrentTenant` during signin. |
+| `The specified 'redirect_uri' contains an unsecure protocol` | HTTP redirect URI in production. | Switch RP to HTTPS or set `DisableTransportSecurityRequirement()` (dev only). |
+| `An error occurred while issuing a token: keyset not found` | Signing cert removed or file deleted. | Restore cert; consider `AddValidationKey` overlap so old tokens still validate. |
+
+## Observability hints
+
+- **OpenIddict events.** OpenIddict raises descriptive events through its event handler pipeline; ABP's `AttachScopes` and `RemoveClaimsFromClientCredentialsGrantType` are registered. Add your own `OpenIddictServerHandler<T>` for audit.
+- **Token issuance metrics.** Instrument `/connect/token` latency with ASP.NET Core HTTP metrics; spikes correlate with refresh-token storms.
+- **Token store growth.** Authorizations/tokens grow with refresh-token rotation. Run the OpenIddict pruning job (`AddQuartz` + OpenIddict Quartz integration, or ABP's background worker) regularly.
+- **Failed signin alerts.** Combine ASP.NET Identity events with rate-limiting middleware.
+
+## Pruning expired tokens
+
+OpenIddict stores authorizations and tokens forever unless you prune. Two options:
+
+1. **Quartz integration** — `OpenIddict.Quartz` package. Schedules `OpenIddictPruneAuthorizationsJob` and `OpenIddictPruneTokensJob`. Wire it after Quartz:
+
+```csharp
+services.AddQuartz(/* ... */)
+        .Services
+        .AddOpenIddict()
+        .AddCore(builder => builder.UseQuartz());
+```
+
+2. **Custom ABP background worker** — call `IOpenIddictTokenManager.PruneAsync` and `IOpenIddictAuthorizationManager.PruneAsync` on a schedule.
+
+Typical schedule: prune tokens > 14 days and authorizations > 30 days. The defaults are conservative; tighten them.
+
+## EF schema and indexes
+
+`Volo.Abp.OpenIddict.EntityFrameworkCore` ships:
+
+| Table | Purpose |
+| --- | --- |
+| `OpenIddictApplications` | Clients. |
+| `OpenIddictScopes` | Scopes (`Resources` is a JSON array). |
+| `OpenIddictAuthorizations` | User consent per (client, scopes). |
+| `OpenIddictTokens` | Access/refresh/reference tokens with `Subject`, `ExpirationDate`. |
+
+Indexes are created automatically on `Subject`, `ApplicationId`, `Status`, `ExpirationDate`. The hot index is `IX_OpenIddictTokens_ExpirationDate` used by pruning — keep it healthy.
+
+MongoDB variant uses one collection per aggregate with the same logical model.
+
+## Wildcard domains — caveats
+
+Wildcard support means redirect-URI validation no longer requires exact-match. **Make sure** your wildcard pattern is constrained — `https://{0}.example.com` is fine, but `https://*` would allow any host. The implementation in `AbpValidateClientRedirectUri` checks the provided URI against each format in `WildcardDomainsFormat`.
+
+For tenant-aware deployments, store the tenant subdomain in `ICurrentTenant.Name` and use a custom redirect resolver that injects it.
+
+## Sign-out and logout chains
+
+OpenIddict supports front-channel and back-channel sign-out. ABP enables `EnableLogoutEndpointPassthrough()` so `/connect/logout` flows through MVC; provide a Razor page that prompts the user and posts the signal back.
+
+For SaaS apps with multiple clients, register each client's `PostLogoutRedirectUris` and they'll be cleared in turn. The user delegation cookie is deleted by the AspNet authentication middleware.
+
+## CORS and SPA flows
+
+Authorization-code-with-PKCE (the recommended SPA flow) needs:
+
+- `/connect/token` accessible via CORS from the SPA origin.
+- `/connect/userinfo` accessible.
+- `/connect/logout` reachable (often not via fetch — top-level navigation).
+
+OpenIddict 4.x adds `Permissions.Endpoints.Authorization` etc. that you set per application. The ABP UI registers these automatically when you create an application via the management UI.
+
+## Token format
+
+By default ABP issues **signed-but-unencrypted JWTs** (`DisableAccessTokenEncryption`). Each access token contains the `sub`, `aud` (resource URL), `scope`, `tenantid`, and any custom claims your handlers add.
+
+For reference tokens (opaque), per-application set `Settings = { TokenSettings.UseReferenceTokens = "true" }`. Reference tokens require the resource API to call introspection — heavier per-request cost but better revocation guarantees.
+
+## Related references
+
+- [IdentityServer4](/reference/integrations/identityserver) — legacy STS.
+- [JWT Bearer](/framework/auth/jwt-bearer) — RP-side token validation.
+- [OpenID Connect](/framework/auth/openid-connect) — interactive RP integration.

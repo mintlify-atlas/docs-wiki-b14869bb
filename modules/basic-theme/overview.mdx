@@ -1,0 +1,192 @@
+---
+title: "Basic Theme Module Overview"
+sidebarTitle: "Overview"
+description: "Tour of the Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic and Volo.Abp.AspNetCore.Components.*.BasicTheme packages — the bare-bones Bootstrap-only reference theme that ABP uses as the default scaffold theme."
+---
+
+The **Basic Theme** is ABP's no-frills reference theme. Where the LeptonX themes (commercial and Lite) add sidebars, dark mode toggles, and a curated component palette, *Basic* gives you exactly what Bootstrap 5 gives you — a top navbar, a centered container, the default font stack, and nothing else. It exists for two reasons: it is the official starter for ABP application templates with the `--theme basic` switch, and it is the canonical example for how to implement `ITheme` across MVC, Blazor Server, Blazor WebAssembly, and (since .NET 8) Blazor Web App rendering modes.
+
+If you are looking at the theme code to learn the contracts — `ITheme.GetLayout`, `IToolbarContributor`, `BundleContributor` — Basic is the cleanest source. It is also the safest starting point for hand-rolled custom themes: copy the four files that matter (`BasicTheme.cs`, `MainLayout.razor`, the toolbar contributor, and the bundle contributor), rename, and you have a new theme module.
+
+## Package layout
+
+The theme ships as four parallel packages plus an installer, under `modules/basic-theme/src/`:
+
+| Package | Target rendering | Documentation |
+| --- | --- | --- |
+| `Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic` | Razor Pages / MVC views | [mvc.mdx](/modules/basic-theme/mvc) |
+| `Volo.Abp.AspNetCore.Components.Server.BasicTheme` | Blazor Server (interactive server) | [blazor-server.mdx](/modules/basic-theme/blazor-server) |
+| `Volo.Abp.AspNetCore.Components.Web.BasicTheme` | Shared Razor Class Library used by every Blazor variant — contains `MainLayout`, `NavMenu`, `Branding`, `App.razor`, etc. | [blazor-web.mdx](/modules/basic-theme/blazor-web) |
+| `Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme` | Blazor WebAssembly | [blazor-webassembly.mdx](/modules/basic-theme/blazor-webassembly) |
+| `Volo.Abp.BasicTheme.Installer` | NuGet metadata for `abp add-module Volo.Abp.BasicTheme`. No runtime code. | — |
+
+There is intentionally *no* package called `BlazorWeb.BasicTheme`. The .NET 8 "Blazor Web App" host model is a hybrid: the project is an ASP.NET Core host (so it consumes the MVC theme package for static SSR fallbacks) **and** it interactively renders Razor components (so it consumes the Server theme package for the Server render mode and/or the WebAssembly theme package for the WebAssembly render mode). The shared component library (`Components.Web.BasicTheme`) is the single source of layout truth across all three Blazor flavours. The Blazor Web page in this section covers the unified hosting topology.
+
+## What every package contributes
+
+Every Basic Theme package does the same three things, just for a different UI stack:
+
+1. **Implements `ITheme`** — exposes a class decorated with `[ThemeName("Basic")]` whose `GetLayout(string standardName)` returns either a Razor view path (MVC) or a `Type` of a Razor component (Blazor) for each `StandardLayouts` enum value (`Application`, `Account`, `Empty`).
+2. **Registers itself as the default theme** — inside `ConfigureServices` it adds itself to `AbpThemingOptions.Themes` and, if no other theme has set `DefaultThemeName`, claims the slot.
+3. **Adds a top-toolbar contributor** — populates the main toolbar with a language switch and a login / user-menu component.
+
+The MVC package additionally registers a *bundle* (`BasicThemeBundles.Styles.Global`, `BasicThemeBundles.Scripts.Global`) that extends the framework's standard bundles with the Basic theme's `layout.css` and `layout.js`. The Blazor Server package mirrors this pattern with `BlazorBasicThemeBundles`. WebAssembly uses a different mechanism (`IBundleContributor` running through the ABP CLI bundling tool) because dynamic server-side bundling is not available in a static SPA host.
+
+## The `BasicTheme` contract
+
+Both MVC and Blazor packages contain a class literally called `BasicTheme`. In MVC it returns a Razor view path:
+
+```csharp
+[ThemeName(Name)]
+public class BasicTheme : ITheme, ITransientDependency
+{
+    public const string Name = "Basic";
+
+    public virtual string GetLayout(string name, bool fallbackToDefault = true)
+    {
+        switch (name)
+        {
+            case StandardLayouts.Application:
+                return "~/Themes/Basic/Layouts/Application.cshtml";
+            case StandardLayouts.Account:
+                return "~/Themes/Basic/Layouts/Account.cshtml";
+            case StandardLayouts.Empty:
+                return "~/Themes/Basic/Layouts/Empty.cshtml";
+            default:
+                return fallbackToDefault ? "~/Themes/Basic/Layouts/Application.cshtml" : null;
+        }
+    }
+}
+```
+
+In Blazor (`Components.Web.BasicTheme`) it returns a `Type`:
+
+```csharp
+[ThemeName(Name)]
+public class BasicTheme : ITheme, ITransientDependency
+{
+    public const string Name = "Basic";
+
+    public virtual Type GetLayout(string name, bool fallbackToDefault = true)
+    {
+        switch (name)
+        {
+            case StandardLayouts.Application:
+            case StandardLayouts.Account:
+            case StandardLayouts.Empty:
+                return typeof(MainLayout);
+            default:
+                return fallbackToDefault ? typeof(MainLayout) : typeof(NullLayout);
+        }
+    }
+}
+```
+
+Note the asymmetry: the MVC theme has **three** distinct Razor views (`Application.cshtml`, `Account.cshtml`, `Empty.cshtml`) but the Blazor theme has **one** `MainLayout` for all three slots. That is intentional. Account pages in MVC need an `Account.cshtml` because they render *server-side* and need conditional tenant-switching markup baked into the response; in Blazor the same logic is reactive and the `MainLayout` decides at render time what to show.
+
+## Standard toolbar contributions
+
+Every package adds an `IToolbarContributor` to `AbpToolbarOptions.Contributors`. The contributors target `StandardToolbars.Main` and add two items:
+
+- A **language switch** view component / Razor component (visible when the host has more than one configured language).
+- A **login display** view component / Razor component (visible when the user is authenticated, or in WebAssembly, when an `AuthenticationStateProvider` has been registered).
+
+In the MVC theme the contributor is:
+
+```csharp
+public class BasicThemeMainTopToolbarContributor : IToolbarContributor
+{
+    public async Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name != StandardToolbars.Main) return;
+        if (!(context.Theme is BasicTheme)) return;
+
+        var languages = await context.ServiceProvider
+            .GetService<ILanguageProvider>().GetLanguagesAsync();
+        if (languages.Count > 1)
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LanguageSwitchViewComponent)));
+
+        if (context.ServiceProvider.GetRequiredService<ICurrentUser>().IsAuthenticated)
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(UserMenuViewComponent)));
+    }
+}
+```
+
+The Blazor Server variant is shorter — it unconditionally adds both (the components decide internally whether to render) — because there is no equivalent of "redirect on first paint" for a Blazor circuit:
+
+```csharp
+public class BasicThemeToolbarContributor : IToolbarContributor
+{
+    public Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name == StandardToolbars.Main)
+        {
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LoginDisplay)));
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LanguageSwitch)));
+        }
+        return Task.CompletedTask;
+    }
+}
+```
+
+The WebAssembly contributor adds a guard for the `AuthenticationStateProvider` so anonymous-only hosts (the rare static landing-page WebAssembly app) do not render a useless "Login" button:
+
+```csharp
+if (context.ServiceProvider.GetService<AuthenticationStateProvider>() != null)
+{
+    context.Toolbar.Items.Add(new ToolbarItem(typeof(LoginDisplay)));
+}
+```
+
+## The shared visual contract
+
+All four packages converge on the same visible chrome:
+
+- A dark Bootstrap navbar at the top: `navbar navbar-expand-md navbar-dark bg-dark shadow-sm`, `min-height: 4rem`.
+- A logo + app name on the left, supplied by `IBrandingProvider`.
+- A centered horizontal main menu.
+- A right-aligned toolbar (`<ul class="navbar-nav">`).
+- A `container` (or `container-fluid` when `ViewBag.FluidLayout == true`) holding the page content.
+- A page alerts strip above the body.
+- Per-layout body classes: `abp-application-layout`, `abp-account-layout`, `abp-empty-layout` — these are the CSS hooks for theme overrides.
+
+The page alerts component (`PageAlertsViewComponent` in MVC, `PageAlert` razor component in Blazor) renders `IAlertManager`-published toast and inline alerts; the user menu, when present, renders an avatar with a dropdown for "Profile" / "Manage your settings" / "Sign out".
+
+## Choosing a starting theme
+
+For new projects:
+
+- The ABP CLI default is the LeptonX Lite theme. To pick Basic explicitly:
+  ```bash
+  abp new MyApp --theme basic --ui mvc
+  abp new MyApp --theme basic --ui blazor-server
+  abp new MyApp --theme basic --ui blazor
+  abp new MyApp --theme basic --ui blazor-webapp     # .NET 8+ Blazor Web App
+  ```
+- The CLI wires the right package (`Volo.Abp.AspNetCore.Mvc.UI.Theme.Basic`, etc.) into the host project and adds the corresponding `[DependsOn]`.
+
+For an existing project, switching themes is a two-step:
+
+1. Replace the theme package reference in the host `csproj`.
+2. Update the `[DependsOn]` in the host module to point to the new theme module.
+
+Because every theme conforms to `ITheme`, no page or component code needs to change. The default theme name comparison happens inside `AbpThemingOptions`, which only checks names lexically.
+
+## Cross-links
+
+- [Theme Shared](/framework/ui-mvc/mvc-ui-theme-shared) — the `ITheme`, `StandardLayouts`, `IToolbarContributor`, `IBrandingProvider`, and `IPageLayout` abstractions all theme implementations share.
+- [Blazor UI overview](/framework/ui-blazor/) — Blazor-specific theming, `IThemeManager`, and the routing / authorisation pipeline.
+- [Bundling & Minification](/framework/ui-mvc/bundling) — how `BasicThemeBundles.Styles.Global` extends `StandardBundles.Styles.Global`.
+- [MVC walkthrough](/modules/basic-theme/mvc), [Blazor Server walkthrough](/modules/basic-theme/blazor-server), [Blazor Web App walkthrough](/modules/basic-theme/blazor-web), [Blazor WebAssembly walkthrough](/modules/basic-theme/blazor-webassembly) — package-specific deep dives.
+
+## Versioning notes
+
+The Basic Theme was the first ABP theme and has stayed remarkably stable. Notable changes:
+
+- **5.x → 6.0** — Bootstrap 4 → 5 migration. `data-toggle`/`data-target` became `data-bs-toggle`/`data-bs-target` throughout `MainNavbar/Default.cshtml` and the Blazor `MainLayout`. Any custom views overriding the navbar must be updated.
+- **7.0** — Account layout received the conditional tenant-switch panel that reads `TenantResolveResultAccessor`.
+- **8.0** — New `Blazor Web App` host wiring: the Server package now depends on `Volo.Abp.Http.Client.IdentityModel.WebAssembly` *transitively* through the shared package only when WebAssembly interactive mode is enabled; ensure your global `[DependsOn]` matches your chosen render mode (see [blazor-web.mdx](/modules/basic-theme/blazor-web)).
+- **8.1** — `<DynamicLayoutComponent />` slot added to `MainLayout` for the dynamic claims and toast surface.
+- **9.0** — `WidgetStylesViewComponent` / `WidgetScriptsViewComponent` invocations moved earlier in the layout to allow custom widgets to override theme defaults.
+
+Continue with the package-specific pages for the implementation details.

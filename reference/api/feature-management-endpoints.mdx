@@ -1,0 +1,268 @@
+---
+title: "Feature management HTTP endpoints"
+sidebarTitle: "Feature management endpoints"
+description: "Routes exposed by Volo.Abp.FeatureManagement.HttpApi: list / update / reset the values of a feature provider (E for edition, T for tenant)."
+---
+
+The feature-management module exposes one controller — `FeaturesController` —
+that implements `IFeatureAppService`. It is symmetric to the
+`PermissionsController` in shape: a single route that takes a
+`providerName` / `providerKey` query pair and lists or updates the values
+that belong to that provider.
+
+```text Volo.Abp.FeatureManagement.HttpApi
+Volo/Abp/FeatureManagement/
+├── AbpFeatureManagementHttpApiModule.cs
+└── FeaturesController.cs   → /api/feature-management/features
+```
+
+## Route summary
+
+| Verb | Path | Body | Returns | Policy |
+| ---- | ---- | ---- | ------- | ------ |
+| GET    | `/api/feature-management/features?providerName=&providerKey=` | — | `GetFeatureListResultDto` | `[Authorize]` (signed-in) |
+| PUT    | `/api/feature-management/features?providerName=&providerKey=` | `UpdateFeaturesDto` | `204` | `[Authorize]` + side-level rules |
+| DELETE | `/api/feature-management/features?providerName=&providerKey=` | — | `204` | `[Authorize]` |
+
+Permission requirements:
+
+- `FeatureManagement.ManageHostFeatures` — required to manage features
+  when `providerName = E` (edition) or `providerKey` resolves to the
+  host. Defined by `FeaturePermissionDefinitionProvider`.
+- For `providerName = T` (tenant) the `AbpTenantManagement.Tenants.ManageFeatures`
+  permission from the tenant-management module is the convention; the
+  feature service itself does not pin a permission per provider — it
+  inherits the calling context's authorization checks at a higher level.
+
+## FeaturesController
+
+```csharp modules/feature-management/src/Volo.Abp.FeatureManagement.HttpApi/Volo/Abp/FeatureManagement/FeaturesController.cs
+[RemoteService(Name = FeatureManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(FeatureManagementRemoteServiceConsts.ModuleName)]
+[Route("api/feature-management/features")]
+public class FeaturesController : AbpControllerBase, IFeatureAppService
+{
+    protected IFeatureAppService FeatureAppService { get; }
+
+    public FeaturesController(IFeatureAppService featureAppService)
+        => FeatureAppService = featureAppService;
+
+    [HttpGet]
+    public virtual Task<GetFeatureListResultDto> GetAsync(string providerName, string providerKey)
+        => FeatureAppService.GetAsync(providerName, providerKey);
+
+    [HttpPut]
+    public virtual Task UpdateAsync(string providerName, string providerKey, UpdateFeaturesDto input)
+        => FeatureAppService.UpdateAsync(providerName, providerKey, input);
+
+    [HttpDelete]
+    public virtual Task DeleteAsync(string providerName, string providerKey)
+        => FeatureAppService.DeleteAsync(providerName, providerKey);
+}
+```
+
+`FeatureAppService` carries `[Authorize]` so anonymous access is not
+possible.
+
+### Providers
+
+| Provider name | `providerKey` is | Definition |
+| ------------- | ----------------- | ---------- |
+| `E` (Edition) | edition `Guid` as string | Built-in edition provider |
+| `T` (Tenant)  | tenant `Guid` as string  | Built-in tenant provider |
+
+A request with `providerName = "E"` and a key that does not match any
+known edition results in `EntityNotFoundException` (HTTP 404).
+
+## `GET /api/feature-management/features`
+
+```http
+GET /api/feature-management/features?providerName=T&providerKey=1f6e7a14-... HTTP/1.1
+Authorization: Bearer ...
+```
+
+```csharp modules/feature-management/src/Volo.Abp.FeatureManagement.Application.Contracts/Volo/Abp/FeatureManagement/GetFeatureListResultDto.cs
+public class GetFeatureListResultDto
+{
+    public List<FeatureGroupDto> Groups { get; set; }
+}
+
+public class FeatureGroupDto
+{
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public List<FeatureDto> Features { get; set; }
+}
+
+public class FeatureDto
+{
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public string Value { get; set; }
+    public FeatureProviderDto Provider { get; set; }
+    public string Description { get; set; }
+    public IStringValueType ValueType { get; set; }
+    public int Depth { get; set; }
+    public string ParentName { get; set; }
+}
+
+public class FeatureProviderDto
+{
+    public string Name { get; set; }
+    public string Key { get; set; }
+}
+```
+
+`FeatureDto.Value` is always a string — the type system that drives the
+admin UI (`IStringValueType` from `Volo.Abp.Validation`) tells the client
+whether to render a boolean toggle, a free-text input or a numeric step.
+
+Response excerpt:
+
+```json
+{
+  "groups": [
+    {
+      "name": "CmsKit",
+      "displayName": "CMS Kit",
+      "features": [
+        {
+          "name": "CmsKit.PageEnable",
+          "displayName": "Pages enabled",
+          "value": "true",
+          "provider": { "name": "T", "key": "1f6e7a14-..." },
+          "description": null,
+          "valueType": { "name": "ToggleStringValueType" },
+          "depth": 0,
+          "parentName": null
+        },
+        {
+          "name": "CmsKit.CommentEnable",
+          "displayName": "Comments enabled",
+          "value": "false",
+          "provider": { "name": "D", "key": null },
+          "description": null,
+          "valueType": { "name": "ToggleStringValueType" },
+          "depth": 0,
+          "parentName": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+`Provider` reports the **effective** source: `"D"` is the default value
+defined by the `FeatureDefinition`; `"T"` means the tenant overrides it;
+`"E"` means the edition overrides it.
+
+## `PUT /api/feature-management/features`
+
+```csharp modules/feature-management/src/Volo.Abp.FeatureManagement.Application.Contracts/Volo/Abp/FeatureManagement/UpdateFeaturesDto.cs
+public class UpdateFeaturesDto
+{
+    public List<UpdateFeatureDto> Features { get; set; }
+}
+
+public class UpdateFeatureDto
+{
+    public string Name { get; set; }
+    public string Value { get; set; }
+}
+```
+
+```http
+PUT /api/feature-management/features?providerName=T&providerKey=1f6e7a14-... HTTP/1.1
+Content-Type: application/json
+
+{
+  "features": [
+    { "name": "CmsKit.PageEnable",    "value": "true" },
+    { "name": "CmsKit.BlogEnable",    "value": "true" },
+    { "name": "CmsKit.CommentEnable", "value": "false" }
+  ]
+}
+```
+
+For each row the implementation:
+
+1. Resolves the feature definition (`IFeatureDefinitionManager`).
+2. Validates the value against `FeatureDefinition.ValueType` —
+   `ToggleStringValueType` accepts `"true"`/`"false"`,
+   `FreeTextStringValueType` accepts any string within the
+   `ValidationRules`, `SelectionStringValueType` accepts only listed
+   items.
+3. Calls `IFeatureManager.SetAsync(name, value, providerName, providerKey)`.
+4. Records the change in the audit log.
+
+A blank string (`""`) is treated as "remove the override" — equivalent to
+`DELETE` for that single key.
+
+## `DELETE /api/feature-management/features`
+
+Removes **all** feature overrides for the provider, falling the tenant or
+edition back to its parent (edition for tenant; default for edition).
+
+```http
+DELETE /api/feature-management/features?providerName=T&providerKey=1f6e7a14-... HTTP/1.1
+```
+
+```text
+204 No Content
+```
+
+## Permissions
+
+```csharp modules/feature-management/src/Volo.Abp.FeatureManagement.Application.Contracts/Volo/Abp/FeatureManagement/FeatureManagementPermissions.cs
+public class FeatureManagementPermissions
+{
+    public const string GroupName = "FeatureManagement";
+    public const string ManageHostFeatures = GroupName + ".ManageHostFeatures";
+}
+```
+
+The single first-party permission gates the host-features view. The
+tenant-features view is gated by the tenant-management module's
+`AbpTenantManagement.Tenants.ManageFeatures` — that is, the same
+`PUT /features` URL is reachable only if the calling principal has the
+right permission for the tenant whose key it is editing.
+
+## Multi-tenancy
+
+The endpoints are not restricted to host or tenant by themselves — what
+matters is the `providerKey` you pass:
+
+- A host admin can set tenant features by sending
+  `providerName = T` + `providerKey = <tenant-guid>`. The `__tenant`
+  header is not required because the key already targets the tenant.
+- A tenant admin can edit only their own tenant's features (the
+  permission system blocks pointing at another tenant's key).
+- Edition (`E`) features are host-only by convention.
+
+The runtime value resolution honours the standard chain:
+`User → Tenant → Edition → Default`. The `GET` endpoint reports the
+**effective** value plus which provider it came from, so the UI can
+render the override status to the operator.
+
+## Common error envelope
+
+```json
+{
+  "error": {
+    "code": "Volo.FeatureManagement:010002",
+    "message": "The value '7' is not valid for the feature 'CmsKit.CommentEnable'.",
+    "details": null
+  }
+}
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Tenant management endpoints" icon="building" href="/reference/api/tenant-management-endpoints">
+    Where tenants — the `T` provider's keys — are created.
+  </Card>
+  <Card title="Setting management endpoints" icon="gear" href="/reference/api/setting-management-endpoints">
+    Sibling configuration surface for runtime settings.
+  </Card>
+</CardGroup>

@@ -1,0 +1,296 @@
+---
+title: "Tenant management HTTP endpoints"
+sidebarTitle: "Tenant management endpoints"
+description: "Routes exposed by Volo.Abp.TenantManagement.HttpApi: tenant CRUD plus per-tenant default-connection-string management."
+---
+
+The tenant-management module ships a single MVC controller — `TenantController`
+in `Volo.Abp.TenantManagement.HttpApi` — that implements
+`ITenantAppService`. The service derives from
+`ICrudAppService<TenantDto, Guid, GetTenantsInput, TenantCreateDto, TenantUpdateDto>`
+and adds three custom methods for the per-tenant default-connection-string.
+
+```text Volo.Abp.TenantManagement.HttpApi
+Volo/Abp/TenantManagement/
+├── AbpTenantManagementHttpApiModule.cs
+└── TenantController.cs   → /api/multi-tenancy/tenants
+```
+
+## Route summary
+
+| Verb | Path | Body | Returns | Policy |
+| ---- | ---- | ---- | ------- | ------ |
+| GET  | `/api/multi-tenancy/tenants` | `GetTenantsInput` (query) | `PagedResultDto<TenantDto>` | `AbpTenantManagement.Tenants` |
+| GET  | `/api/multi-tenancy/tenants/{id}` | — | `TenantDto` | `AbpTenantManagement.Tenants` |
+| POST | `/api/multi-tenancy/tenants` | `TenantCreateDto` | `TenantDto` | `AbpTenantManagement.Tenants.Create` |
+| PUT  | `/api/multi-tenancy/tenants/{id}` | `TenantUpdateDto` | `TenantDto` | `AbpTenantManagement.Tenants.Update` |
+| DELETE | `/api/multi-tenancy/tenants/{id}` | — | `204` | `AbpTenantManagement.Tenants.Delete` |
+| GET  | `/api/multi-tenancy/tenants/{id}/default-connection-string` | — | `string` | `AbpTenantManagement.Tenants.ManageConnectionStrings` |
+| PUT  | `/api/multi-tenancy/tenants/{id}/default-connection-string?defaultConnectionString=...` | — | `204` | `AbpTenantManagement.Tenants.ManageConnectionStrings` |
+| DELETE | `/api/multi-tenancy/tenants/{id}/default-connection-string` | — | `204` | `AbpTenantManagement.Tenants.ManageConnectionStrings` |
+
+All routes require an authenticated **host-side** user — the controller is
+not callable from a tenant context (see [Multi-tenancy](#multi-tenancy)).
+
+## TenantController
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.HttpApi/Volo/Abp/TenantManagement/TenantController.cs
+[Controller]
+[RemoteService(Name = TenantManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(TenantManagementRemoteServiceConsts.ModuleName)]
+[Route("api/multi-tenancy/tenants")]
+public class TenantController : AbpControllerBase, ITenantAppService
+{
+    protected ITenantAppService TenantAppService { get; }
+
+    public TenantController(ITenantAppService tenantAppService) => TenantAppService = tenantAppService;
+
+    [HttpGet] [Route("{id}")]
+    public virtual Task<TenantDto> GetAsync(Guid id) => TenantAppService.GetAsync(id);
+
+    [HttpGet]
+    public virtual Task<PagedResultDto<TenantDto>> GetListAsync(GetTenantsInput input)
+        => TenantAppService.GetListAsync(input);
+
+    [HttpPost]
+    public virtual Task<TenantDto> CreateAsync(TenantCreateDto input)
+    {
+        ValidateModel();
+        return TenantAppService.CreateAsync(input);
+    }
+
+    [HttpPut] [Route("{id}")]
+    public virtual Task<TenantDto> UpdateAsync(Guid id, TenantUpdateDto input)
+        => TenantAppService.UpdateAsync(id, input);
+
+    [HttpDelete] [Route("{id}")]
+    public virtual Task DeleteAsync(Guid id) => TenantAppService.DeleteAsync(id);
+
+    [HttpGet] [Route("{id}/default-connection-string")]
+    public virtual Task<string> GetDefaultConnectionStringAsync(Guid id)
+        => TenantAppService.GetDefaultConnectionStringAsync(id);
+
+    [HttpPut] [Route("{id}/default-connection-string")]
+    public virtual Task UpdateDefaultConnectionStringAsync(Guid id, string defaultConnectionString)
+        => TenantAppService.UpdateDefaultConnectionStringAsync(id, defaultConnectionString);
+
+    [HttpDelete] [Route("{id}/default-connection-string")]
+    public virtual Task DeleteDefaultConnectionStringAsync(Guid id)
+        => TenantAppService.DeleteDefaultConnectionStringAsync(id);
+}
+```
+
+Note the `ValidateModel()` call in `CreateAsync` — the comment in the
+source notes that inheriting from `Controller` (instead of
+`AbpControllerBase`) "Throws exception on validation"; the explicit call
+keeps the same behaviour from the API controller surface.
+
+`TenantAppService` carries `[Authorize(TenantManagementPermissions.Tenants.Default)]`
+at class level plus the per-method overrides reflected in the route table.
+
+## DTOs
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Application.Contracts/Volo/Abp/TenantManagement/TenantDto.cs
+public class TenantDto : ExtensibleEntityDto<Guid>, IHasConcurrencyStamp
+{
+    public string Name { get; set; }
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Application.Contracts/Volo/Abp/TenantManagement/TenantCreateOrUpdateDtoBase.cs
+public abstract class TenantCreateOrUpdateDtoBase : ExtensibleObject
+{
+    [Required]
+    [Display(Name = "TenantName")]
+    public string Name { get; set; }
+}
+```
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Application.Contracts/Volo/Abp/TenantManagement/TenantCreateDto.cs
+public class TenantCreateDto : TenantCreateOrUpdateDtoBase
+{
+    [Required] [EmailAddress] [MaxLength(256)]
+    public virtual string AdminEmailAddress { get; set; }
+
+    [Required] [MaxLength(128)] [DisableAuditing]
+    public virtual string AdminPassword { get; set; }
+}
+```
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Application.Contracts/Volo/Abp/TenantManagement/TenantUpdateDto.cs
+public class TenantUpdateDto : TenantCreateOrUpdateDtoBase, IHasConcurrencyStamp
+{
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Application.Contracts/Volo/Abp/TenantManagement/GetTenantsInput.cs
+public class GetTenantsInput : PagedAndSortedResultRequestDto
+{
+    public string Filter { get; set; }
+}
+```
+
+## Examples
+
+### `GET /api/multi-tenancy/tenants`
+
+```http
+GET /api/multi-tenancy/tenants?Filter=cont&MaxResultCount=20 HTTP/1.1
+Authorization: Bearer <host-admin-token>
+```
+
+```json
+{
+  "totalCount": 2,
+  "items": [
+    {
+      "id": "1f6e7a14-...-...",
+      "name": "contoso",
+      "concurrencyStamp": "ab12...",
+      "extraProperties": {}
+    },
+    {
+      "id": "a7b21f08-...-...",
+      "name": "contoso-eu",
+      "concurrencyStamp": "cc99...",
+      "extraProperties": {}
+    }
+  ]
+}
+```
+
+### `POST /api/multi-tenancy/tenants`
+
+Creating a new tenant also creates the **first admin user inside that
+tenant** (`AdminEmailAddress` / `AdminPassword`) by switching the
+`ICurrentTenant` scope inside the application service.
+
+```http
+POST /api/multi-tenancy/tenants HTTP/1.1
+Content-Type: application/json
+
+{
+  "name": "contoso",
+  "adminEmailAddress": "admin@contoso.example.com",
+  "adminPassword": "P@ssw0rd!",
+  "extraProperties": {}
+}
+```
+
+```json
+{
+  "id": "1f6e7a14-...",
+  "name": "contoso",
+  "concurrencyStamp": "ab12...",
+  "extraProperties": {}
+}
+```
+
+The admin user is created with the `admin` static role and the
+`AbpIdentity.Users.IsLockoutEnabled` setting effective for that tenant.
+
+### `PUT /api/multi-tenancy/tenants/{id}`
+
+```json
+{
+  "name": "contoso-prod",
+  "concurrencyStamp": "ab12...",
+  "extraProperties": {}
+}
+```
+
+The body's `ConcurrencyStamp` must match the database row or the call fails
+with `Volo.Abp.Domain:AbpDbConcurrencyException` (HTTP 409).
+
+### Per-tenant connection strings
+
+The default connection string lives in the tenant's
+`ConnectionStrings` collection under the key `Default`. The three
+connection-string endpoints let an operator route a single tenant's data
+to a dedicated database.
+
+```http
+GET /api/multi-tenancy/tenants/1f6e7a14-.../default-connection-string HTTP/1.1
+```
+
+```json
+"Server=tcp:contoso-sql.database.windows.net,1433;Database=Contoso;..."
+```
+
+```http
+PUT /api/multi-tenancy/tenants/1f6e7a14-.../default-connection-string?defaultConnectionString=Server%3D...
+```
+
+The argument is a primitive `string` so it is bound from the **query
+string**, not the body. `204 No Content` on success.
+
+```http
+DELETE /api/multi-tenancy/tenants/1f6e7a14-.../default-connection-string
+```
+
+Removes the override and falls the tenant back to the host's `Default`
+connection string.
+
+## Permission definitions
+
+```csharp modules/tenant-management/src/Volo.Abp.TenantManagement.Application.Contracts/Volo/Abp/TenantManagement/TenantManagementPermissions.cs
+public static class TenantManagementPermissions
+{
+    public const string GroupName = "AbpTenantManagement";
+
+    public static class Tenants
+    {
+        public const string Default = GroupName + ".Tenants";
+        public const string Create = Default + ".Create";
+        public const string Update = Default + ".Update";
+        public const string Delete = Default + ".Delete";
+        public const string ManageFeatures = Default + ".ManageFeatures";
+        public const string ManageConnectionStrings = Default + ".ManageConnectionStrings";
+    }
+}
+```
+
+`ManageFeatures` is enforced from the `feature-management` module's
+endpoints — see [Feature management endpoints](/reference/api/feature-management-endpoints).
+
+## Multi-tenancy
+
+Tenant management is a **host-only** module. The
+`AbpTenantManagementPermissionDefinitionProvider` defines the
+`AbpTenantManagement` group with `MultiTenancySides.Host`, so the
+permission system refuses to grant the policies inside a tenant.
+Practically:
+
+- A host-side admin (`__tenant` not set, or token has no `tenantid` claim)
+  is the only caller that satisfies `AbpTenantManagement.Tenants*`.
+- The endpoints are not behind a `[RequiresGlobalFeature]` — they work
+  whenever the module is registered.
+
+If a tenant token reaches the endpoint, the authorization filter rejects
+the request with `403 Forbidden` (code
+`Volo.Authorization:010001`).
+
+## Common error envelope
+
+```json
+{
+  "error": {
+    "code": "Volo.TenantManagement:010001",
+    "message": "Duplicate tenant name 'contoso'.",
+    "details": null
+  }
+}
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Feature management endpoints" icon="flag" href="/reference/api/feature-management-endpoints">
+    Set feature values per tenant — usually mounted next to tenant management.
+  </Card>
+  <Card title="Permission management endpoints" icon="lock" href="/reference/api/permission-management-endpoints">
+    Assign role permissions inside a tenant.
+  </Card>
+</CardGroup>

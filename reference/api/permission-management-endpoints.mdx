@@ -1,0 +1,292 @@
+---
+title: "Permission management HTTP endpoints"
+sidebarTitle: "Permission management endpoints"
+description: "Routes exposed by Volo.Abp.PermissionManagement.HttpApi: list / grant / revoke permissions for a provider (R, U, C) and the integration is-granted probe."
+---
+
+The permission-management module exposes two controllers:
+
+- `PermissionsController` — the admin endpoint used by the management UI.
+- `PermissionIntegrationController` — a microservice-to-microservice
+  probe under the `integration-api` prefix.
+
+Both controllers carry `[Area(PermissionManagementRemoteServiceConsts.ModuleName)]`
+(`"permission-management"`) and implement an
+`IApplicationService` interface from
+`Volo.Abp.PermissionManagement.Application.Contracts`.
+
+```text Volo.Abp.PermissionManagement.HttpApi
+Volo/Abp/PermissionManagement/
+├── AbpPermissionManagementHttpApiModule.cs
+├── PermissionsController.cs               → /api/permission-management/permissions
+└── Integration/PermissionIntegrationController.cs
+                                            → /integration-api/permission-management/permissions
+```
+
+## Route summary
+
+| Verb | Path | Body | Returns | Policy |
+| ---- | ---- | ---- | ------- | ------ |
+| GET  | `/api/permission-management/permissions?providerName=&providerKey=` | — | `GetPermissionListResultDto` | `[Authorize]` (any signed-in caller; the implementation calls `ICheckPermissionDefinitionProvider`) |
+| PUT  | `/api/permission-management/permissions?providerName=&providerKey=` | `UpdatePermissionsDto` | `204` | `[Authorize]` + per-permission `Providers` allow-list |
+| GET  | `/integration-api/permission-management/permissions/is-granted` | `List<IsGrantedRequest>` (body — `[FromBody]` on the action) | `ListResultDto<IsGrantedResponse>` | none (intended for trusted callers) |
+
+The admin endpoint does **not** demand a single hard-coded policy because
+which permission group it is granting depends on the request — the runtime
+enforces the per-permission management rules from each definition
+provider.
+
+## PermissionsController
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.HttpApi/Volo/Abp/PermissionManagement/PermissionsController.cs
+[RemoteService(Name = PermissionManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(PermissionManagementRemoteServiceConsts.ModuleName)]
+[Route("api/permission-management/permissions")]
+public class PermissionsController : AbpControllerBase, IPermissionAppService
+{
+    protected IPermissionAppService PermissionAppService { get; }
+
+    public PermissionsController(IPermissionAppService permissionAppService)
+        => PermissionAppService = permissionAppService;
+
+    [HttpGet]
+    public virtual Task<GetPermissionListResultDto> GetAsync(string providerName, string providerKey)
+        => PermissionAppService.GetAsync(providerName, providerKey);
+
+    [HttpPut]
+    public virtual Task UpdateAsync(string providerName, string providerKey, UpdatePermissionsDto input)
+        => PermissionAppService.UpdateAsync(providerName, providerKey, input);
+}
+```
+
+`PermissionAppService` is decorated with `[Authorize]` at class level so
+only signed-in users may call either action.
+
+### Providers
+
+The `providerName` / `providerKey` pair identifies **who is being managed**.
+The built-in providers are:
+
+| Provider name | `providerKey` is | Set up by |
+| ------------- | ----------------- | --------- |
+| `R` (Role)    | role name (e.g. `admin`) | `RolePermissionManagementProvider` |
+| `U` (User)    | user `Guid` as string | `UserPermissionManagementProvider` |
+| `C` (Client)  | OpenIddict / IdentityServer client id | `ClientPermissionManagementProvider` |
+
+### `GET /api/permission-management/permissions`
+
+```http
+GET /api/permission-management/permissions?providerName=R&providerKey=admin HTTP/1.1
+Authorization: Bearer ...
+```
+
+The response groups permissions exactly like the
+`AbpPermissionGroupDefinition`s registered on the host:
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Application.Contracts/Volo/Abp/PermissionManagement/GetPermissionListResultDto.cs
+public class GetPermissionListResultDto
+{
+    public string EntityDisplayName { get; set; }
+    public List<PermissionGroupDto> Groups { get; set; }
+}
+
+public class PermissionGroupDto
+{
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public string DisplayNameKey { get; set; }
+    public string DisplayNameResource { get; set; }
+    public List<PermissionGrantInfoDto> Permissions { get; set; }
+}
+
+public class PermissionGrantInfoDto
+{
+    public string Name { get; set; }
+    public string DisplayName { get; set; }
+    public string ParentName { get; set; }
+    public bool IsGranted { get; set; }
+    public List<string> AllowedProviders { get; set; }
+    public List<ProviderInfoDto> GrantedProviders { get; set; }
+}
+
+public class ProviderInfoDto
+{
+    public string ProviderName { get; set; }
+    public string ProviderKey { get; set; }
+}
+```
+
+Response excerpt (admin role inside a tenant):
+
+```json
+{
+  "entityDisplayName": "admin",
+  "groups": [
+    {
+      "name": "AbpIdentity",
+      "displayName": "Identity management",
+      "displayNameKey": "Permission:IdentityManagement",
+      "displayNameResource": "AbpIdentity",
+      "permissions": [
+        {
+          "name": "AbpIdentity.Users",
+          "displayName": "User management",
+          "parentName": null,
+          "isGranted": true,
+          "allowedProviders": [],
+          "grantedProviders": [{ "providerName": "R", "providerKey": "admin" }]
+        },
+        {
+          "name": "AbpIdentity.Users.Create",
+          "displayName": "Create",
+          "parentName": "AbpIdentity.Users",
+          "isGranted": true,
+          "allowedProviders": [],
+          "grantedProviders": [{ "providerName": "R", "providerKey": "admin" }]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`IsGranted` is the **effective** value — `true` if any of the
+`GrantedProviders` grants it (role inheritance via the user's roles,
+direct user grant, or client grant).
+
+### `PUT /api/permission-management/permissions`
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.Application.Contracts/Volo/Abp/PermissionManagement/UpdatePermissionsDto.cs
+public class UpdatePermissionsDto
+{
+    public UpdatePermissionDto[] Permissions { get; set; }
+}
+
+public class UpdatePermissionDto
+{
+    public string Name { get; set; }
+    public bool IsGranted { get; set; }
+}
+```
+
+```http
+PUT /api/permission-management/permissions?providerName=R&providerKey=editor HTTP/1.1
+Content-Type: application/json
+
+{
+  "permissions": [
+    { "name": "AbpIdentity.Users", "isGranted": true },
+    { "name": "AbpIdentity.Users.Create", "isGranted": true },
+    { "name": "AbpIdentity.Users.Delete", "isGranted": false }
+  ]
+}
+```
+
+`204 No Content` on success. The implementation walks each permission and:
+
+1. Resolves the `PermissionDefinition` from the registered providers.
+2. Checks `AllowedProviders` — if not empty, the call must use one of the
+   listed provider names.
+3. Calls `IPermissionManager.SetAsync(name, providerName, providerKey, isGranted)`.
+4. Audit logs the change with the old and new value.
+
+If the caller asks for `IsGranted = true` on a permission whose definition
+is **side-restricted** to host while the call comes from a tenant (or vice
+versa) the service throws `AbpAuthorizationException`.
+
+## PermissionIntegrationController
+
+```csharp modules/permission-management/src/Volo.Abp.PermissionManagement.HttpApi/Volo/Abp/PermissionManagement/Integration/PermissionIntegrationController.cs
+[RemoteService(Name = PermissionManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(PermissionManagementRemoteServiceConsts.ModuleName)]
+[ControllerName("PermissionIntegration")]
+[Route("integration-api/permission-management/permissions")]
+public class PermissionIntegrationController : AbpControllerBase, IPermissionIntegrationService
+{
+    [HttpGet]
+    [Route("is-granted")]
+    public virtual Task<ListResultDto<IsGrantedResponse>> IsGrantedAsync(List<IsGrantedRequest> input)
+        => PermissionIntegrationService.IsGrantedAsync(input);
+}
+```
+
+The integration interface is decorated with
+`[IntegrationService]`, which makes `AbpServiceConvention` route it under
+`AbpAspNetCoreConsts.DefaultIntegrationServiceApiPrefix` (`integration-api`)
+and bypass front-end authorization.
+
+`IsGrantedRequest` and `IsGrantedResponse` come from
+`Volo.Abp.Authorization.Permissions` (request DTO carries the name plus
+`providerName`/`providerKey`; response echoes the name and a boolean).
+Even though the method uses `HttpGet`, the parameter is a list and is
+bound from the body — clients send a `GET` request **with a JSON body**.
+
+```http
+GET /integration-api/permission-management/permissions/is-granted HTTP/1.1
+Content-Type: application/json
+
+[
+  { "name": "AbpIdentity.Users.Create", "providerName": "U", "providerKey": "3fa85f64-..." },
+  { "name": "AbpIdentity.Users.Delete", "providerName": "U", "providerKey": "3fa85f64-..." }
+]
+```
+
+```json
+{
+  "items": [
+    { "name": "AbpIdentity.Users.Create", "isGranted": true },
+    { "name": "AbpIdentity.Users.Delete", "isGranted": false }
+  ]
+}
+```
+
+## Multi-tenancy
+
+The provider key resolution happens **inside the current tenant scope**.
+Pass `__tenant` to manage a tenant's role/user grants from a host
+admin:
+
+```http
+GET /api/permission-management/permissions?providerName=R&providerKey=admin HTTP/1.1
+__tenant: contoso
+Authorization: Bearer <host-admin-token>
+```
+
+Without `__tenant` the host's `admin` role grants are returned. The
+permission-management database stores rows tagged with `TenantId`, and
+the `IMultiTenant` filter prevents cross-tenant leaks even if a caller
+spoofs a name.
+
+## Provider rules and edge cases
+
+- `User (U)` grants for a permission with `IsEnabled = false` (a feature
+  toggled off) are stored but reported as `IsGranted = false`.
+- Toggling a parent grant **does not** cascade to children — the UI sends
+  multiple `UpdatePermissionDto` entries.
+- `R` grants are evaluated transitively when a user has multiple roles;
+  the `IsGranted` returned by `GET` reflects only the direct grants on
+  the requested provider — use the integration `is-granted` endpoint to
+  evaluate the effective decision for a user.
+
+## Common error envelope
+
+```json
+{
+  "error": {
+    "code": "Volo.PermissionManagement:010001",
+    "message": "The permission 'MyApp.OrderManagement' is not allowed for the provider 'R'.",
+    "details": null
+  }
+}
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Identity endpoints" icon="user-shield" href="/reference/api/identity-endpoints">
+    The most common producer of `AbpIdentity.*` permissions managed here.
+  </Card>
+  <Card title="Feature management endpoints" icon="flag" href="/reference/api/feature-management-endpoints">
+    Sibling module with the same provider model (`E`/`T` instead of `R`/`U`/`C`).
+  </Card>
+</CardGroup>

@@ -1,0 +1,390 @@
+---
+title: "Basic Theme — Blazor WebAssembly"
+sidebarTitle: "Blazor WebAssembly"
+description: "Walkthrough of Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme — the SPA client theme that hosts the shared MainLayout in a WebAssembly runtime, brokers OIDC login through RemoteAuthenticatorView, and persists language choice in localStorage."
+---
+
+`Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme` is the WebAssembly flavour of the [Basic Theme](/modules/basic-theme/overview). Like the [Server package](/modules/basic-theme/blazor-server) it depends on the shared `Volo.Abp.AspNetCore.Components.Web.BasicTheme` library for the layout, navigation and routing components — and it adds **WebAssembly-only** counterparts of `LoginDisplay` and `LanguageSwitch`, a toolbar contributor, an OIDC `RemoteAuthenticatorView` host page, and a `WebAssemblyRedirectToLogin` override that uses `Microsoft.AspNetCore.Components.WebAssembly.Authentication` instead of a full page redirect to MVC.
+
+The key conceptual difference between this package and the Server one is the authentication transport. A Blazor Server host can sign in with a cookie because the browser hits an ASP.NET Core endpoint. A WebAssembly host runs entirely in the browser and has to redirect to the OIDC authority itself, then handle the callback back into the SPA. This package wires that flow.
+
+## Module wiring
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebBasicThemeModule),
+    typeof(AbpAspNetCoreComponentsWebAssemblyThemingModule),
+    typeof(AbpHttpClientIdentityModelWebAssemblyModule)
+)]
+public class AbpAspNetCoreComponentsWebAssemblyBasicThemeModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpRouterOptions>(options =>
+        {
+            options.AdditionalAssemblies.Add(
+                typeof(AbpAspNetCoreComponentsWebAssemblyBasicThemeModule).Assembly);
+        });
+
+        Configure<AbpToolbarOptions>(options =>
+        {
+            options.Contributors.Add(new BasicThemeToolbarContributor());
+        });
+    }
+}
+```
+
+Three things are added:
+
+1. The module's own assembly is added to `AbpRouterOptions.AdditionalAssemblies` so the `[Route("/authentication/{action}")]` page on `Authentication.razor` is discoverable by the shared `Router`. Without this, the OIDC callback URL would 404.
+2. `BasicThemeToolbarContributor` registers the WebAssembly `LoginDisplay` and `LanguageSwitch`. Unlike the Server contributor it guards `LoginDisplay` behind a check for a registered `AuthenticationStateProvider` — useful in rare anonymous-only WebAssembly hosts.
+3. The dependency on `AbpHttpClientIdentityModelWebAssemblyModule` brings in the IdentityModel client extensions that drive `NavigateToLogin` / `NavigateToLogout`.
+
+There is no bundle registration. Bundling on the WebAssembly side runs via the ABP CLI `bundle` command at publish time using `IBundleContributor` — see `BasicThemeBundleContributor` below.
+
+## File inventory
+
+Under `modules/basic-theme/src/Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme/`:
+
+| Path | Role |
+| --- | --- |
+| `AbpAspNetCoreComponentsWebAssemblyBasicThemeModule.cs` | Module class. |
+| `BasicThemeBundleContributor.cs` | `IBundleContributor` — adds `theme.css` to the static SPA bundle. |
+| `BasicThemeToolbarContributor.cs` | Registers WebAssembly `LoginDisplay` and `LanguageSwitch`. |
+| `Pages/Authentication.razor` | OIDC callback page bound to `/authentication/{action}` (`login`, `login-callback`, `logout`, `logout-callback`, etc.). |
+| `Themes/Basic/LoginDisplay.razor(.cs)` | Authenticated user dropdown with Logout action that invokes `NavigateToLogout`. |
+| `Themes/Basic/LanguageSwitch.razor` | Language picker that persists choice to `localStorage` and reloads the page. |
+| `Themes/Basic/WebAssemblyRedirectToLogin.razor` | Overrides the shared `RedirectToLogin` to use `NavigateToLogin("authentication/login")`. |
+| `Themes/Basic/_Imports.razor` | Common `@using` declarations. |
+
+## Static bundling
+
+```csharp
+public class BasicThemeBundleContributor : IBundleContributor
+{
+    public void AddScripts(BundleContext context) { }
+
+    public void AddStyles(BundleContext context)
+    {
+        context.Add("_content/Volo.Abp.AspNetCore.Components.Web.BasicTheme/libs/abp/css/theme.css");
+    }
+}
+```
+
+WebAssembly hosts cannot use the runtime `IBundleManager` because that lives in `Microsoft.Extensions.DependencyInjection` and requires server execution. Instead, ABP generates the bundle at publish time:
+
+```bash
+abp bundle -wd .   # run from the WebAssembly client project
+```
+
+The CLI discovers every `IBundleContributor`, executes `AddStyles` / `AddScripts`, and writes a `global.css` / `global.js` into `wwwroot/` referenced from `index.html`. Re-run `abp bundle` after adding new modules so the SPA picks up their assets.
+
+## Toolbar contributor
+
+```csharp
+public class BasicThemeToolbarContributor : IToolbarContributor
+{
+    public Task ConfigureToolbarAsync(IToolbarConfigurationContext context)
+    {
+        if (context.Toolbar.Name == StandardToolbars.Main)
+        {
+            context.Toolbar.Items.Add(new ToolbarItem(typeof(LanguageSwitch)));
+
+            var authenticationStateProvider = context.ServiceProvider
+                .GetService<AuthenticationStateProvider>();
+            if (authenticationStateProvider != null)
+            {
+                context.Toolbar.Items.Add(new ToolbarItem(typeof(LoginDisplay)));
+            }
+        }
+        return Task.CompletedTask;
+    }
+}
+```
+
+Unlike the server variant, this contributor adds the language switch first and the login display second — meaning the login dropdown ends up at the *right edge* (matching common SPA conventions). The order is intentional and worth preserving in customisations.
+
+The `AuthenticationStateProvider != null` guard exists because a SPA can in theory be deployed without an auth provider (public landing page). In that case `LoginDisplay`'s `<AuthorizeView>` would still render correctly but the unauthenticated branch shows a `<a href="authentication/login">` link that 404s. Hiding the component entirely is the more honest behaviour.
+
+## `LoginDisplay.razor`
+
+The WebAssembly `LoginDisplay` differs from the Server one in three important ways:
+
+```razor
+<AuthorizeView>
+    <Authorized>
+        <Dropdown RightAligned="true">
+            <DropdownToggle Color="Color.Default">
+                @if (CurrentTenant.Name != null)
+                {
+                    <span><i>@CurrentTenant.Name</i>\@CurrentUser.UserName</span>
+                }
+                else
+                {
+                    <span>@CurrentUser.UserName</span>
+                }
+            </DropdownToggle>
+            <DropdownMenu>
+                @if (Menu != null)
+                {
+                    @foreach (var menuItem in Menu.Items)
+                    {
+                        <DropdownItem Clicked="@(() => NavigateToAsync(menuItem.Url, menuItem.Target))">
+                            @menuItem.DisplayName
+                        </DropdownItem>
+                    }
+                }
+                <DropdownDivider />
+                <DropdownItem Clicked="BeginSignOut">@UiLocalizer["Logout"]</DropdownItem>
+            </DropdownMenu>
+        </Dropdown>
+    </Authorized>
+    <NotAuthorized>
+        <a class="nav-link" href="authentication/login">@UiLocalizer["Login"]</a>
+    </NotAuthorized>
+</AuthorizeView>
+```
+
+Differences from the server `LoginDisplay`:
+
+1. **Menu items invoke `NavigateToAsync(url, target)`** instead of being plain `<a href>` anchors. This routes the click through Blazor's `NavigationManager` so the SPA does an in-app navigation instead of a full reload. `target == "_blank"` opens via JavaScript `window.open` instead.
+2. **An explicit Logout `<DropdownItem>`** is appended after a `<DropdownDivider />`. The Account module in a WebAssembly SPA does not contribute a Logout menu item because the OIDC sign-out flow needs to invoke `NavigateToLogout` with the correct path — not a static `<a href>`.
+3. **`href="authentication/login"`** (not `Account/Login`). The WebAssembly host's login URL is the SPA's own `Authentication.razor` page, which then redirects to the OIDC authority.
+
+The code-behind:
+
+```csharp
+public partial class LoginDisplay : IDisposable
+{
+    [Inject] protected IMenuManager MenuManager { get; set; }
+    [Inject] protected ApplicationConfigurationChangedService ApplicationConfigurationChangedService { get; set; }
+    protected ApplicationMenu Menu { get; set; }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Menu = await MenuManager.GetAsync(StandardMenus.User);
+        Navigation.LocationChanged += OnLocationChanged;
+        ApplicationConfigurationChangedService.Changed += ApplicationConfigurationChanged;
+    }
+
+    private async Task NavigateToAsync(string uri, string target = null)
+    {
+        if (target == "_blank")
+            await JsRuntime.InvokeVoidAsync("open", uri, target);
+        else
+            Navigation.NavigateTo(uri);
+    }
+
+    private void BeginSignOut() => Navigation.NavigateToLogout("authentication/logout");
+
+    private async void ApplicationConfigurationChanged()
+    {
+        Menu = await MenuManager.GetAsync(StandardMenus.User);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        Navigation.LocationChanged -= OnLocationChanged;
+        ApplicationConfigurationChangedService.Changed -= ApplicationConfigurationChanged;
+    }
+}
+```
+
+The `BeginSignOut` method calls `NavigateToLogout` — an extension method on `NavigationManager` from `Microsoft.AspNetCore.Components.WebAssembly.Authentication`. Under the hood it:
+
+1. Sets the `RemoteAuthenticationActions.LogOut` route on `RemoteAuthenticatorView`.
+2. Lets `RemoteAuthenticatorView` initiate the OIDC end-session-endpoint redirect.
+3. Catches the post-logout callback at `authentication/logout-callback`.
+4. Tears down the user's local OIDC state.
+
+`OnLocationChanged` + `ApplicationConfigurationChanged` together ensure the menu re-renders after a login, logout, tenant switch, or permission change.
+
+## `LanguageSwitch.razor`
+
+The WebAssembly language switch is completely different from the server one — it has no `Abp/Languages/Switch` endpoint to call (the SPA is static). Instead it persists the chosen culture to `localStorage` and reloads the page:
+
+```razor
+<BarDropdown RightAligned="true">
+    <BarDropdownToggle>@_currentLanguage.DisplayName</BarDropdownToggle>
+    <BarDropdownMenu>
+        @foreach (var language in _otherLanguages)
+        {
+            <BarDropdownItem Clicked="() => ChangeLanguageAsync(language)">
+                @language.DisplayName
+            </BarDropdownItem>
+        }
+    </BarDropdownMenu>
+</BarDropdown>
+```
+
+```csharp
+protected override async Task OnInitializedAsync()
+{
+    var selectedLanguageName = await JsRuntime.InvokeAsync<string>(
+        "localStorage.getItem", "Abp.SelectedLanguage");
+
+    _otherLanguages = await LanguageProvider.GetLanguagesAsync();
+    if (!_otherLanguages.Any()) return;
+
+    if (!selectedLanguageName.IsNullOrWhiteSpace())
+        _currentLanguage = _otherLanguages.FirstOrDefault(l => l.UiCultureName == selectedLanguageName);
+
+    _currentLanguage ??= _otherLanguages.FirstOrDefault(l => l.UiCultureName == CultureInfo.CurrentUICulture.Name);
+    _currentLanguage ??= _otherLanguages.FirstOrDefault();
+
+    _otherLanguages = _otherLanguages.Where(l => l != _currentLanguage).ToImmutableList();
+}
+
+private async Task ChangeLanguageAsync(LanguageInfo language)
+{
+    await JsRuntime.InvokeVoidAsync("localStorage.setItem", "Abp.SelectedLanguage", language.UiCultureName);
+    await JsRuntime.InvokeVoidAsync("localStorage.setItem", "Abp.IsRtl",
+        CultureInfo.GetCultureInfo(language.UiCultureName).TextInfo.IsRightToLeft);
+    await JsRuntime.InvokeVoidAsync("location.reload");
+}
+```
+
+How it works:
+
+- On initialise, read the previous choice from `localStorage["Abp.SelectedLanguage"]`. Fall back to the runtime's `CurrentUICulture`, then to the first available language.
+- On change, store the new culture name and a precomputed `IsRtl` flag in `localStorage`, then `location.reload()`.
+- The ABP WebAssembly boot code reads `localStorage["Abp.SelectedLanguage"]` on startup and applies it to `CultureInfo` before the first render — that is why a reload is required to pick up the new culture.
+
+The `IsRtl` boolean is precomputed in JavaScript-land because the boot code needs it *before* the .NET runtime is available, in order to set `<html dir="rtl">` early to avoid layout flashes.
+
+## `WebAssemblyRedirectToLogin.razor`
+
+```razor
+@inject NavigationManager Navigation
+
+@using Volo.Abp.DependencyInjection
+@using Volo.Abp.AspNetCore.Components.Web.BasicTheme.Themes.Basic
+@using Microsoft.AspNetCore.Components.WebAssembly.Authentication
+@inherits RedirectToLogin
+@attribute [ExposeServices(typeof(RedirectToLogin))]
+@attribute [Dependency(ReplaceServices = true)]
+
+@code {
+    protected override void OnInitialized()
+    {
+        Navigation.NavigateToLogin("authentication/login");
+    }
+}
+```
+
+Two attributes make this work:
+
+- `[ExposeServices(typeof(RedirectToLogin))]` and `[Dependency(ReplaceServices = true)]` register this component as the `RedirectToLogin` implementation in the DI container, **replacing** the shared web library's version. The shared `App.razor` renders `<RedirectToLogin />` by tag name, but Blazor's compiled markup resolves the type via DI when ABP's services pipeline intercepts.
+
+Actually, the substitution does not work through component-tag resolution alone — Blazor compiles `<RedirectToLogin />` to a fixed type reference. The `[ExposeServices]` attribute matters for the DI graph; the component override is achieved because ABP's WebAssembly hosts wire `AppWithoutAuth.razor` or a custom `App.razor` that delegates to `WebAssemblyRedirectToLogin` directly. In the template-generated host you will find an explicit reference to `WebAssemblyRedirectToLogin` in `App.razor`.
+
+Either way, the runtime behaviour is the same: redirect to `authentication/login`, which is the SPA's own `Authentication.razor` page.
+
+## `Authentication.razor`
+
+```razor
+@page "/authentication/{action}"
+@using Microsoft.AspNetCore.Components.WebAssembly.Authentication
+@using Volo.Abp.AspNetCore.Components.Web.Security
+
+<RemoteAuthenticatorView Action="@Action"
+                        OnLogInSucceeded="OnLogInSucceeded"
+                        OnLogOutSucceeded="OnLogOutSucceeded" />
+
+@inject WebAssemblyCachedApplicationConfigurationClient WebAssemblyCachedApplicationConfigurationClient
+
+@code {
+    [Parameter] public string Action { get; set; }
+
+    private async Task OnLogInSucceeded(RemoteAuthenticationState state)
+    {
+        await WebAssemblyCachedApplicationConfigurationClient.InitializeAsync();
+    }
+
+    private async Task OnLogOutSucceeded(RemoteAuthenticationState state)
+    {
+        await WebAssemblyCachedApplicationConfigurationClient.InitializeAsync();
+    }
+}
+```
+
+This is the **OIDC dispatcher**. `RemoteAuthenticatorView` is the ASP.NET Core component that handles the five canonical OIDC actions:
+
+| Action | URL | Behaviour |
+| --- | --- | --- |
+| `login` | `/authentication/login` | Redirect to OIDC authority. |
+| `login-callback` | `/authentication/login-callback` | Process the authority's redirect, store tokens. |
+| `login-failed` | `/authentication/login-failed` | Show error. |
+| `logout` | `/authentication/logout` | Redirect to end-session endpoint. |
+| `logout-callback` | `/authentication/logout-callback` | Clear local state. |
+
+After a successful login or logout the page calls `WebAssemblyCachedApplicationConfigurationClient.InitializeAsync()` which re-fetches `/api/abp/application-configuration` and broadcasts via `ApplicationConfigurationChangedService.Changed`. That broadcast is what triggers `NavMenu` and `LoginDisplay` to re-render with the new identity context.
+
+If your host uses a different OIDC library or wires authentication manually, you can replace `Authentication.razor` by putting a file at the same `@page` route in your client project. The shared `Router` finds the host file first thanks to the assembly ordering in `AbpRouterOptions`.
+
+## Customisation recipes
+
+### Add a custom OIDC option
+
+Pass an `AdditionalAuthenticationParameters` dictionary to `RemoteAuthenticatorView` by overriding `Authentication.razor`:
+
+```razor
+<RemoteAuthenticatorView Action="@Action"
+                        AuthenticationState="@MyState"
+                        OnLogInSucceeded="OnLogInSucceeded"
+                        OnLogOutSucceeded="OnLogOutSucceeded">
+    <LoggingIn>
+        <p>Redirecting to identity provider...</p>
+    </LoggingIn>
+</RemoteAuthenticatorView>
+```
+
+Each child slot (`<LoggingIn>`, `<LogInFailed>`, `<LogOutSucceeded>`, etc.) renders during the corresponding intermediate state. The defaults are minimal English text — localising them is the most common customisation.
+
+### Persist language to a cookie shared with the API host
+
+The default `localStorage` persistence is local to the browser origin. If your SPA and API are on the same domain and you want the API host to see the language, write a cookie instead:
+
+```csharp
+private async Task ChangeLanguageAsync(LanguageInfo language)
+{
+    await JsRuntime.InvokeVoidAsync("eval",
+        $"document.cookie = 'X-Abp-Culture={language.UiCultureName}; path=/; max-age=31536000'");
+    await JsRuntime.InvokeVoidAsync("location.reload");
+}
+```
+
+…and update the API host's `RequestLocalizationOptions` to read that cookie. The default `Abp.SelectedLanguage` storage stays in the SPA only.
+
+### Hide Logout for impersonated users
+
+Inject `IPermissionChecker` and conditionally hide the Logout item:
+
+```razor
+@if (!await PermissionChecker.IsGrantedAsync("Impersonated"))
+{
+    <DropdownItem Clicked="BeginSignOut">@UiLocalizer["Logout"]</DropdownItem>
+}
+```
+
+Or remove it from the User menu in a contributor — but the WebAssembly `LoginDisplay` adds Logout literally in the markup, so you must override the component.
+
+## Gotchas
+
+- **`NavigateToLogout("authentication/logout")` requires a registered `IAccessTokenProvider`**. If your SPA uses a non-OIDC scheme (rare — e.g. a custom JWT API key) the call will throw. The Account WebAssembly module installs the right provider; do not remove it.
+- **`location.reload()` after a language change drops the SPA's in-memory state**. Long-running edits in a grid or modal are lost. Warn users before switching languages mid-session.
+- **`Authentication.razor`'s `[Parameter] public string Action`** is case-insensitive (`/authentication/Login` and `/authentication/login` both resolve), but the `RemoteAuthenticatorView` actions are case-sensitive constants. Always link to lowercase URLs to be safe.
+- **`abp bundle` must be re-run after adding modules** that contribute styles. Forgetting this is the most common reason for "the new feature has no styling" reports in WebAssembly hosts.
+- **`WebAssemblyCachedApplicationConfigurationClient`** caches the application configuration in memory. After a tenant switch you must call `InitializeAsync()` explicitly — the cache does not invalidate on its own.
+- **The fixed `<a href="authentication/login">` in `LoginDisplay`** is *relative*. If your SPA is hosted under a base path like `/app/`, the link resolves to `/app/authentication/login` — which matches the SPA's `<base href="/app/">`. If you accidentally set `<base href="/">` the link breaks for users behind a path-mapped reverse proxy.
+- **`BasicThemeBundleContributor` only adds styles** — no scripts. If you need WebAssembly-side JS, register an additional `IBundleContributor` and re-run `abp bundle`.
+
+## See also
+
+- [Overview](/modules/basic-theme/overview) — package map and shared visual contract.
+- [Blazor Web (shared)](/modules/basic-theme/blazor-web) — `MainLayout`, `NavMenu`, `Branding`, `RedirectToLogin`, `App.razor`.
+- [Blazor Server](/modules/basic-theme/blazor-server) — server-side counterpart with cookie-based language switching.
+- [Blazor UI overview](/framework/ui-blazor/) — Blazor-specific abstractions, `AbpRouterOptions`, `IThemeManager`.
+- [MVC walkthrough](/modules/basic-theme/mvc) — Razor Pages equivalent.
+- [Theme Shared (MVC)](/framework/ui-mvc/mvc-ui-theme-shared) — `StandardLayouts`, `StandardToolbars`, `IBrandingProvider`.

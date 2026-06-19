@@ -1,0 +1,284 @@
+---
+title: "Apache Kafka"
+description: "External-broker reference for Apache Kafka — Volo.Abp.Kafka transport, broker version targets, ClientConfig knobs, SASL/TLS, topic layout, and consumer-group semantics."
+---
+
+`Volo.Abp.Kafka` is the transport-level Kafka integration. It wraps the `Confluent.Kafka` client, exposes producer/consumer pools, and gives the distributed event bus a Kafka backend. This reference focuses on the **broker side**: which Kafka versions ABP runs against, how the `Confluent.Kafka` `ClientConfig` maps to `appsettings.json`, what topics and consumer groups ABP creates, and the failure modes you'll see in production.
+
+For ABP-side internals (pools, consumer factory, serializer) see [Kafka Transport](/framework/brokers/kafka). For event semantics, see [Distributed Event Bus — Kafka](/framework/eventbus/kafka).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.Kafka` | Connection / producer / consumer pools, `IKafkaMessageConsumer`. |
+| `Volo.Abp.EventBus.Kafka` | Distributed event bus over Kafka. |
+
+The transport module:
+
+```csharp
+[DependsOn(typeof(AbpJsonModule), typeof(AbpThreadingModule))]
+public class AbpKafkaModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpKafkaOptions>(configuration.GetSection("Kafka"));
+    }
+    /* OnApplicationShutdown disposes IConsumerPool and IProducerPool */
+}
+```
+
+## Options model
+
+```csharp
+public class AbpKafkaOptions
+{
+    public KafkaConnections Connections { get; }
+
+    public Action<ProducerConfig> ConfigureProducer { get; set; }
+    public Action<ConsumerConfig> ConfigureConsumer { get; set; }
+    public Action<TopicSpecification> ConfigureTopic { get; set; }
+}
+
+public class KafkaConnections : Dictionary<string, ClientConfig>
+{
+    public const string DefaultConnectionName = "Default";
+    public ClientConfig Default { /* indexer over "Default" */ }
+    public ClientConfig GetOrDefault(string connectionName) { /* fallback */ }
+}
+```
+
+`Confluent.Kafka.ClientConfig` is the union of common producer + consumer + admin settings; ABP binds it directly from the `Kafka:Connections:Default` JSON section. Producer-only and consumer-only overrides are applied imperatively via `ConfigureProducer` / `ConfigureConsumer` callbacks (set in code, not in JSON). `ConfigureTopic` runs when ABP creates a topic through the admin client.
+
+## Broker version requirements
+
+| Broker | Minimum | Recommended |
+| --- | --- | --- |
+| Apache Kafka | 2.5 (KIP-447 transactional semantics) | **3.5+** (KRaft GA), **3.6+** (tiered storage GA) |
+| Redpanda | 22.x | 23.x or later — wire-compatible, no ZooKeeper |
+| Confluent Platform | 6.x | 7.x |
+| Amazon MSK / MSK Serverless | mirrors OSS | use latest LTS line |
+| Azure Event Hubs (Kafka surface) | n/a | works as a single-broker, single-AZ Kafka — see below |
+
+ABP relies on `Confluent.Kafka` 2.x, which speaks the modern Kafka protocol including idempotent producers, EOS-v2 transactions, and incremental cooperative rebalancing.
+
+## Sample `appsettings.json`
+
+```json
+{
+  "Kafka": {
+    "Connections": {
+      "Default": {
+        "BootstrapServers": "kafka-1.internal:9093,kafka-2.internal:9093,kafka-3.internal:9093",
+        "SecurityProtocol": "SaslSsl",
+        "SaslMechanism": "ScramSha512",
+        "SaslUsername": "catalog-service",
+        "SaslPassword": "Sup3rS3cret!",
+        "SslCaLocation": "/etc/ssl/certs/kafka-ca.pem",
+        "ClientId": "catalog-service",
+        "EnableSslCertificateVerification": true
+      }
+    },
+    "EventBus": {
+      "GroupId": "catalog-service",
+      "TopicName": "Abp.Events"
+    }
+  }
+}
+```
+
+The property names match `ClientConfig`'s PascalCase property names; `Confluent.Kafka` translates them to its underlying `kebab-case` librdkafka properties (`bootstrap.servers`, `security.protocol`, etc.) at runtime. `Kafka:EventBus` is read by `AbpKafkaEventBusOptions` from the event bus module.
+
+## Authentication and transport
+
+`SecurityProtocol` accepts:
+
+- `Plaintext` — no auth, no TLS. Dev only.
+- `Ssl` — mutual TLS (broker authenticates client via cert).
+- `SaslPlaintext` — SASL over plain TCP. Avoid in production.
+- `SaslSsl` — SASL over TLS. The default for managed brokers.
+
+`SaslMechanism`:
+
+| Value | Use |
+| --- | --- |
+| `Plain` | MSK with IAM disabled, Event Hubs (with connection-string-as-password). |
+| `ScramSha256` / `ScramSha512` | Self-managed Kafka, Redpanda, Confluent Cloud. |
+| `OAuthBearer` | OAuth/OIDC brokers; pair with `OAuthBearerConfig`. |
+| `Gssapi` | Kerberos. |
+
+For **Azure Event Hubs**, the canonical form is:
+
+```json
+{
+  "BootstrapServers": "my-ns.servicebus.windows.net:9093",
+  "SecurityProtocol": "SaslSsl",
+  "SaslMechanism": "Plain",
+  "SaslUsername": "$ConnectionString",
+  "SaslPassword": "Endpoint=sb://my-ns.servicebus.windows.net/;SharedAccessKeyName=...;SharedAccessKey=..."
+}
+```
+
+For **AWS MSK with IAM**, install `Confluent.Kafka.OAuthBearer.AWS` (or implement a token refresh callback) and set `SecurityProtocol=SaslSsl`, `SaslMechanism=OAuthBearer`.
+
+## Producer & consumer defaults to override
+
+ABP doesn't pre-set many producer/consumer parameters; `Confluent.Kafka` defaults apply. The most important ones to set explicitly in `ConfigureProducer` / `ConfigureConsumer`:
+
+```csharp
+Configure<AbpKafkaOptions>(options =>
+{
+    options.ConfigureProducer = producer =>
+    {
+        producer.EnableIdempotence = true;          // exactly-once-ish
+        producer.Acks = Acks.All;                   // wait for ISR
+        producer.LingerMs = 5;                      // micro-batch
+        producer.CompressionType = CompressionType.Zstd;
+        producer.MessageSendMaxRetries = 10;
+    };
+
+    options.ConfigureConsumer = consumer =>
+    {
+        consumer.AutoOffsetReset = AutoOffsetReset.Earliest;
+        consumer.EnableAutoCommit = false;          // ABP commits explicitly
+        consumer.SessionTimeoutMs = 30_000;
+        consumer.PartitionAssignmentStrategy = PartitionAssignmentStrategy.CooperativeSticky;
+        consumer.IsolationLevel = IsolationLevel.ReadCommitted;
+    };
+});
+```
+
+`EnableAutoCommit=false` is recommended because ABP's `KafkaMessageConsumer` commits after the handler succeeds — auto-commit would lose at-least-once guarantees on crash.
+
+## Topic and consumer-group layout
+
+| Object | Default | Notes |
+| --- | --- | --- |
+| Distributed event topic | `Abp.Events` (configurable via `Kafka:EventBus:TopicName`) | One topic per app cluster, partitioned by event type. |
+| Consumer group | `Kafka:EventBus:GroupId` (defaults to `Default`) | One group per microservice — that's what gives you load balancing across pod replicas. |
+| Topic partitions | not set by ABP | Pre-create the topic with enough partitions (≥ # of replicas per service) before deploy. |
+| Replication factor | not set by ABP | Use ≥ 3 in production. |
+
+`ConfigureTopic` runs only when ABP calls the admin client to auto-create a topic. In production prefer to pre-create topics via your provisioning tool (Terraform, `kafka-topics.sh`, Confluent Cloud API) so partition count and replication are explicit.
+
+## Network setup
+
+1. **Bootstrap servers.** List 3+ brokers comma-separated. The client discovers the full cluster from the first reachable bootstrap.
+2. **Advertised listeners.** Brokers advertise hostnames the client must reach. If bootstrap works but produce/consume fails with `Connection refused`, the advertised listener is wrong (a common Docker-on-laptop issue).
+3. **TLS.** Mount the CA bundle into the pod and point `SslCaLocation` at it. With managed services, the system CA bundle usually suffices and `SslCaLocation` can be omitted.
+4. **Idle disconnects.** Brokers close idle connections after `connections.max.idle.ms` (default 10 min). The client reconnects transparently; nothing to configure.
+5. **Schema registry.** ABP's default serializer is UTF-8 JSON, not Avro. If you need a registry-backed schema, override `IKafkaSerializer` and depend on `Confluent.SchemaRegistry.Serdes.Json`/`Avro`.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `Local: Broker transport failure` | TLS handshake or bootstrap address wrong. | Verify `SecurityProtocol`, CA, hostname resolution. Enable `Debug=security,broker` temporarily. |
+| `SASL authentication error: SCRAM-SHA-512 mechanism handshake failed: Broker: Unsupported SASL mechanism` | Broker doesn't enable that SCRAM algorithm. | Match `SaslMechanism` to broker config; for Event Hubs use `Plain`. |
+| Consumer keeps rebalancing every few seconds | Handler slower than `MaxPollIntervalMs` (default 5 min) or session timeout breached. | Increase `MaxPollIntervalMs`, move slow work to a background queue, or use cooperative-sticky strategy. |
+| Lag grows on one partition only | Keyed messages hashing to a single hot partition. | Re-key producer or increase partition count + rebalance. |
+| `Group authorization failed` | Service account lacks `Read,Describe` on group, `Read` on topic. | Apply ACLs: `kafka-acls --add --allow-principal User:catalog-service --operation Read --topic Abp.Events --group catalog-service`. |
+| Duplicate events on retry | `EnableIdempotence=false` (default) + producer retries. | Set `EnableIdempotence=true` and `Acks=All`. |
+| `MESSAGE_TOO_LARGE` | Event larger than broker `message.max.bytes` (default 1 MB). | Compress (`zstd`), shrink payloads, or raise broker/topic limit. |
+| Consumer doesn't see new topic | Topic created after consumer started, `metadata.max.age.ms` too high. | Lower `MetadataMaxAgeMs` to 30s or restart the consumer. |
+| Event Hubs returns `not_coordinator_for_group` | Connection routed through a wrong namespace. | Use one Event Hubs namespace per consumer-group target; check connection string. |
+
+## Observability hints
+
+- **Broker metrics.** JMX exporters (Kafka has no Prometheus endpoint natively; use `kminion` or `kafka_exporter`). Key gauges: `kafka_topic_partition_current_offset`, `kafka_consumergroup_lag`, `kafka_brokers`, under-replicated partitions.
+- **Client stats.** `Confluent.Kafka` emits stats JSON every `StatisticsIntervalMs` (set in `ConfigureProducer/Consumer`). Wire a callback in your app module to push gauges (`outbuf_msg_cnt`, `txmsgs`, `rxmsgs`, `lag`).
+- **Tracing.** `OpenTelemetry.Instrumentation.ConfluentKafka` (community) adds producer/consumer spans. ABP propagates `traceparent` through event metadata when the event bus is wired with `IDistributedEventBus`.
+- **Lag.** `kafka-consumer-groups.sh --describe --group catalog-service` from a broker shell. For continuous monitoring, deploy Burrow or kminion.
+- **Producer batch size.** A common silent inefficiency: `LingerMs=0` (default) sends single-record batches. Set to 5–20 ms for higher throughput.
+
+## High availability and durability
+
+- **Replication factor 3** with `min.insync.replicas=2` is the production minimum. Combined with `Acks=All` it survives one broker failure without data loss.
+- **Rack awareness.** Tag brokers with `broker.rack=zone-a/b/c` so partitions spread across availability zones.
+- **KRaft.** Kafka 3.5+ KRaft mode removes ZooKeeper. ABP's client doesn't care which controller plane is used.
+- **Tiered storage** (Apache Kafka 3.6+, Confluent Cloud, MSK Serverless) moves cold segments to object storage. Doesn't change client behaviour.
+
+## Topic configuration cheatsheet
+
+When pre-creating topics for ABP events:
+
+```bash
+kafka-topics.sh --bootstrap-server kafka:9093 --create \
+  --topic Abp.Events \
+  --partitions 12 \
+  --replication-factor 3 \
+  --config min.insync.replicas=2 \
+  --config retention.ms=604800000 \
+  --config compression.type=zstd \
+  --config cleanup.policy=delete
+```
+
+- **Partitions** ≥ max consumer concurrency you ever expect. Increasing later is allowed but redistributes keys — costly.
+- **Retention** — events are usually transient; 7 days is enough for replay during a major incident.
+- **Compaction** (`cleanup.policy=compact`) is useful for snapshot-style topics keyed by aggregate id; ABP's event stream is not compacted.
+
+## Headers
+
+ABP sets these Kafka headers on every event:
+
+| Header | Meaning |
+| --- | --- |
+| `messageId` | UUID for idempotency. |
+| `traceparent` | W3C trace context for tracing. |
+| `tenantId` | Tenant context (if multi-tenant). |
+| `eventName` | Logical event name; consumers dispatch on this. |
+
+Headers are JSON UTF-8 byte values, parsed by the consumer pool.
+
+## ACLs
+
+A useful per-service ACL set for Kafka over SASL/SCRAM:
+
+```bash
+kafka-acls --bootstrap-server kafka:9093 \
+  --add --allow-principal User:catalog-service \
+  --operation Read --operation Write \
+  --topic Abp.Events
+
+kafka-acls --bootstrap-server kafka:9093 \
+  --add --allow-principal User:catalog-service \
+  --operation Read --operation Describe \
+  --group catalog-service
+```
+
+For Confluent Cloud / MSK use the equivalent role bindings.
+
+## Exactly-once semantics
+
+Kafka supports EOS via idempotent producer + transactions + read-committed consumer. ABP's transport doesn't enable transactions by default — combine with the inbox/outbox pattern instead:
+
+- Outbox writes the event in the same DB transaction as the domain change.
+- The outbox publisher reads outbox rows and publishes (idempotent producer ensures no duplicates within a session).
+- Consumers store processed `messageId`s in the inbox to dedupe.
+
+This pattern is broker-agnostic and avoids Kafka transaction complexity.
+
+## Schema evolution
+
+ABP serialises events as UTF-8 JSON by default. Plan for schema evolution:
+
+- Use `[EventName("user.created.v1")]` for stable topic / header values.
+- Add new optional fields; deserialisers ignore unknown.
+- For breaking changes publish to a new event name (`v2`); run both for a period; then retire.
+
+For strongly typed contracts use Confluent Schema Registry + Avro / Protobuf. Replace `IKafkaSerializer` with a SR-aware one.
+
+## Connection idle and DNS
+
+Brokers reset DNS occasionally (e.g. MSK during patching). `librdkafka` re-resolves on reconnect; pin `BootstrapServers` to DNS names rather than IPs.
+
+## Cooperative-sticky rebalancing
+
+Set `consumer.PartitionAssignmentStrategy = CooperativeSticky` to avoid the "stop the world" rebalance behaviour. With it only the moving partitions pause; others continue draining. Highly recommended for ABP consumers running many partitions.
+
+## Related references
+
+- [Kafka Transport](/framework/brokers/kafka) — producer/consumer pool internals and serializer.
+- [Distributed Event Bus — Kafka](/framework/eventbus/kafka) — event topic and consumer-group layout.
+- [Outbox/Inbox](/framework/eventbus/inbox-outbox) — combine with Kafka for exactly-once delivery semantics.

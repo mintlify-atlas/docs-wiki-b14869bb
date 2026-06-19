@@ -1,0 +1,412 @@
+---
+title: "Account module HTTP endpoints"
+sidebarTitle: "Account endpoints"
+description: "Routes exposed by Volo.Abp.Account.HttpApi: anonymous registration, password reset, profile management and the my-profile change-password flow."
+---
+
+The Account module ships two MVC controllers in `Volo.Abp.Account.HttpApi`,
+both extending `AbpControllerBase` and implementing an application-service
+interface from `Volo.Abp.Account.Application.Contracts`. The interface is
+the contract; the controller just forwards the call. Route prefixes are
+hard-coded on the controller with `[Route]`, the area name comes from
+`[Area(AccountRemoteServiceConsts.ModuleName)]` (`"account"`) and the
+remote-service name comes from `[RemoteService(...)]`.
+
+```text Volo.Abp.Account.HttpApi
+Volo/Abp/Account/
+├── AbpAccountHttpApiModule.cs
+├── AccountController.cs   → [Route("api/account")]
+└── ProfileController.cs   → [Route("/api/account/my-profile")]
+```
+
+## Route summary
+
+| Verb | Path | Body | Returns | Auth |
+| ---- | ---- | ---- | ------- | ---- |
+| POST | `/api/account/register` | `RegisterDto` | `IdentityUserDto` | anonymous |
+| POST | `/api/account/send-password-reset-code` | `SendPasswordResetCodeDto` | `204` | anonymous |
+| POST | `/api/account/verify-password-reset-token` | `VerifyPasswordResetTokenInput` | `bool` | anonymous |
+| POST | `/api/account/reset-password` | `ResetPasswordDto` | `204` | anonymous |
+| GET  | `/api/account/my-profile` | — | `ProfileDto` | authenticated |
+| PUT  | `/api/account/my-profile` | `UpdateProfileDto` | `ProfileDto` | authenticated |
+| POST | `/api/account/my-profile/change-password` | `ChangePasswordInput` | `204` | authenticated |
+
+`204` means the action returns `Task` (no body) and `AbpNoContentActionFilter`
+rewrites it to `204 No Content`.
+
+## AccountController — the anonymous flow
+
+```csharp modules/account/src/Volo.Abp.Account.HttpApi/Volo/Abp/Account/AccountController.cs
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[Route("api/account")]
+public class AccountController : AbpControllerBase, IAccountAppService
+{
+    protected IAccountAppService AccountAppService { get; }
+
+    public AccountController(IAccountAppService accountAppService)
+    {
+        AccountAppService = accountAppService;
+    }
+
+    [HttpPost]
+    [Route("register")]
+    public virtual Task<IdentityUserDto> RegisterAsync(RegisterDto input)
+    {
+        return AccountAppService.RegisterAsync(input);
+    }
+
+    [HttpPost]
+    [Route("send-password-reset-code")]
+    public virtual Task SendPasswordResetCodeAsync(SendPasswordResetCodeDto input)
+    {
+        return AccountAppService.SendPasswordResetCodeAsync(input);
+    }
+
+    [HttpPost]
+    [Route("verify-password-reset-token")]
+    public Task<bool> VerifyPasswordResetTokenAsync(VerifyPasswordResetTokenInput input)
+    {
+        return AccountAppService.VerifyPasswordResetTokenAsync(input);
+    }
+
+    [HttpPost]
+    [Route("reset-password")]
+    public virtual Task ResetPasswordAsync(ResetPasswordDto input)
+    {
+        return AccountAppService.ResetPasswordAsync(input);
+    }
+}
+```
+
+`IAccountAppService` carries no `[Authorize]`, so the four routes above are
+anonymous-by-default. The implementation may still throw
+`AbpAuthorizationException` from inside if a feature/setting forbids the
+operation (for example "self-registration disabled").
+
+### `POST /api/account/register`
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/RegisterDto.cs
+public class RegisterDto : ExtensibleObject
+{
+    [Required]
+    [DynamicStringLength(typeof(IdentityUserConsts), nameof(IdentityUserConsts.MaxUserNameLength))]
+    public string UserName { get; set; }
+
+    [Required]
+    [EmailAddress]
+    [DynamicStringLength(typeof(IdentityUserConsts), nameof(IdentityUserConsts.MaxEmailLength))]
+    public string EmailAddress { get; set; }
+
+    [Required]
+    [DynamicStringLength(typeof(IdentityUserConsts), nameof(IdentityUserConsts.MaxPasswordLength))]
+    [DataType(DataType.Password)]
+    [DisableAuditing]
+    public string Password { get; set; }
+
+    [Required]
+    public string AppName { get; set; }
+}
+```
+
+`AppName` is propagated to email templates so the welcome/confirmation mail
+can render with the right product label.
+
+Request:
+
+```http
+POST /api/account/register HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+
+{
+  "userName": "alice",
+  "emailAddress": "alice@example.com",
+  "password": "P@ssw0rd!",
+  "appName": "MVC"
+}
+```
+
+Response (`IdentityUserDto`, abbreviated):
+
+```json
+{
+  "tenantId": null,
+  "userName": "alice",
+  "name": null,
+  "surname": null,
+  "email": "alice@example.com",
+  "emailConfirmed": false,
+  "phoneNumber": null,
+  "phoneNumberConfirmed": false,
+  "isActive": true,
+  "lockoutEnabled": true,
+  "accessFailedCount": 0,
+  "lockoutEnd": null,
+  "concurrencyStamp": "5c6f...",
+  "entityVersion": 0,
+  "lastPasswordChangeTime": "2025-01-15T08:30:00Z",
+  "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "creationTime": "2025-01-15T08:30:00Z",
+  "creatorId": null
+}
+```
+
+### `POST /api/account/send-password-reset-code`
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/SendPasswordResetCodeDto.cs
+public class SendPasswordResetCodeDto
+{
+    [Required]
+    [EmailAddress]
+    [DynamicStringLength(typeof(IdentityUserConsts), nameof(IdentityUserConsts.MaxEmailLength))]
+    public string Email { get; set; }
+
+    [Required]
+    public string AppName { get; set; }
+
+    public string ReturnUrl { get; set; }
+
+    public string ReturnUrlHash { get; set; }
+}
+```
+
+```json
+{
+  "email": "alice@example.com",
+  "appName": "MVC",
+  "returnUrl": "https://app.example.com/account/reset",
+  "returnUrlHash": null
+}
+```
+
+Returns `204 No Content`. The reset link mailed to the user embeds the
+token plus `userId`, both of which are required by the next two calls.
+
+### `POST /api/account/verify-password-reset-token`
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/IAccountAppService.cs (subset)
+Task<bool> VerifyPasswordResetTokenAsync(VerifyPasswordResetTokenInput input);
+```
+
+`VerifyPasswordResetTokenInput` carries `UserId` and `ResetToken` and returns
+the boolean directly — `true` if the token is still valid for that user.
+
+```json
+{
+  "userId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "resetToken": "CfDJ8L...truncated"
+}
+```
+
+```json
+true
+```
+
+### `POST /api/account/reset-password`
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/ResetPasswordDto.cs
+public class ResetPasswordDto
+{
+    public Guid UserId { get; set; }
+
+    [Required]
+    public string ResetToken { get; set; }
+
+    [Required]
+    [DisableAuditing]
+    public string Password { get; set; }
+}
+```
+
+```json
+{
+  "userId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "resetToken": "CfDJ8L...truncated",
+  "password": "newP@ss!"
+}
+```
+
+`204 No Content` on success.
+
+## ProfileController — the signed-in user
+
+```csharp modules/account/src/Volo.Abp.Account.HttpApi/Volo/Abp/Account/ProfileController.cs
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[ControllerName("Profile")]
+[Route("/api/account/my-profile")]
+public class ProfileController : AbpControllerBase, IProfileAppService
+{
+    [HttpGet]
+    public virtual Task<ProfileDto> GetAsync() => ...;
+
+    [HttpPut]
+    public virtual Task<ProfileDto> UpdateAsync(UpdateProfileDto input) => ...;
+
+    [HttpPost]
+    [Route("change-password")]
+    public virtual Task ChangePasswordAsync(ChangePasswordInput input) => ...;
+}
+```
+
+`IProfileAppService` requires the current user (it calls
+`CurrentUser.GetId()` inside) — every action enforces authentication.
+
+### `GET /api/account/my-profile`
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/ProfileDto.cs
+public class ProfileDto : ExtensibleObject, IHasConcurrencyStamp
+{
+    public string UserName { get; set; }
+    public string Email { get; set; }
+    public string Name { get; set; }
+    public string Surname { get; set; }
+    public string PhoneNumber { get; set; }
+    public bool IsExternal { get; set; }
+    public bool HasPassword { get; set; }
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+```http
+GET /api/account/my-profile HTTP/1.1
+Authorization: Bearer eyJhbGciOi...
+```
+
+```json
+{
+  "userName": "alice",
+  "email": "alice@example.com",
+  "name": "Alice",
+  "surname": "Liddell",
+  "phoneNumber": "+1-555-1234",
+  "isExternal": false,
+  "hasPassword": true,
+  "concurrencyStamp": "5c6f..."
+}
+```
+
+### `PUT /api/account/my-profile`
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/UpdateProfileDto.cs
+public class UpdateProfileDto : ExtensibleObject
+{
+    public string UserName { get; set; }
+    public string Email { get; set; }
+    public string Name { get; set; }
+    public string Surname { get; set; }
+    public string PhoneNumber { get; set; }
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+Send the stamp from the previous `GET` to opt into optimistic concurrency.
+
+```json
+{
+  "userName": "alice",
+  "email": "alice@example.com",
+  "name": "Alice",
+  "surname": "Liddell-Smith",
+  "phoneNumber": "+1-555-0000",
+  "concurrencyStamp": "5c6f..."
+}
+```
+
+Returns the updated `ProfileDto` (new `ConcurrencyStamp`).
+
+### `POST /api/account/my-profile/change-password`
+
+```csharp modules/account/src/Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/ChangePasswordInput.cs
+public class ChangePasswordInput : IValidatableObject
+{
+    [DisableAuditing]
+    public string CurrentPassword { get; set; }
+
+    [Required]
+    [DisableAuditing]
+    public string NewPassword { get; set; }
+}
+```
+
+```json
+{
+  "currentPassword": "P@ssw0rd!",
+  "newPassword": "newP@ssw0rd!"
+}
+```
+
+The DTO's `Validate` method rejects `CurrentPassword == NewPassword`. When
+`HasPassword` is `false` (external login) `CurrentPassword` may be omitted —
+the server uses `AddPasswordAsync` instead of `ChangePasswordAsync`.
+
+## Multi-tenancy
+
+The Account module is fully tenant-aware. The current tenant is resolved by
+`ITenantResolver` before the action runs and overrides the `IMultiTenant`
+filter inside services. Clients pass it via one of the standard channels:
+
+| Channel | Example |
+| ------- | ------- |
+| Header  | `__tenant: contoso` |
+| Header (GUID) | `__tenant: 3fa85f64-5717-4562-b3fc-2c963f66afa6` |
+| Cookie  | `__tenant=contoso` |
+| Query   | `/api/account/register?__tenant=contoso` |
+| Domain  | `contoso.app.example.com` (when a domain resolver is configured) |
+
+Registering a user in tenant `contoso`:
+
+```http
+POST /api/account/register HTTP/1.1
+__tenant: contoso
+Content-Type: application/json
+
+{ "userName": "...", "emailAddress": "...", "password": "...", "appName": "MVC" }
+```
+
+The new user is created with `TenantId = <contoso-guid>`.
+
+## Common error envelope
+
+When validation fails or the user cannot be found the response uses the
+standard ABP envelope produced by `AbpExceptionFilter` /
+`AbpExceptionHandlingMiddleware`:
+
+```json
+{
+  "error": {
+    "code": "Volo.Account:010002",
+    "message": "Invalid user name or password!",
+    "details": null,
+    "data": {},
+    "validationErrors": null
+  }
+}
+```
+
+Validation errors (model state) surface as `400 Bad Request`:
+
+```json
+{
+  "error": {
+    "code": null,
+    "message": "Your request is not valid!",
+    "details": "The following errors were found:\n\n - The Password field is required.",
+    "validationErrors": [
+      { "message": "The Password field is required.", "members": ["password"] }
+    ]
+  }
+}
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Identity endpoints" icon="user-shield" href="/reference/api/identity-endpoints">
+    Admin-side user and role management — the privileged counterpart of the public account flow.
+  </Card>
+  <Card title="Dynamic controllers" icon="bolt" href="/reference/api/dynamic-controllers">
+    How `AbpServiceConvention` turns app services into HTTP endpoints.
+  </Card>
+</CardGroup>

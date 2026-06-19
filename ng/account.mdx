@@ -1,0 +1,347 @@
+---
+title: "@abp/ng.account"
+description: "Login, register, forgot/reset password and manage-profile screens for ABP — every component is replaceable, every form is extensible, every route is permission-aware."
+---
+
+`@abp/ng.account` ships the user-facing pages of the *Account* application module: login, register, forgot-password, reset-password, manage-profile and personal-settings. Every page is replaceable through `ReplaceableComponentsService` and every form is extensible through the form-prop contributor pattern shared with `@abp/ng.identity`.
+
+The package peer-depends on `@abp/ng.core`, `@abp/ng.theme.shared`, `@ngx-validate/core` and `@ng-bootstrap/ng-bootstrap`.
+
+## File tree
+
+```text
+packages/account/
+├── package.json            # "@abp/ng.account" — version 7.4.0
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── account.module.ts
+        ├── account-routing.module.ts
+        ├── components/
+        │   ├── login/
+        │   ├── register/
+        │   ├── forgot-password/
+        │   ├── reset-password/
+        │   ├── change-password/
+        │   ├── manage-profile/
+        │   ├── personal-settings/
+        │   └── index.ts
+        ├── defaults/        # default extensions config (form props for personal settings)
+        ├── enums/
+        │   └── components.ts (eAccountComponents)
+        ├── guards/
+        │   ├── authentication-flow.guard.ts
+        │   ├── extensions.guard.ts
+        │   └── index.ts
+        ├── models/
+        │   ├── config-options.ts
+        │   ├── manage-profile.ts
+        │   └── personal-settings.ts
+        ├── services/
+        │   └── manage-profile.state.service.ts
+        ├── tokens/
+        │   ├── config-options.token.ts (ACCOUNT_CONFIG_OPTIONS)
+        │   ├── re-login-confirmation.token.ts (RE_LOGIN_CONFIRMATION_TOKEN)
+        │   ├── extensions.token.ts (ACCOUNT_EDIT_FORM_PROP_CONTRIBUTORS)
+        │   └── index.ts
+        └── utils/
+            ├── factory-utils.ts
+            └── auth-utils.ts (getRedirectUrl)
+```
+
+## `public-api.ts`
+
+```typescript
+// packages/account/src/public-api.ts
+export * from './lib/account.module';
+export * from './lib/components';
+export * from './lib/enums';
+export * from './lib/guards';
+export * from './lib/models';
+export * from './lib/services';
+export * from './lib/tokens';
+export * from './lib/utils';
+```
+
+`enums/components.ts` lists every replaceable key — the LeptonX theme uses the same constants to swap in its own templates:
+
+```typescript
+// packages/account/src/lib/enums/components.ts
+export const enum eAccountComponents {
+  Login = 'Account.LoginComponent',
+  Register = 'Account.RegisterComponent',
+  ForgotPassword = 'Account.ForgotPasswordComponent',
+  ResetPassword = 'Account.ResetPasswordComponent',
+  ManageProfile = 'Account.ManageProfileComponent',
+  TenantBox = 'Account.TenantBoxComponent',
+  AuthWrapper = 'Account.AuthWrapperComponent',
+  ChangePassword = 'Account.ChangePasswordComponent',
+  PersonalSettings = 'Account.PersonalSettingsComponent',
+}
+```
+
+## AccountModule
+
+```typescript
+// packages/account/src/lib/account.module.ts (excerpt)
+const declarations = [
+  LoginComponent,
+  RegisterComponent,
+  ChangePasswordComponent,
+  ManageProfileComponent,
+  PersonalSettingsComponent,
+  ForgotPasswordComponent,
+  ResetPasswordComponent,
+  PersonalSettingsHalfRowComponent,
+];
+
+@NgModule({
+  declarations: [...declarations],
+  imports: [
+    CoreModule,
+    AccountRoutingModule,
+    ThemeSharedModule,
+    NgbDropdownModule,
+    NgxValidateCoreModule,
+    UiExtensionsModule,
+  ],
+})
+export class AccountModule {
+  static forChild(options: AccountConfigOptions = {}): ModuleWithProviders<AccountModule> { /* … */ }
+  static forLazy(options: AccountConfigOptions = {}): NgModuleFactory<AccountModule> {
+    return new LazyModuleFactory(AccountModule.forChild(options));
+  }
+}
+```
+
+The `forLazy()` factory is how the app routes lazy-load it:
+
+```typescript
+{
+  path: 'account',
+  loadChildren: () =>
+    import('@abp/ng.account').then(m => m.AccountModule.forLazy()),
+}
+```
+
+A separate `AccountConfigModule` (in the secondary entry `@abp/ng.account/config`) is registered eagerly in `AppModule` so its routes, permissions and extension hooks are wired before the lazy load happens.
+
+## Routing & replacement
+
+Every route uses `ReplaceableRouteContainerComponent` so a downstream app can substitute its own page without forking:
+
+```typescript
+// packages/account/src/lib/account-routing.module.ts (excerpt)
+const canActivate = mapToCanActivate([AuthenticationFlowGuard]);
+
+const routes: Routes = [
+  { path: '', pathMatch: 'full', redirectTo: 'login' },
+  {
+    path: '',
+    component: RouterOutletComponent,
+    children: [
+      {
+        path: 'login',
+        component: ReplaceableRouteContainerComponent,
+        canActivate,
+        data: {
+          replaceableComponent: {
+            key: eAccountComponents.Login,
+            defaultComponent: LoginComponent,
+          } as ReplaceableComponents.RouteData<LoginComponent>,
+        },
+      },
+      {
+        path: 'register',
+        component: ReplaceableRouteContainerComponent,
+        canActivate,
+        data: {
+          replaceableComponent: {
+            key: eAccountComponents.Register,
+            defaultComponent: RegisterComponent,
+          } as ReplaceableComponents.RouteData<RegisterComponent>,
+        },
+      },
+      /* forgot-password, reset-password, manage-profile … */
+    ],
+  },
+];
+```
+
+## LoginComponent
+
+The default login UI talks to whichever `AuthService` the app provides — which in practice is `AbpOAuthService` from `@abp/ng.oauth`:
+
+```typescript
+// packages/account/src/lib/components/login/login.component.ts
+@Component({
+  selector: 'abp-login',
+  templateUrl: './login.component.html',
+})
+export class LoginComponent implements OnInit {
+  form!: UntypedFormGroup;
+  inProgress?: boolean;
+  isSelfRegistrationEnabled = true;
+  authWrapperKey = eAccountComponents.AuthWrapper;
+
+  constructor(
+    protected injector: Injector,
+    protected fb: UntypedFormBuilder,
+    protected toasterService: ToasterService,
+    protected authService: AuthService,
+    protected configState: ConfigStateService,
+  ) {}
+
+  ngOnInit() {
+    this.init();
+    this.buildForm();
+  }
+
+  protected init() {
+    this.isSelfRegistrationEnabled =
+      ((this.configState.getSetting('Abp.Account.IsSelfRegistrationEnabled') as string) || '')
+        .toLowerCase() !== 'false';
+  }
+
+  protected buildForm() {
+    this.form = this.fb.group({
+      username:   ['', [Validators.required, Validators.maxLength(255)]],
+      password:   ['', [Validators.required, Validators.maxLength(128)]],
+      rememberMe: [false],
+    });
+  }
+
+  onSubmit() {
+    if (this.form.invalid) return;
+    this.inProgress = true;
+
+    const { username, password, rememberMe } = this.form.value;
+    const redirectUrl = getRedirectUrl(this.injector);
+
+    this.authService
+      .login({ username, password, rememberMe, redirectUrl })
+      .pipe(
+        catchError(err => { this.inProgress = false; return throwError(err); }),
+        finalize(() => (this.inProgress = false)),
+      )
+      .subscribe();
+  }
+}
+```
+
+Notes:
+
+* `isSelfRegistrationEnabled` is read from the `Abp.Account.IsSelfRegistrationEnabled` setting (managed via `@abp/ng.setting-management`).
+* `authWrapperKey` lets the template host an `AuthWrapper` slot (used by themes to wrap the form in a card / tenant box).
+* `getRedirectUrl` reads `?returnUrl=` from the current activated route — that's the value `AbpOAuthGuard` writes when an unauthenticated user is bounced to login.
+
+## RegisterComponent
+
+`RegisterComponent` calls the auto-generated `AccountService.register()` proxy, then redirects to login (or auto-logs-in when `Abp.Account.IsAutoSignInEnabled` is on). The form is constructed identically to `LoginComponent` with additional `name`, `surname` and `emailAddress` fields plus password confirmation handled by `@ngx-validate/core`.
+
+## Manage profile + personal settings
+
+`ManageProfileComponent` is a tabbed shell that hosts `PersonalSettingsComponent`, `ChangePasswordComponent`, and any tabs your app contributes via `ReplaceableComponentsService`. State for the active tab is held in `ManageProfileStateService`:
+
+```typescript
+@Injectable({ providedIn: 'root' })
+export class ManageProfileStateService {
+  private readonly _profile$ = new ReplaySubject<ProfileDto>(1);
+  readonly profile$ = this._profile$.asObservable();
+
+  setProfile(value: ProfileDto) { this._profile$.next(value); }
+}
+```
+
+The personal-settings form is extensible via `ACCOUNT_EDIT_FORM_PROP_CONTRIBUTORS`:
+
+```typescript
+import { eAccountComponents } from '@abp/ng.account';
+import { ePropType, FormPropContributorCallback } from '@abp/ng.theme.shared/extensions';
+
+const contributor: FormPropContributorCallback<{ phoneNumber: string }> = propList => {
+  propList.addLast({
+    type: ePropType.String,
+    name: 'phoneNumber',
+    displayName: '::PhoneNumber',
+    validators: () => [Validators.required],
+  });
+};
+
+@NgModule({
+  providers: [{
+    provide: ACCOUNT_EDIT_FORM_PROP_CONTRIBUTORS,
+    useValue: {
+      [eAccountComponents.PersonalSettings]: [contributor],
+    },
+  }],
+})
+export class MyExtensionsModule {}
+```
+
+`AccountExtensionsGuard` resolves these contributors before the route activates — the form definition is therefore available the first time the component renders.
+
+## AuthenticationFlowGuard
+
+This guard guarantees the user can only reach `login` / `register` / etc. when the configured auth flow allows it. The default `AbpOAuthService` exposes `isInternalAuth` which is `true` only for the OIDC code flow with a local Identity Server — for external-only setups the guard redirects to `/`.
+
+## Config tokens
+
+| Token | Purpose |
+| ----- | ------- |
+| `ACCOUNT_CONFIG_OPTIONS` | typed `AccountConfigOptions` for `forChild`/`forLazy` |
+| `RE_LOGIN_CONFIRMATION_TOKEN` | boolean — show a confirmation modal before forcing re-login after password change |
+| `ACCOUNT_EDIT_FORM_PROP_CONTRIBUTORS` | multi-token mapping `eAccountComponents` → contributor list |
+
+`accountConfigOptionsFactory` merges the options forwarded through `forChild` with the defaults and provides the resolved value to the components.
+
+## Usage
+
+```typescript
+// app.module.ts
+import { AccountConfigModule } from '@abp/ng.account/config';
+
+@NgModule({
+  imports: [
+    AccountConfigModule.forRoot({
+      redirectUrl: '/dashboard',
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+```typescript
+// app-routing.module.ts
+{
+  path: 'account',
+  loadChildren: () => import('@abp/ng.account').then(m => m.AccountModule.forLazy()),
+}
+```
+
+To swap the login screen entirely:
+
+```typescript
+import { eAccountComponents } from '@abp/ng.account';
+
+constructor(replaceable: ReplaceableComponentsService) {
+  replaceable.add({
+    key: eAccountComponents.Login,
+    component: MyBrandedLoginComponent,
+  });
+}
+```
+
+## Gotchas
+
+* The login form's `rememberMe` flag is only meaningful for the *resource owner password* flow. Under the OIDC *code flow*, the `OAuthService` token storage decides persistence — `rememberMe` becomes a hint that the strategy passes to local storage selection.
+* `getRedirectUrl(injector)` returns the literal `returnUrl` from query parameters — *no validation*. If you accept arbitrary external returnUrls you'll want to add an allow-list check.
+* `Abp.Account.IsSelfRegistrationEnabled` is read **synchronously** in `LoginComponent.ngOnInit` — make sure the `APP_INITIALIZER` from core has hydrated `ConfigStateService` first (it always does unless you set `skipGetAppConfiguration: true`).
+* The `AccountModule.forLazy()` factory wraps `forChild` in `LazyModuleFactory`. Don't import `AccountModule` directly into another `@NgModule` — use the `forChild`/`forLazy` factory or you'll lose the route/permission registration.
+* The `eAccountComponents` enum is marked `const enum`. Without `preserveConstEnums: true` in `tsconfig` your library *consumers* won't be able to reference it — that's why ABP's `tsconfig.base.json` always sets it.
+
+## Related pages
+
+* `ng/account-core.mdx` — `AuthWrapperService` and `TenantBoxService` consumed by the templates above.
+* `ng/oauth.mdx` — the concrete `AuthService` implementation behind `LoginComponent.onSubmit()`.
+* `ng/theme-shared.mdx` — modal / toast / confirmation services used by manage-profile.

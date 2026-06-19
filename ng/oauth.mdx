@@ -1,0 +1,470 @@
+---
+title: "@abp/ng.oauth"
+description: "angular-oauth2-oidc wired into ABP — code-flow and password-flow strategies, AbpOAuthService, AbpOAuthGuard and the bearer/tenant interceptor."
+---
+
+`@abp/ng.oauth` is the *real* implementation of the authentication contract that `@abp/ng.core` defines as a stub. It plugs `angular-oauth2-oidc` into the ABP runtime, dispatches login/logout to one of two flow strategies (OIDC code flow or resource-owner password flow), and replaces the `AuthService` / `AuthGuard` / `ApiInterceptor` providers so the rest of the framework can stay agnostic of how authentication happens.
+
+The package targets Angular 16 and depends on `angular-oauth2-oidc` ^15 plus `just-compare`.
+
+## File tree
+
+```text
+packages/oauth/
+├── package.json            # "@abp/ng.oauth" — version 7.4.0
+├── ng-package.json
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── oauth.module.ts
+        ├── guards/
+        │   ├── oauth.guard.ts (AbpOAuthGuard)
+        │   └── index.ts
+        ├── handlers/
+        │   └── oauth-configuration.handler.ts
+        ├── interceptors/
+        │   ├── api.interceptor.ts (OAuthApiInterceptor)
+        │   └── index.ts
+        ├── providers/
+        │   ├── navigate-to-manage-profile.provider.ts
+        │   └── index.ts
+        ├── services/
+        │   ├── oauth.service.ts (AbpOAuthService)
+        │   └── index.ts
+        ├── strategies/
+        │   ├── auth-flow-strategy.ts
+        │   ├── auth-code-flow-strategy.ts
+        │   ├── auth-password-flow-strategy.ts
+        │   └── index.ts
+        ├── tokens/
+        │   ├── auth-flow-strategy.ts (AUTH_FLOW_STRATEGY)
+        │   └── index.ts
+        └── utils/
+            ├── auth-utils.ts (pipeToLogin, removeRememberMe)
+            ├── check-access-token.ts
+            ├── clear-o-auth-storage.ts
+            ├── oauth-storage.ts
+            └── storage.factory.ts
+```
+
+## `public-api.ts`
+
+```typescript
+// packages/oauth/src/public-api.ts
+export * from './lib/oauth.module';
+export * from './lib/utils';
+export * from './lib/tokens';
+export * from './lib/services';
+export * from './lib/strategies';
+export * from './lib/handlers';
+export * from './lib/interceptors';
+export * from './lib/guards';
+export * from './lib/providers';
+```
+
+## AbpOAuthModule.forRoot
+
+The module replaces every core provider that relates to authentication:
+
+```typescript
+// packages/oauth/src/lib/oauth.module.ts
+@NgModule({
+  imports: [CommonModule, OAuthModule],
+})
+export class AbpOAuthModule {
+  static forRoot(): ModuleWithProviders<AbpOAuthModule> {
+    return {
+      ngModule: AbpOAuthModule,
+      providers: [
+        { provide: AuthService,     useClass: AbpOAuthService },
+        { provide: AuthGuard,       useClass: AbpOAuthGuard },
+        { provide: ApiInterceptor,  useClass: OAuthApiInterceptor },
+        { provide: PIPE_TO_LOGIN_FN_KEY,              useValue: pipeToLogin },
+        { provide: CHECK_AUTHENTICATION_STATE_FN_KEY, useValue: checkAccessToken },
+        { provide: HTTP_INTERCEPTORS, useExisting: ApiInterceptor, multi: true },
+        NavigateToManageProfileProvider,
+        {
+          provide: APP_INITIALIZER,
+          multi: true,
+          deps: [OAuthConfigurationHandler],
+          useFactory: noop,
+        },
+        OAuthModule.forRoot().providers as Provider[],
+        { provide: OAuthStorage, useClass: AbpLocalStorageService },
+      ],
+    };
+  }
+}
+```
+
+Key effects:
+
+* `AuthService` (the stub in core) is overridden with `AbpOAuthService`.
+* `AuthGuard` is overridden with `AbpOAuthGuard` — checks `hasValidAccessToken()` and bounces to `/account/login` otherwise.
+* `ApiInterceptor` (also a stub in core) is overridden with `OAuthApiInterceptor` and additionally registered as an `HTTP_INTERCEPTORS` multi provider.
+* `PIPE_TO_LOGIN_FN_KEY` and `CHECK_AUTHENTICATION_STATE_FN_KEY` provide function-style hooks that core calls without having a hard dependency on this package.
+* `OAuthStorage` is mapped to `AbpLocalStorageService` so tokens are persisted through ABP's storage facade (which can be overridden per app for `sessionStorage` semantics).
+
+## AbpOAuthService
+
+The service inspects `environment.oAuthConfig.responseType` and instantiates either the *code* or *password* strategy:
+
+```typescript
+// packages/oauth/src/lib/services/oauth.service.ts (excerpt)
+@Injectable({ providedIn: 'root' })
+export class AbpOAuthService implements IAuthService {
+  private strategy!: AuthFlowStrategy;
+  private readonly oAuthService: OAuthService;
+
+  get isInternalAuth() { return this.strategy.isInternalAuth; }
+  get isAuthenticated(): boolean { return this.oAuthService.hasValidAccessToken(); }
+
+  constructor(protected injector: Injector) {
+    this.oAuthService = this.injector.get(OAuthService);
+  }
+
+  async init() {
+    const environmentService = this.injector.get(EnvironmentService);
+
+    const result$ = environmentService.getEnvironment$().pipe(
+      map(env => env?.oAuthConfig),
+      filter(Boolean),
+      tap(oAuthConfig => {
+        this.strategy =
+          oAuthConfig.responseType === 'code'
+            ? AUTH_FLOW_STRATEGY.Code(this.injector)
+            : AUTH_FLOW_STRATEGY.Password(this.injector);
+      }),
+      switchMap(() => from(this.strategy.init())),
+      take(1),
+    );
+
+    return await lastValueFrom(result$);
+  }
+
+  logout(queryParams?: Params): Observable<any> {
+    if (!this.strategy) return EMPTY;
+    return this.strategy.logout(queryParams);
+  }
+
+  navigateToLogin(queryParams?: Params) { this.strategy.navigateToLogin(queryParams); }
+  login(params: LoginParams) { return this.strategy.login(params); }
+
+  loginUsingGrant(grantType: string, parameters: object, headers?: HttpHeaders): Promise<AbpAuthResponse> {
+    const { clientId: client_id, dummyClientSecret: client_secret } = this.oAuthService;
+    const access_token = this.oAuthService.getAccessToken();
+    const p = { access_token, grant_type: grantType, client_id, ...parameters };
+    if (client_secret) p['client_secret'] = client_secret;
+    return this.oAuthService.fetchTokenUsingGrant(grantType, p, headers);
+  }
+}
+```
+
+`isInternalAuth` is true only for the password flow — themes use it to hide/show the local login form.
+
+## Strategy hierarchy
+
+```typescript
+// packages/oauth/src/lib/strategies/auth-flow-strategy.ts (excerpt)
+export abstract class AuthFlowStrategy {
+  abstract readonly isInternalAuth: boolean;
+
+  protected httpErrorReporter: HttpErrorReporterService;
+  protected environment: EnvironmentService;
+  protected configState: ConfigStateService;
+  protected oAuthService: OAuthService2;
+  protected oAuthConfig!: AuthConfig;
+  protected sessionState: SessionStateService;
+  protected localStorageService: AbpLocalStorageService;
+  protected tenantKey: string;
+  protected router: Router;
+
+  abstract checkIfInternalAuth(queryParams?: Params): boolean;
+  abstract navigateToLogin(queryParams?: Params): void;
+  abstract logout(queryParams?: Params): Observable<any>;
+  abstract login(params?: LoginParams | Params): Observable<any>;
+
+  constructor(protected injector: Injector) {
+    /* … resolves dependencies via injector.get(), wires error listener */
+  }
+}
+```
+
+The factory lives in `tokens/auth-flow-strategy.ts`:
+
+```typescript
+export const AUTH_FLOW_STRATEGY = {
+  Code(injector: Injector)     { return new AuthCodeFlowStrategy(injector); },
+  Password(injector: Injector) { return new AuthPasswordFlowStrategy(injector); },
+};
+```
+
+### AuthCodeFlowStrategy (OIDC code flow)
+
+```typescript
+// packages/oauth/src/lib/strategies/auth-code-flow-strategy.ts
+export class AuthCodeFlowStrategy extends AuthFlowStrategy {
+  readonly isInternalAuth = false;
+
+  async init() {
+    return super.init()
+      .then(() => this.oAuthService.tryLogin().catch(noop))
+      .then(() => this.oAuthService.setupAutomaticSilentRefresh({}, 'access_token'));
+  }
+
+  navigateToLogin(queryParams?: Params) {
+    let additionalState = '';
+    if (queryParams?.returnUrl) additionalState = queryParams.returnUrl;
+    const cultureParams = this.getCultureParams(queryParams);
+    this.oAuthService.initCodeFlow(additionalState, cultureParams);
+  }
+
+  logout(queryParams?: Params) {
+    return from(this.oAuthService.revokeTokenAndLogout(this.getCultureParams(queryParams)));
+  }
+
+  login(queryParams?: Params) {
+    this.oAuthService.initCodeFlow('', this.getCultureParams(queryParams));
+    return of(null);
+  }
+
+  private getCultureParams(queryParams?: Params) {
+    const lang = this.sessionState.getLanguage();
+    const culture = { culture: lang, 'ui-culture': lang };
+    return { ...(lang && culture), ...queryParams };
+  }
+}
+```
+
+The strategy:
+
+* calls `OAuthService.tryLogin()` on init (consumes `?code=...&state=...` after the redirect from Identity Server);
+* schedules silent refresh against the `access_token` claim;
+* preserves the original URL in `state` so the user lands back where they came from;
+* propagates the active culture as `culture=` / `ui-culture=` query parameters so the OIDC login page renders in the same language as the app.
+
+### AuthPasswordFlowStrategy (resource-owner password)
+
+```typescript
+// packages/oauth/src/lib/strategies/auth-password-flow-strategy.ts (excerpt)
+export class AuthPasswordFlowStrategy extends AuthFlowStrategy {
+  readonly isInternalAuth = true;
+  private cookieKey = 'rememberMe';
+  private storageKey = 'passwordFlow';
+
+  async init() {
+    if (!getCookieValueByName(this.cookieKey) && localStorage.getItem(this.storageKey)) {
+      this.oAuthService.logOut();
+    }
+    return super.init().then(() => this.listenToTokenExpiration());
+  }
+
+  navigateToLogin(queryParams?: Params) {
+    const router = this.injector.get(Router);
+    return router.navigate(['/account/login'], { queryParams });
+  }
+
+  login(params: LoginParams): Observable<any> {
+    const tenant = this.sessionState.getTenant();
+    return from(
+      this.oAuthService.fetchTokenUsingPasswordFlow(
+        params.username, params.password,
+        new HttpHeaders({ ...(tenant && tenant.id && { [this.tenantKey]: tenant.id }) }),
+      ),
+    ).pipe(pipeToLogin(params, this.injector));
+  }
+
+  logout() {
+    const router = this.injector.get(Router);
+    return from(this.oAuthService.revokeTokenAndLogout(true)).pipe(
+      switchMap(() => this.configState.refreshAppState()),
+      tap(() => { router.navigateByUrl('/'); removeRememberMe(this.localStorageService); }),
+    );
+  }
+}
+```
+
+Notable behaviours:
+
+* `init()` clears tokens from a previous session when the `rememberMe` cookie is absent — a defensive measure when a non-persistent login somehow left tokens in `localStorage`.
+* `login()` posts the current tenant id (if any) as the `__tenant` header so the token request resolves under the right tenancy context.
+* `listenToTokenExpiration()` watches `OAuthInfoEvent.token_expires` events and either refreshes the token (if a refresh token exists) or logs out.
+
+## OAuthApiInterceptor
+
+```typescript
+// packages/oauth/src/lib/interceptors/api.interceptor.ts
+@Injectable({ providedIn: 'root' })
+export class OAuthApiInterceptor implements IApiInterceptor {
+  constructor(
+    private oAuthService: OAuthService,
+    private sessionState: SessionStateService,
+    private httpWaitService: HttpWaitService,
+    @Inject(TENANT_KEY) private tenantKey: string,
+  ) {}
+
+  intercept(request: HttpRequest<any>, next: HttpHandler) {
+    this.httpWaitService.addRequest(request);
+    const isExternalRequest = request.context?.get(IS_EXTERNAL_REQUEST);
+    const newRequest = isExternalRequest
+      ? request
+      : request.clone({ setHeaders: this.getAdditionalHeaders(request.headers) });
+
+    return next.handle(newRequest).pipe(
+      finalize(() => this.httpWaitService.deleteRequest(request)),
+    );
+  }
+
+  getAdditionalHeaders(existingHeaders?: HttpHeaders) {
+    const headers = {} as any;
+
+    const token = this.oAuthService.getAccessToken();
+    if (!existingHeaders?.has('Authorization') && token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const lang = this.sessionState.getLanguage();
+    if (!existingHeaders?.has('Accept-Language') && lang) {
+      headers['Accept-Language'] = lang;
+    }
+
+    const tenant = this.sessionState.getTenant();
+    if (!existingHeaders?.has(this.tenantKey) && tenant?.id) {
+      headers[this.tenantKey] = tenant.id;
+    }
+
+    headers['X-Requested-With'] = 'XMLHttpRequest';
+    return headers;
+  }
+}
+```
+
+Three headers are added unless the caller pre-set them:
+
+* `Authorization: Bearer <access_token>`
+* `Accept-Language: <session culture>`
+* `__tenant: <tenant id>` (key is configurable via `TENANT_KEY`)
+
+`IS_EXTERNAL_REQUEST` is an `HttpContextToken` exported by core — set it on a request to opt out of token/tenant header injection. This is how `RestService` skips headers when `config.skipAddingHeader = true`.
+
+## AbpOAuthGuard
+
+```typescript
+// packages/oauth/src/lib/guards/oauth.guard.ts
+@Injectable({ providedIn: 'root' })
+export class AbpOAuthGuard implements IAbpGuard {
+  protected readonly oAuthService = inject(OAuthService);
+  protected readonly authService = inject(AuthService);
+
+  canActivate(route: ActivatedRouteSnapshot, state: RouterStateSnapshot)
+    : Observable<boolean> | boolean | UrlTree
+  {
+    const hasValidAccessToken = this.oAuthService.hasValidAccessToken();
+    if (hasValidAccessToken) return true;
+    const params = { returnUrl: state.url };
+    this.authService.navigateToLogin(params);
+    return false;
+  }
+}
+```
+
+Two-step decision: short-circuit if a valid token exists, otherwise delegate to the strategy's `navigateToLogin(params)` so the right flow handles the redirect.
+
+## OAuthConfigurationHandler
+
+```typescript
+// packages/oauth/src/lib/handlers/oauth-configuration.handler.ts
+@Injectable({ providedIn: 'root' })
+export class OAuthConfigurationHandler {
+  constructor(
+    private oAuthService: OAuthService,
+    private environmentService: EnvironmentService,
+    @Inject(CORE_OPTIONS) private options: ABP.Root,
+  ) {
+    this.listenToSetEnvironment();
+  }
+
+  private listenToSetEnvironment() {
+    this.environmentService.createOnUpdateStream(state => state)
+      .pipe(
+        map(environment => environment.oAuthConfig as AuthConfig),
+        filter(config => !compare(config, this.options.environment.oAuthConfig)),
+      )
+      .subscribe(config => this.oAuthService.configure(config));
+  }
+}
+```
+
+Whenever `EnvironmentService` emits a new value (typical for white-labelled apps that swap `oAuthConfig` at runtime), `OAuthService.configure()` is called again with the new config. `just-compare` is used to skip no-op updates.
+
+## Utility helpers
+
+| Helper | Purpose |
+| ------ | ------- |
+| `pipeToLogin(params, injector)` | post-login pipeline: persist remember-me, refresh app state, navigate to `returnUrl` |
+| `checkAccessToken(injector)` | detects a stale token after `refreshAppState` returned an empty `currentUser` and clears storage |
+| `clearOAuthStorage()` | removes every `nonce`, `PKCI_verifier`, `access_token`, `id_token`, `expires_at` and `granted_scopes` entry from storage |
+| `oAuthStorage` | factory that returns either `localStorage` or `sessionStorage` based on remember-me cookie |
+| `removeRememberMe(localStorageService)` | clears the remember-me marker |
+
+## environment.oAuthConfig
+
+The dev-app's environment file shows the canonical shape:
+
+```typescript
+// apps/dev-app/src/environments/environment.ts
+export const environment = {
+  /* … */
+  oAuthConfig: {
+    issuer: 'https://localhost:44305/',
+    clientId: 'MyProjectName_App',
+    scope: 'offline_access MyProjectName',
+    responseType: 'code',
+    redirectUri: baseUrl,
+  },
+  /* … */
+};
+```
+
+`responseType: 'code'` ⇒ code flow with PKCE. Set `responseType: 'password'` to switch to the legacy resource-owner password flow.
+
+## Usage
+
+```typescript
+// app.module.ts
+@NgModule({
+  imports: [
+    CoreModule.forRoot({ environment, registerLocaleFn: registerLocale() }),
+    AbpOAuthModule.forRoot(),
+    ThemeSharedModule.forRoot(),
+  ],
+})
+export class AppModule {}
+```
+
+Login from a custom screen:
+
+```typescript
+constructor(private auth: AuthService) {}
+
+submit() {
+  this.auth.login({ username: 'admin', password: 'P@ssw0rd' }).subscribe();
+}
+```
+
+For the code flow, `login()` immediately redirects to Identity Server — the subscription completes synchronously with `null` once the redirect is initiated.
+
+## Gotchas
+
+* The choice of strategy is *frozen* on the first emission of `environment.oAuthConfig`. Toggling `responseType` at runtime requires reloading the page.
+* `OAuthStorage` is provided by `AbpLocalStorageService` from core — *every* token persists across tabs by default. If you need session-scope tokens, override the provider after `AbpOAuthModule.forRoot()`.
+* The `__tenant` header is added only when `sessionState.getTenant()?.id` is set. Pre-login (no tenant resolved yet), token requests rely on the body's `__tenant` field — the password strategy sets the header explicitly.
+* `revokeTokenAndLogout` (code flow) honours the OIDC end-session endpoint. If your Identity Server doesn't implement RP-initiated logout, the user may be left with a stale Identity Server session even after a successful `logout()`.
+* `OAuthConfigurationHandler` re-configures the underlying `OAuthService` on *any* environment change — calling `EnvironmentService.setState(...)` mid-session resets PKCE state. Treat dynamic env updates as a navigation event.
+* `pipeToLogin` is registered as a *value* under `PIPE_TO_LOGIN_FN_KEY`. Replacing it with a custom function lets you redirect to a tenant-specific landing page after login without forking the strategy.
+
+## Related pages
+
+* `ng/core.mdx` — the `AuthService`/`AuthGuard`/`ApiInterceptor` contracts overridden here.
+* `ng/account.mdx` — `LoginComponent.onSubmit()` calls `AuthService.login()` which routes through this package.
+* `ng/account-core.mdx` — `AuthWrapperService.enableLocalLogin$` toggles the password-flow form vs. the *Login* button that triggers `initCodeFlow()`.

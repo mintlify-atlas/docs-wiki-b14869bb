@@ -1,0 +1,174 @@
+---
+title: "MongoDB Project"
+description: "Alternative persistence project — the MongoDB DbContext, collection registration, and schema initializer that replaces the EntityFrameworkCore project for document-database deployments."
+---
+
+`MyCompanyName.MyProjectName.MongoDB` is the second, mutually-exclusive persistence project shipped by the application template. Pick **either** `EntityFrameworkCore` **or** `MongoDB` — never both — because each one registers a different `IMyProjectNameDbSchemaMigrator` and a different repository implementation set.
+
+If you generated your solution with `abp new ... -d mongodb` this project takes the place of `EntityFrameworkCore` in the solution, and the host modules reference `MyProjectNameMongoDbModule` instead of `MyProjectNameEntityFrameworkCoreModule`.
+
+## When to put code here
+
+Add a file here when it is:
+
+- A `IMongoCollection<T>` accessor on `MyProjectNameMongoDbContext`.
+- A mapping registration inside `CreateModel` (Mongo indexes, BSON conventions).
+- A custom `MongoDbRepository<>` subclass for a non-trivial query.
+- A serializer registration that has to run before any document is read or written.
+
+## File tree
+
+```text
+MyCompanyName.MyProjectName.MongoDB/
+├── MongoDb/
+│   ├── MongoDbMyProjectNameDbSchemaMigrator.cs
+│   ├── MyProjectNameMongoDbContext.cs
+│   └── MyProjectNameMongoDbModule.cs
+├── Properties/
+│   └── ...
+└── MyCompanyName.MyProjectName.MongoDB.csproj
+```
+
+## csproj at a glance
+
+| Property            | Value                                              |
+| ------------------- | -------------------------------------------------- |
+| `TargetFramework`   | `net7.0`                                           |
+| `Nullable`          | `enable`                                           |
+| `RootNamespace`     | `MyCompanyName.MyProjectName`                      |
+
+| Project reference                                                       | Purpose                                  |
+| ----------------------------------------------------------------------- | ---------------------------------------- |
+| `MyCompanyName.MyProjectName.Domain`                                    | Entities, repository interfaces          |
+| `Volo.Abp.PermissionManagement.MongoDB`                                 | Permission grant document mapping        |
+| `Volo.Abp.SettingManagement.MongoDB`                                    | Setting document mapping                 |
+| `Volo.Abp.Identity.MongoDB`                                             | `IdentityUser`/`IdentityRole` document mapping |
+| `Volo.Abp.BackgroundJobs.MongoDB`                                       | Background job document                  |
+| `Volo.Abp.AuditLogging.MongoDB`                                         | Audit log document                       |
+| `Volo.Abp.TenantManagement.MongoDB`                                     | Tenant document mapping                  |
+| `Volo.Abp.FeatureManagement.MongoDB`                                    | Feature value document                   |
+| `Volo.Abp.OpenIddict.MongoDB`                                           | OpenIddict app/scope documents           |
+
+## Module class
+
+```csharp
+[DependsOn(
+    typeof(MyProjectNameDomainModule),
+    typeof(AbpPermissionManagementMongoDbModule),
+    typeof(AbpSettingManagementMongoDbModule),
+    typeof(AbpIdentityMongoDbModule),
+    typeof(AbpOpenIddictMongoDbModule),
+    typeof(AbpBackgroundJobsMongoDbModule),
+    typeof(AbpAuditLoggingMongoDbModule),
+    typeof(AbpTenantManagementMongoDbModule),
+    typeof(AbpFeatureManagementMongoDbModule))]
+public class MyProjectNameMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<MyProjectNameMongoDbContext>(options =>
+        {
+            options.AddDefaultRepositories();
+        });
+
+        Configure<AbpUnitOfWorkDefaultOptions>(options =>
+        {
+            options.TransactionBehavior = UnitOfWorkTransactionBehavior.Disabled;
+        });
+    }
+}
+```
+
+The two highlights are:
+
+- **`AddDefaultRepositories()`** — generic `IRepository<TEntity, TKey>` registrations for every collection declared on the DbContext.
+- **`TransactionBehavior.Disabled`** — MongoDB transactions require a *replica-set* deployment. The template ships with transactions off so a local single-node MongoDB also works out of the box. Set the behavior to `Auto` once you deploy against a replica set.
+
+## Key types
+
+### MyProjectNameMongoDbContext
+
+```csharp
+[ConnectionStringName("Default")]
+public class MyProjectNameMongoDbContext : AbpMongoDbContext
+{
+    /* Add Mongo collections here. Example:
+     * public IMongoCollection<Question> Questions => Collection<Question>();
+     */
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        //modelBuilder.Entity<YourEntity>(b => { ... });
+    }
+}
+```
+
+- `[ConnectionStringName("Default")]` aligns with the `"Default"` entry under `ConnectionStrings` in every host's `appsettings.json`.
+- `base.CreateModel(modelBuilder)` registers all the bundled modules' documents (Identity, OpenIddict, Audit, etc.) — call it **first** if you override.
+- Define collections by adding `IMongoCollection<TEntity>` properties returning `Collection<TEntity>()`. The base class handles BSON discriminator registration.
+
+### MongoDbMyProjectNameDbSchemaMigrator
+
+```csharp
+public async Task MigrateAsync()
+{
+    var dbContexts = _serviceProvider.GetServices<IAbpMongoDbContext>();
+    var connectionStringResolver = _serviceProvider.GetRequiredService<IConnectionStringResolver>();
+
+    foreach (var dbContext in dbContexts)
+    {
+        var connectionString = await connectionStringResolver.ResolveAsync(
+            ConnectionStringNameAttribute.GetConnStringName(dbContext.GetType()));
+        var mongoUrl = new MongoUrl(connectionString);
+        var databaseName = mongoUrl.DatabaseName;
+        var client = new MongoClient(mongoUrl);
+
+        if (databaseName.IsNullOrWhiteSpace())
+        {
+            databaseName = ConnectionStringNameAttribute.GetConnStringName(dbContext.GetType());
+        }
+
+        (dbContext as AbpMongoDbContext)?.InitializeCollections(client.GetDatabase(databaseName));
+    }
+}
+```
+
+Unlike EF Core there are no SQL migrations to apply — `InitializeCollections` lazily creates collections and indexes on first access. The migrator instead:
+
+1. Resolves the active connection string per `DbContext` type (works for the host context **and** any module-defined contexts that you have not replaced).
+2. Parses the database name out of the URL (or falls back to the connection string name when none is provided).
+3. Constructs a `MongoClient` and calls `InitializeCollections` so subsequent `Collection<T>()` calls return ready-to-use collection handles.
+
+## Connection string format
+
+MongoDB requires a [connection string in the standard URI form](https://www.mongodb.com/docs/manual/reference/connection-string/):
+
+```json
+{
+  "ConnectionStrings": {
+    "Default": "mongodb://localhost:27017/MyProjectName"
+  }
+}
+```
+
+The database name **must** appear in the path (`/MyProjectName`) or the migrator will use the connection-string name (`Default`) as the database name — which is rarely what you want and will silently scatter your collections under a database called `Default`.
+
+## Customization points
+
+| Need                                  | File / API                                                       |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| Add a collection                      | `public IMongoCollection<Book> Books => Collection<Book>();`     |
+| Add an index                          | `Collection<T>().Indexes.CreateOneAsync(...)` from a contributor |
+| Custom BSON serializer                | `BsonSerializer.RegisterSerializer(...)` in `PreConfigureServices` |
+| Enable transactions                   | `TransactionBehavior = Auto` and ensure a replica-set deployment |
+| Override a module repository          | Custom `MongoDbRepository<MyProjectNameMongoDbContext, TEntity>` |
+
+## Gotchas
+
+- **Don't run with both `EntityFrameworkCore` and `MongoDB` projects referenced from a host.** Each registers an `IMyProjectNameDbSchemaMigrator`; both implementations will run during `DbMigrator` startup and the second one will fail because the entity sets do not exist in the other store.
+- **OpenIddict assumes specific collection names.** `AbpOpenIddictMongoDbModule` configures `Volo.Abp.OpenIddict.Applications` and other collections — *do not* rename them via `CreateModel` overrides or the `OpenIddictDataSeedContributor` cannot find the records it just created.
+- **EF Core migrations DO NOT apply.** The `Migrations/` folder generated by `dotnet ef` is a SQL Server artifact. If you swap from EF Core to MongoDB delete that folder, otherwise the design-time tooling will pick it up and complain.
+- **Connection-string resolution is per-tenant.** When `MyProjectNameDbMigrationService` switches tenants the resolver returns the tenant's Mongo connection string (or falls back to the host's). Verify that tenants store *full* Mongo URLs in `AbpTenantConnectionStrings.Value`.
+- **`IClientSessionHandle` is required for multi-document transactions.** Even with `TransactionBehavior = Auto`, repositories only enroll automatically through the unit-of-work pipeline; raw `IMongoCollection<T>.InsertManyAsync` calls do **not** participate unless you pass the session handle explicitly.
+- **`AddDefaultRepositories()` (no `includeAllEntities` parameter)** — unlike EF Core, the Mongo extension automatically registers a repository for every aggregate root exposed through `CreateModel`. There is no opt-in for child entities; design your aggregates accordingly.

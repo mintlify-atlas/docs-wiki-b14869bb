@@ -1,0 +1,347 @@
+---
+title: "@abp/ng.identity"
+description: "Users and Roles administration UI for ABP — routes, entity-actions, toolbar contributors and the extension hooks used to graft custom columns onto the data grids."
+---
+
+`@abp/ng.identity` is the Angular face of `Volo.Abp.Identity`. It ships two screens — Users and Roles — but the real value is the extension pipeline: every column, toolbar button, row action and form field is contributed through tokens, so consumers customise the grids without forking the components.
+
+The package is published as three secondary entries:
+
+| Import path | Purpose |
+| ----------- | ------- |
+| `@abp/ng.identity` | feature module (loaded lazily) |
+| `@abp/ng.identity/config` | eager configuration — routes + menu providers |
+| `@abp/ng.identity/proxy` | auto-generated proxies, DTOs and policies |
+
+## File tree
+
+```text
+packages/identity/
+├── package.json            # "@abp/ng.identity" — version 7.4.0
+├── ng-package.json
+├── config/                 # secondary entry: @abp/ng.identity/config
+│   └── src/
+│       ├── public-api.ts
+│       ├── identity-config.module.ts
+│       ├── providers/route.provider.ts
+│       └── enums/
+├── proxy/                  # secondary entry: @abp/ng.identity/proxy
+│   └── src/
+│       ├── public-api.ts
+│       └── lib/
+│           ├── volo/abp/identity/   # IdentityUserService, IdentityRoleService …
+│           └── models/
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── identity.module.ts
+        ├── identity-routing.module.ts
+        ├── components/
+        │   ├── users/
+        │   └── roles/
+        ├── defaults/        # default contributor data
+        ├── enums/
+        │   └── components.ts (eIdentityComponents)
+        ├── guards/
+        │   ├── extensions.guard.ts
+        │   └── index.ts
+        ├── models/config-options.ts
+        └── tokens/
+            ├── extensions.token.ts (DEFAULT_IDENTITY_* tokens)
+            └── index.ts
+```
+
+## `public-api.ts`
+
+```typescript
+// packages/identity/src/public-api.ts
+export * from './lib/components';
+export * from './lib/enums';
+export * from './lib/guards';
+export * from './lib/identity.module';
+export * from './lib/models';
+export * from './lib/tokens';
+```
+
+Two enum entries cover every replaceable component:
+
+```typescript
+// packages/identity/src/lib/enums/components.ts
+export const enum eIdentityComponents {
+  Roles = 'Identity.RolesComponent',
+  Users = 'Identity.UsersComponent',
+}
+```
+
+## IdentityConfigModule (eager)
+
+Eager wiring registers menu/route providers before the lazy module loads:
+
+```typescript
+// packages/identity/config/src/identity-config.module.ts
+@NgModule()
+export class IdentityConfigModule {
+  static forRoot(): ModuleWithProviders<IdentityConfigModule> {
+    return {
+      ngModule: IdentityConfigModule,
+      providers: [IDENTITY_ROUTE_PROVIDERS],
+    };
+  }
+}
+```
+
+`IDENTITY_ROUTE_PROVIDERS` runs an `APP_INITIALIZER` that calls `RoutesService.add([...])`, registering the *Identity Management* menu group with sub-routes for Roles and Users, each carrying the `requiredPolicy` for the permission guard.
+
+## IdentityModule (lazy)
+
+```typescript
+// packages/identity/src/lib/identity.module.ts (excerpt)
+@NgModule({
+  declarations: [RolesComponent, UsersComponent],
+  exports: [RolesComponent, UsersComponent],
+  imports: [
+    CoreModule,
+    IdentityRoutingModule,
+    NgbNavModule,
+    ThemeSharedModule,
+    UiExtensionsModule,
+    NgbDropdownModule,
+    PermissionManagementModule,
+    NgxValidateCoreModule,
+    PageModule,
+  ],
+})
+export class IdentityModule {
+  static forChild(options: IdentityConfigOptions = {}): ModuleWithProviders<IdentityModule> {
+    return {
+      ngModule: IdentityModule,
+      providers: [
+        { provide: IDENTITY_ENTITY_ACTION_CONTRIBUTORS,   useValue: options.entityActionContributors },
+        { provide: IDENTITY_TOOLBAR_ACTION_CONTRIBUTORS, useValue: options.toolbarActionContributors },
+        /* … entity props, edit/create form props … */
+      ],
+    };
+  }
+
+  static forLazy(options: IdentityConfigOptions = {}): NgModuleFactory<IdentityModule> {
+    return new LazyModuleFactory(IdentityModule.forChild(options));
+  }
+}
+```
+
+Imports of interest:
+
+* `PermissionManagementModule` — embedded permission editor used by the Users/Roles grids.
+* `UiExtensionsModule` — extension framework (`ExtensibleTableComponent`, `generateFormFromProps`).
+* `PageModule` — `<abp-page>` from `@abp/ng.components/page`.
+
+## Routing
+
+```typescript
+// packages/identity/src/lib/identity-routing.module.ts
+const routes: Routes = [
+  { path: '', redirectTo: 'roles', pathMatch: 'full' },
+  {
+    path: '',
+    component: RouterOutletComponent,
+    canActivate: mapToCanActivate([AuthGuard, PermissionGuard, IdentityExtensionsGuard]),
+    children: [
+      {
+        path: 'roles',
+        component: ReplaceableRouteContainerComponent,
+        data: {
+          requiredPolicy: 'AbpIdentity.Roles',
+          replaceableComponent: {
+            key: eIdentityComponents.Roles,
+            defaultComponent: RolesComponent,
+          } as ReplaceableComponents.RouteData<RolesComponent>,
+        },
+      },
+      {
+        path: 'users',
+        component: ReplaceableRouteContainerComponent,
+        data: {
+          requiredPolicy: 'AbpIdentity.Users',
+          replaceableComponent: {
+            key: eIdentityComponents.Users,
+            defaultComponent: UsersComponent,
+          } as ReplaceableComponents.RouteData<UsersComponent>,
+        },
+      },
+    ],
+  },
+];
+```
+
+Three guards run in order:
+
+1. `AuthGuard` — bounces to `/account/login` if not authenticated (provided by `@abp/ng.oauth`).
+2. `PermissionGuard` — checks `AbpIdentity.Roles` / `AbpIdentity.Users` from `ConfigStateService`.
+3. `IdentityExtensionsGuard` — resolves contributor tokens before rendering.
+
+## UsersComponent — the canonical example
+
+```typescript
+// packages/identity/src/lib/components/users/users.component.ts (excerpt)
+@Component({
+  selector: 'abp-users',
+  templateUrl: './users.component.html',
+  providers: [
+    ListService,
+    {
+      provide: EXTENSIONS_IDENTIFIER,
+      useValue: eIdentityComponents.Users,
+    },
+  ],
+})
+export class UsersComponent implements OnInit {
+  data: PagedResultDto<IdentityUserDto> = { items: [], totalCount: 0 };
+
+  @ViewChild('modalContent', { static: false }) modalContent!: TemplateRef<any>;
+
+  form!: UntypedFormGroup;
+  selected?: IdentityUserDto;
+  selectedUserRoles?: IdentityRoleDto[];
+  roles?: IdentityRoleDto[];
+  visiblePermissions = false;
+  providerKey?: string;
+  isModalVisible?: boolean;
+  modalBusy = false;
+  permissionManagementKey = ePermissionManagementComponents.PermissionManagement;
+  entityDisplayName: string;
+  inputKey = eFormComponets.FormCheckboxComponent;
+
+  trackByFn: TrackByFunction<AbstractControl> = (index, item) => Object.keys(item)[0] || index;
+
+  constructor(
+    public readonly list: ListService<GetIdentityUsersInput>,
+    protected confirmationService: ConfirmationService,
+    protected service: IdentityUserService,
+    private toasterService: ToasterService,
+    /* … injector, fb, etc. */
+  ) {}
+}
+```
+
+`ListService` (from `@abp/ng.core`) holds the table's pagination/sort/filter state. `EXTENSIONS_IDENTIFIER` is the discriminator the extension framework keys off — both `EntityActionContributors` and `EntityPropContributors` look up their contributor list by this value.
+
+## Extension hooks
+
+```typescript
+// packages/identity/src/lib/tokens/extensions.token.ts (excerpt)
+export const DEFAULT_IDENTITY_ENTITY_ACTIONS = {
+  [eIdentityComponents.Roles]: DEFAULT_ROLES_ENTITY_ACTIONS,
+  [eIdentityComponents.Users]: DEFAULT_USERS_ENTITY_ACTIONS,
+};
+
+export const DEFAULT_IDENTITY_TOOLBAR_ACTIONS = {
+  [eIdentityComponents.Roles]: DEFAULT_ROLES_TOOLBAR_ACTIONS,
+  [eIdentityComponents.Users]: DEFAULT_USERS_TOOLBAR_ACTIONS,
+};
+
+export const DEFAULT_IDENTITY_ENTITY_PROPS = {
+  [eIdentityComponents.Roles]: DEFAULT_ROLES_ENTITY_PROPS,
+  [eIdentityComponents.Users]: DEFAULT_USERS_ENTITY_PROPS,
+};
+/* + DEFAULT_IDENTITY_CREATE_FORM_PROPS, DEFAULT_IDENTITY_EDIT_FORM_PROPS */
+```
+
+The matching injection tokens are populated by `IdentityModule.forChild`:
+
+* `IDENTITY_ENTITY_ACTION_CONTRIBUTORS`
+* `IDENTITY_TOOLBAR_ACTION_CONTRIBUTORS`
+* `IDENTITY_ENTITY_PROP_CONTRIBUTORS`
+* `IDENTITY_CREATE_FORM_PROP_CONTRIBUTORS`
+* `IDENTITY_EDIT_FORM_PROP_CONTRIBUTORS`
+
+## Adding a column to the Users grid
+
+```typescript
+import {
+  ePropType,
+  EntityProp,
+  EntityPropList,
+  EntityPropContributorCallback,
+} from '@abp/ng.theme.shared/extensions';
+import { IdentityUserDto } from '@abp/ng.identity/proxy';
+import { eIdentityComponents } from '@abp/ng.identity';
+
+const phoneNumber: EntityPropContributorCallback<IdentityUserDto> = propList => {
+  propList.addAfter(
+    new EntityProp<IdentityUserDto>({
+      type: ePropType.String,
+      name: 'phoneNumber',
+      displayName: 'AbpIdentity::PhoneNumber',
+      sortable: true,
+    }),
+    'userName',
+    (a, b) => a.name === b.name,
+  );
+};
+
+@NgModule({
+  imports: [
+    IdentityConfigModule.forRoot(),
+  ],
+})
+export class AppConfigModule {
+  constructor() {
+    /* … or contribute via IdentityModule.forLazy({ entityPropContributors: { [eIdentityComponents.Users]: [phoneNumber] } }) */
+  }
+}
+```
+
+The same shape applies to entity actions (row buttons), toolbar actions (top-right buttons) and create/edit form props.
+
+## IdentityExtensionsGuard
+
+Resolves all contributor tokens once and merges the contributor functions with the defaults shipped under `defaults/`. The resolved arrays are stored on the `ExtensionsService` so the components don't have to subscribe at runtime.
+
+## Proxy & DTOs
+
+`@abp/ng.identity/proxy` exports the auto-generated Angular services. Excerpt from the proxy public-api:
+
+```typescript
+// packages/identity/proxy/src/lib/index.ts (excerpt)
+export * from './volo/abp/identity/identity-role.service';
+export * from './volo/abp/identity/identity-user.service';
+export * from './volo/abp/identity/models';
+/* + organization-units, claim-types, … */
+```
+
+`IdentityUserService` calls `RestService` with `apiName: 'AbpIdentity'` — that key maps to the matching entry in `environment.apis`.
+
+## Usage in an app
+
+```typescript
+// app.module.ts
+@NgModule({
+  imports: [
+    IdentityConfigModule.forRoot(),
+  ],
+})
+export class AppModule {}
+
+// app-routing.module.ts
+{
+  path: 'identity',
+  loadChildren: () =>
+    import('@abp/ng.identity').then(m => m.IdentityModule.forLazy({
+      entityPropContributors: { [eIdentityComponents.Users]: [phoneNumberContributor] },
+    })),
+}
+```
+
+## Gotchas
+
+* The `requiredPolicy` strings (`AbpIdentity.Roles`, `AbpIdentity.Users`) match the backend permission *names* exactly — typos silently fall back to `PermissionGuard` allowing the route (because no policy = no check).
+* `IdentityModule.forLazy(options)` accepts contributor maps but the *map key* must be one of the `eIdentityComponents` enum values, not the literal `'Identity.UsersComponent'` string. Both are equal at runtime, but using the enum protects against renames.
+* `UsersComponent` shares its `EXTENSIONS_IDENTIFIER` token with the `ExtensibleTableComponent` used inside its template — replacing the component entirely means re-providing that token to keep contributors working.
+* The Roles grid creates the *Default role* checkbox via a form prop contributor — overriding the create-form props for `eIdentityComponents.Roles` may drop that field unless you call `addLast(new EntityProp({ name: 'isDefault', … }))` in your contributor.
+* `@abp/ng.identity/proxy` is a separate npm sub-package — importing from `@abp/ng.identity` directly will not give you `IdentityUserService`.
+
+## Related pages
+
+* `ng/permission-management.mdx` — the permission editor embedded inside the Users/Roles grids.
+* `ng/core.mdx` — `ListService`, `PermissionGuard`, `RoutesService` semantics.
+* `ng/components.mdx` — `<abp-page>` and `<abp-tree>` used by these screens.

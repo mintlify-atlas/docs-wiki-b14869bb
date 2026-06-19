@@ -1,0 +1,252 @@
+---
+title: "@abp/cms-kit.admin"
+description: "CMS Kit admin UI npm pack. Pulls jsTree, slugify, CodeMirror, TUI Editor, and Uppy so the back-office menu builder, page editor, blog post editor, and tag editor work."
+---
+
+`@abp/cms-kit.admin` declares every third-party JavaScript library the **CMS Kit back-office** needs.
+It is a pure aggregator: no JS, no `abp.resourcemapping.js`. The visible behaviour — menu trees, slug
+auto-generation, the Markdown editor, the media uploader — is implemented in the C# project
+`Volo.CmsKit.Admin.Web` and ships as static files. This npm pack only ensures the supporting libraries
+exist under `wwwroot/libs/`.
+
+## Package metadata
+
+```json
+{
+    "name": "@abp/cms-kit.admin",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "@abp/codemirror":  "~7.4.0",
+        "@abp/jstree":      "~7.4.0",
+        "@abp/slugify":     "~7.4.0",
+        "@abp/tui-editor":  "~7.4.0",
+        "@abp/uppy":        "~7.4.0"
+    }
+}
+```
+
+Five third-party shims; see [`@abp/third-party-packs`](/npm/third-party-packs) for what each one
+ships and exactly which files it copies.
+
+## Files shipped to the browser
+
+```text
+@abp/cms-kit.admin/
+├── package.json
+└── README.md
+```
+
+Empty in terms of code. The real admin widgets live at
+`modules/cms-kit/src/Volo.CmsKit.Admin.Web/Pages/CmsKit/...` and are documented page by page below.
+After `abp install-libs` you will additionally find:
+
+```text
+wwwroot/libs/
+├── jstree/              ← @abp/jstree
+├── slugify/             ← @abp/slugify
+├── codemirror/          ← @abp/codemirror
+├── tui-editor/          ← @abp/tui-editor
+└── uppy/                ← @abp/uppy
+```
+
+## Admin widget catalog
+
+The CMS Kit admin pages are conventional Razor Pages that load a per-page `.js` file. Each script is
+wrapped in an IIFE and calls into auto-generated client proxies (`volo.cmsKit.admin.*`) plus the
+shipped third-party libraries.
+
+### Menus — `Pages/CmsKit/Menus/MenuItems/index.js`
+
+The menu builder uses **jsTree** to render an arbitrarily deep tree of `MenuItemDto`. Selected
+excerpts:
+
+```js
+var _menuItem = {};
+$(function () {
+    var l = abp.localization.getResource('CmsKit');
+
+    var menuService = volo.cmsKit.admin.menus.menuItemAdmin;
+
+    var createModal = new abp.ModalManager({
+        viewUrl: abp.appPath + 'CmsKit/Menus/MenuItems/CreateModal',
+        modalClass: 'createMenuItem'
+    });
+    var updateModal = new abp.ModalManager({
+        viewUrl: abp.appPath + 'CmsKit/Menus/MenuItems/UpdateModal',
+        modalClass: 'updateMenuItem'
+    });
+
+    var menuTree = {
+        $tree: $('#MenuItemsEditTree'),
+        $emptyInfo: $('#MenuItemsTreeEmptyInfo'),
+        show: function () { /* ... */ },
+        hide: function () { /* ... */ },
+        itemCount: 0,
+        // ... bind jstree, contextmenu, dnd plugins ...
+    };
+});
+```
+
+It depends on `abp.ModalManager` (from `@abp/aspnetcore.mvc.ui.theme.shared`), the auto-generated
+`volo.cmsKit.admin.menus.menuItemAdmin` proxy (from `cms-kit-admin-proxy.js`), and the `jstree`,
+`jstree-dnd`, `jstree-contextmenu` plugins (from `@abp/jstree`).
+
+### Blog posts — `Pages/CmsKit/BlogPosts/create.js`, `update.js`
+
+The blog post create / update pages mount the **TUI Editor** for the markdown body and **slugify**
+for the URL slug:
+
+```js
+$(function () {
+    var titleInput = $('#BlogPost_Title');
+    var slugInput  = $('#BlogPost_UrlSlug');
+
+    titleInput.on('input', function () {
+        slugInput.val(slugify(titleInput.val(), { lower: true, strict: true }));
+    });
+
+    var editor = new toastui.Editor({
+        el:           document.querySelector('#editor'),
+        previewStyle: 'vertical',
+        height:       '500px',
+        initialEditType: 'markdown'
+    });
+});
+```
+
+`slugify` is the global exported by `@abp/slugify`'s `slugify.min.js`. `toastui.Editor` is the global
+from `@abp/tui-editor`'s `tui-editor-full.min.js`.
+
+### Pages — `Pages/CmsKit/Pages/create.js`, `update.js`
+
+Pages get the same TUI Editor plus **CodeMirror** for the raw HTML/script tab. CodeMirror exposes
+`CodeMirror.fromTextArea(...)` and is used when an editor needs to edit HTML/JS literally rather than
+through a WYSIWYG.
+
+### Tag editor — `Pages/CmsKit/Tags/Components/TagEditor/default.js`
+
+```js
+$(function () {
+    var $tagEditorForms = $('.tag-editor-form');
+
+    $tagEditorForms.on('submit', function (e) {
+        e.preventDefault();
+        var $form = $(e.currentTarget);
+        if ($form.valid()) {
+            abp.ui.setBusy();
+            var entityId   = $form.data('entity-id');
+            var entityType = $form.data('entity-type');
+            var tags       = $form.find('input').val().split(',');
+
+            volo.cmsKit.admin.tags.entityTagAdmin.setEntityTags({
+                entityId: entityId,
+                entityType: entityType,
+                tags: tags
+            });
+        }
+    });
+});
+```
+
+Standard ABP form pattern: `$form.valid()` (jQuery Validation), `abp.ui.setBusy` (from `@abp/core`),
+client proxy call. No third-party libraries beyond ABP's own stack are needed for this widget — it is
+listed here because the C# code that emits the `.tag-editor-form` markup is in
+`Volo.CmsKit.Admin.Web`.
+
+### Media (Files) — Uppy
+
+Uppy is mounted by the media uploader modal. The relevant snippet from the page script:
+
+```js
+var uppy = new Uppy.Core({
+    restrictions: { maxNumberOfFiles: 5, allowedFileTypes: ['image/*'] }
+})
+.use(Uppy.Dashboard, { inline: true, target: '#uppy-target' })
+.use(Uppy.XHRUpload, {
+    endpoint: abp.appPath + 'api/cms-kit-admin/media',
+    headers:  { RequestVerificationToken: abp.security.antiForgery.getToken() }
+});
+```
+
+The endpoint accepts multi-part uploads handled by the `Volo.CmsKit.Admin.Web` controllers and
+persists media via the CMS Kit blob storage configuration.
+
+### Blogs index — `Pages/CmsKit/Blogs/index.js`
+
+Uses **DataTables** (from `@abp/datatables.net-bs5` via `theme.shared`) and the row-action contributor
+extension from [`@abp/aspnetcore.mvc.ui.theme.shared`'s `ui-extensions.js`](/npm/aspnetcore-mvc-ui-theme-shared).
+
+## Razor view example
+
+A typical admin page that hosts the tag editor view component:
+
+```html
+@page
+@model Acme.MyApp.Web.Pages.Posts.EditModel
+
+<abp-card>
+    <abp-card-body>
+        <abp-input asp-for="Post.Title" />
+        <abp-input asp-for="Post.UrlSlug" />
+
+        @* Markdown editor *@
+        <div id="editor"></div>
+
+        @* Tag editor — view component from cms-kit *@
+        <vc:cms-kit-tag-editor
+            entity-type="Post"
+            entity-id="@Model.Post.Id.ToString()" />
+    </abp-card-body>
+</abp-card>
+
+<abp-script src="/Pages/Posts/edit.js" />
+```
+
+```js
+// /Pages/Posts/edit.js
+$(function () {
+    var titleInput = $('#Post_Title');
+    var slugInput  = $('#Post_UrlSlug');
+
+    titleInput.on('input', function () {
+        slugInput.val(slugify(titleInput.val(), { lower: true, strict: true }));
+    });
+
+    new toastui.Editor({
+        el: document.querySelector('#editor'),
+        previewStyle: 'vertical',
+        height: '500px',
+        initialEditType: 'markdown'
+    });
+});
+```
+
+Everything works because `@abp/cms-kit.admin` has pulled in `slugify`, `tui-editor`, and the rest of
+the bundle, and the bundle contributor in C# has emitted the `<script>` tags in the right order.
+
+## Gotchas
+
+- **`abp install-libs` is required**, every CMS Kit version bump. The framework will not lazy-load
+  `jstree` from a CDN — it expects a local `wwwroot/libs/jstree/jstree.min.js`.
+- **The TUI Editor pulls a *large* dependency tree.** ~1.5 MB minified. If your CMS Kit pages are only
+  occasionally used, consider deferring the bundle by overriding the bundle contributor and emitting
+  the `<script>` tag only on the matching pages.
+- **`slugify` is the global function name.** Don't `import slugify from '...'` from an ESM consumer —
+  the shipped file is the UMD/global variant.
+- **jsTree depends on jQuery 3.x at runtime**, which arrives via `@abp/jquery` from `theme.shared`.
+  Replacing jQuery with a forked or shimmed copy will break the menu editor.
+- **Uppy's XHRUpload sends the anti-forgery token from the cookie.** If you disable cookie
+  anti-forgery on the `/api/cms-kit-admin/media` endpoint without also removing the header logic, the
+  upload will 401.
+- **The admin client proxy is named `volo.cmsKit.admin.*`** (lowercase `cmsKit`). Don't camelcase it
+  as `cmskit` — ABP's `abp generate-proxy` produces the dotted form documented above.
+
+## Related pages
+
+- [`@abp/cms-kit`](/npm/cms-kit) — the umbrella that combines admin + public.
+- [`@abp/cms-kit.public`](/npm/cms-kit-public) — public-facing companion widgets.
+- [`@abp/third-party-packs`](/npm/third-party-packs) — `@abp/jstree`, `@abp/slugify`, `@abp/codemirror`,
+  `@abp/tui-editor`, `@abp/uppy` resource mappings.
+- [`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) — provides
+  `abp.ModalManager`, `abp.ui.setBusy`, DataTables.

@@ -1,0 +1,278 @@
+---
+title: "@abp/cms-kit.public"
+description: "Public-facing CMS Kit widgets npm pack. Adds highlight.js and star-rating-svg so the commenting, rating, reaction-selection, and blog post components shipped by `Volo.CmsKit.Public.Web` work in the browser."
+---
+
+`@abp/cms-kit.public` is the **public-facing** half of the CMS Kit npm split. It guarantees that two
+third-party libraries — **highlight.js** and **star-rating-svg** — are present under `wwwroot/libs/`
+so the commenting, rating, reaction-selection, and rendered blog post widgets that the C# project
+`Volo.CmsKit.Public.Web` ships can run.
+
+## Package metadata
+
+```json
+{
+    "name": "@abp/cms-kit.public",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "@abp/highlight.js":    "~7.4.0",
+        "@abp/star-rating-svg": "~7.4.0"
+    }
+}
+```
+
+Two dependencies. No JS, no resource mapping.
+
+## Files shipped to the browser
+
+```text
+@abp/cms-kit.public/
+├── package.json
+└── README.md
+```
+
+As with every aggregator pack in this section, the visible behaviour comes from:
+
+- The transitive `@abp/<lib>` packs copying files into `wwwroot/libs/`.
+- The static JS files embedded in `Volo.CmsKit.Public.Web`'s assembly, which become
+  `_content/Volo.CmsKit.Public.Web/...` (or, in a fully-hosted scenario, plain `wwwroot/...`).
+
+## Public widget catalog
+
+Every widget below is a Razor view component that emits an `<div class="abp-widget-wrapper">` with an
+`abp-widget-api` attribute referencing one of the JS implementations described here. The
+`abp.WidgetManager` from
+[`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) wires them up on
+`DOMContentLoaded`.
+
+### Commenting — `Pages/CmsKit/Shared/Components/Commenting/default.js`
+
+```js
+(function ($) {
+    let l = abp.localization.getResource('CmsKit');
+
+    abp.widgets.CmsCommenting = function ($widget) {
+        let widgetManager = $widget.data('abp-widget-manager');
+        let $commentArea  = $widget.find('.cms-comment-area');
+
+        function getFilters() {
+            return {
+                entityType: $commentArea.attr('data-entity-type'),
+                entityId:   $commentArea.attr('data-entity-id')
+            };
+        }
+
+        function registerEditLinks($container) { /* ... */ }
+        function registerReplyLinks($container) { /* ... */ }
+        function registerDeleteButtons($container) { /* ... */ }
+
+        return {
+            getFilters: getFilters,
+            init:       function () { /* register all handlers */ }
+        };
+    };
+})(jQuery);
+```
+
+Each comment thread is keyed by `(entityType, entityId)`. The widget supports inline editing
+(`comment-edit-link`/`comment-edit-cancel-button`), nested replies, and AJAX submission via
+`volo.cmsKit.public.comments.commentPublic.*` client proxy methods. The widget manager refreshes the
+DOM by re-rendering the view component on the server when an action completes.
+
+### Rating — `Pages/CmsKit/Shared/Components/Rating/default.js`
+
+```js
+(function () {
+    var l = abp.localization.getResource('CmsKit');
+
+    abp.widgets.CmsRating = function ($widget) {
+        var widgetManager = $widget.data('abp-widget-manager');
+        var $ratingArea = $widget.find('.cms-rating-area');
+
+        function getFilters() {
+            return {
+                entityType: $ratingArea.attr('data-entity-type'),
+                entityId:   $ratingArea.attr('data-entity-id')
+            };
+        }
+
+        function registerCreateOfNewRating() {
+            $widget.find('.my-rating').each(function () {
+                var authenticated = $(this).attr('data-authenticated');
+
+                $(this).starRating({
+                    initialRating: 0,
+                    starSize: 16,
+                    emptyColor: '#eee',
+                    hoverColor: '#ffc107',
+                    activeColor: '#ffc107',
+                    useGradient: false,
+                    strokeWidth: 0,
+                    disableAfterRate: true,
+                    useFullStars: true,
+                    readOnly: authenticated === 'True',
+                    callback: function (currentRating, $el) {
+                        volo.cmsKit.public.ratings.ratingPublic.create(
+                            $ratingArea.attr('data-entity-type'),
+                            $ratingArea.attr('data-entity-id'),
+                            { starCount: currentRating }
+                        );
+                    }
+                });
+            });
+        }
+
+        return { init: function () { registerCreateOfNewRating(); }, getFilters: getFilters };
+    };
+})();
+```
+
+`$.fn.starRating` comes from the **`@abp/star-rating-svg`** pack (the underlying library is
+[nashio/star-rating-svg](https://github.com/nashio/star-rating-svg)). The widget reads
+`data-authenticated` to switch between read-only and interactive mode.
+
+### Reaction selection — `Pages/CmsKit/Shared/Components/ReactionSelection/default.js`
+
+```js
+$(document).ready(function () {
+    var allowList = $.fn.tooltip.Constructor.Default.allowList;
+    if (allowList.span.indexOf('data-reaction-name') < 0) {
+        allowList.span.push('data-reaction-name');
+    }
+});
+
+(function ($) {
+    var l = abp.localization.getResource('CmsKit');
+
+    abp.widgets.CmsReactionSelection = function ($widget) {
+        var $reactionArea   = $widget.find('.cms-reaction-area');
+        var $selectIcon     = $widget.find('.cms-reaction-select-icon');
+        var $popoverContent = $widget.find('.cms-reaction-selection-popover-content');
+
+        function registerClickOfReactionIcons($container) {
+            $container.find('.cms-reaction-icon').each(function () {
+                var $icon = $(this);
+                var reactionName = $icon.attr('data-reaction-name');
+                $icon.click(function () {
+                    var methodName = $icon.hasClass('cms-reaction-icon-selected') ? 'delete' : 'create';
+                    volo.cmsKit.public.reactions.reactionPublic[methodName](
+                        $reactionArea.attr('data-entity-type'),
+                        $reactionArea.attr('data-entity-id'),
+                        reactionName
+                    ).then(function () {
+                        $selectIcon.popover('hide');
+                        widgetManager.refresh($widget);
+                    });
+                });
+            });
+        }
+
+        function init() {
+            $selectIcon.popover({
+                placement: 'left',
+                html: true,
+                trigger: 'click',
+                title: l('PickYourReaction'),
+                content: $popoverContent.html()
+            }).on('shown.bs.popover', function () {
+                var $popover = $('#' + $selectIcon.attr('aria-describedby'));
+                registerClickOfReactionIcons($popover);
+            });
+            registerClickOfReactionIcons($widget);
+        }
+
+        return { init: init, getFilters: getFilters };
+    };
+})(jQuery);
+```
+
+The widget extends Bootstrap's tooltip sanitiser to allow the custom `data-reaction-name` attribute on
+`<span>` — without that, Bootstrap strips the attribute and the click handlers can't resolve which
+reaction was clicked.
+
+### Highlight on load — `Pages/Public/CmsKit/highlightOnLoad.js`
+
+```js
+$(function () {
+    document.querySelectorAll('code').forEach(block => {
+        $(block).addClass('hljs');
+        hljs.highlightBlock(block);
+    });
+});
+```
+
+Walks every `<code>` element on page load, adds the `hljs` class (so the gray-background style is
+applied even for unsupported languages), and invokes `hljs.highlightBlock` from
+**`@abp/highlight.js`**.
+
+### Blog post scroll index — `Pages/Public/CmsKit/Blogs/blogpost-scroll-index.js` + `bootstrap-toc.js`
+
+Generates a Bootstrap-style table of contents from `<h2>`/`<h3>` headings in the rendered blog post,
+syncs scroll position with the highlighted heading, and supports anchor links to sections.
+
+## Razor view example
+
+A complete public blog post page that uses every widget:
+
+```html
+@page "/blog/{slug}"
+@model PublicBlogPostModel
+
+@section Styles {
+    <link rel="stylesheet" href="~/libs/highlight.js/styles/atom-one-dark.css" />
+}
+
+<article>
+    <h1>@Model.Post.Title</h1>
+    @Html.Raw(Model.Post.RenderedHtml)
+</article>
+
+<vc:cms-kit-reaction-selection
+    entity-type="BlogPost"
+    entity-id="@Model.Post.Id.ToString()" />
+
+<vc:cms-kit-rating
+    entity-type="BlogPost"
+    entity-id="@Model.Post.Id.ToString()" />
+
+<vc:cms-kit-commenting
+    entity-type="BlogPost"
+    entity-id="@Model.Post.Id.ToString()" />
+
+@section Scripts {
+    <abp-script src="/Pages/CmsKit/highlightOnLoad.js" />
+}
+```
+
+`<abp-script src="/Pages/CmsKit/highlightOnLoad.js" />` resolves to the static asset embedded by
+`Volo.CmsKit.Public.Web`. The view components emit `abp-widget-wrapper` div trees whose JS
+implementations are auto-loaded by the bundle contributor.
+
+## Gotchas
+
+- **The "double-click guard"** in the reaction widget (`isDoubleClicked`) silently drops the second
+  click within 500 ms. If your QA framework triggers two rapid synthetic clicks, the second one is
+  ignored — wait > 500 ms between clicks in tests.
+- **Bootstrap's `tooltip.Constructor.Default.allowList` is a global.** Extending it in the reaction
+  widget affects every tooltip on the page. If you have stricter sanitization requirements, accept
+  this trade-off or override the widget.
+- **`hljs.highlightBlock` is deprecated upstream** in favour of `hljs.highlightElement`; the shipped
+  CMS Kit script still uses the older API and may emit a console warning when upgrading
+  `@abp/highlight.js`. The behaviour is unchanged.
+- **Anti-forgery tokens.** The client proxies (`volo.cmsKit.public.*`) inject the
+  `RequestVerificationToken` header from the cookie automatically. If you call the underlying REST
+  endpoints by hand, set the header yourself via `abp.security.antiForgery.getToken()`.
+- **The TOC script assumes Bootstrap.** If you swap themes to one that uses a different scroll-spy
+  primitive, the TOC will not link correctly. Override the script or disable it via the CMS Kit
+  `BlogPostOptions`.
+- **Don't load both `@abp/cms-kit.public` and the LeptonX blog plugin.** LeptonX ships its own blog
+  components; loading both produces duplicate event handlers on commenting links.
+
+## Related pages
+
+- [`@abp/cms-kit`](/npm/cms-kit) — the umbrella.
+- [`@abp/cms-kit.admin`](/npm/cms-kit-admin) — back-office twin.
+- [`@abp/third-party-packs`](/npm/third-party-packs) — `@abp/highlight.js` and `@abp/star-rating-svg`.
+- [`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) — provides
+  `abp.WidgetManager` and `abp.event` used by every widget here.

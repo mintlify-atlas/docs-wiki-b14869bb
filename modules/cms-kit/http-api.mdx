@@ -1,0 +1,220 @@
+---
+title: "Volo.CmsKit.HttpApi & .Common.HttpApi"
+sidebarTitle: "HttpApi"
+description: "The roll-up HttpApi module and the shared Common.HttpApi — controllers that wrap the cross-cutting AppServices (media download, blog-feature lookup) and host the localisation alias for AbpUi."
+---
+
+The HTTP layer follows the same admin/public/common split as Application. `Volo.CmsKit.HttpApi` is a thin roll-up that depends on both halves; `Volo.CmsKit.Common.HttpApi` holds the two controllers shared by both sides (`MediaDescriptorController`, `BlogFeatureController`) and the localisation glue.
+
+## File inventory
+
+```
+Volo.CmsKit.HttpApi/
+└── Volo/CmsKit/CmsKitHttpApiModule.cs
+
+Volo.CmsKit.Common.HttpApi/Volo/CmsKit/
+├── CmsKitCommonHttpApiModule.cs
+├── CmsKitControllerBase.cs
+├── Blogs/BlogFeatureController.cs
+└── MediaDescriptors/MediaDescriptorController.cs
+```
+
+## `CmsKitHttpApiModule`
+
+```csharp
+[DependsOn(
+    typeof(CmsKitAdminHttpApiModule),
+    typeof(CmsKitPublicHttpApiModule),
+    typeof(CmsKitApplicationContractsModule)
+)]
+public class CmsKitHttpApiModule : AbpModule { }
+```
+
+Like its [Application](/modules/cms-kit/application) sibling, this module contains zero code of its own — its job is to pull in both halves so a single host project gets the full HTTP surface in one reference. The transitive dependency on `Volo.CmsKit.Common.HttpApi` (via the two halves) brings in the shared controllers.
+
+## `CmsKitCommonHttpApiModule`
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcModule),
+    typeof(CmsKitCommonApplicationContractsModule)
+)]
+public class CmsKitCommonHttpApiModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(CmsKitCommonHttpApiModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpLocalizationOptions>(options =>
+        {
+            options.Resources.Get<CmsKitResource>().AddBaseTypes(typeof(AbpUiResource));
+        });
+    }
+}
+```
+
+Two important things happen here:
+
+1. **`AddApplicationPartIfNotExists`** registers the assembly so ASP.NET Core MVC discovers the controllers even when CMS Kit ships as a NuGet package. Without this call the controllers would still exist as types but ASP.NET wouldn't scan them.
+2. **`AddBaseTypes(typeof(AbpUiResource))`** chains `AbpUi` as a fallback resource — so a CMS Kit controller can say `L["Save"]` and get the framework's `"Save"` translation when the CMS Kit resource doesn't define one.
+
+## Remote service constants
+
+Each side has its own constants class so the dynamic-HTTP-proxy and the dynamic-controller convention can find them:
+
+| File | RemoteServiceName | ModuleName (`[Area]`) |
+| --- | --- | --- |
+| `CmsKitAdminRemoteServiceConsts` | `"CmsKitAdmin"` | `"cms-kit-admin"` |
+| `CmsKitPublicRemoteServiceConsts` | `"CmsKitPublic"` | `"cms-kit"` *(unusual — see gotcha)* |
+| `CmsKitCommonRemoteServiceConsts` | `"CmsKitCommon"` | `"cms-kit-common"` |
+
+Every controller carries:
+
+```csharp
+[RemoteService(Name = CmsKitXxxRemoteServiceConsts.RemoteServiceName)]
+[Area(CmsKitXxxRemoteServiceConsts.ModuleName)]
+[Route("api/cms-kit-xxx/<resource>")]
+```
+
+The `[Area]` attribute matters because each `Admin.Web` / `Public.Web` razor module disables JS proxy generation for its area separately:
+
+```csharp
+Configure<DynamicJavaScriptProxyOptions>(options =>
+{
+    options.DisableModule(CmsKitAdminRemoteServiceConsts.ModuleName);
+});
+```
+
+## Shared controllers
+
+### `MediaDescriptorController`
+
+```csharp
+[RequiresGlobalFeature(typeof(MediaFeature))]
+[RemoteService(Name = CmsKitCommonRemoteServiceConsts.RemoteServiceName)]
+[Area(CmsKitCommonRemoteServiceConsts.ModuleName)]
+[Route("api/cms-kit/media")]
+public class MediaDescriptorController : CmsKitControllerBase, IMediaDescriptorAppService
+{
+    [HttpGet]
+    [Route("{id}")]
+    public virtual Task<RemoteStreamContent> DownloadAsync(Guid id) =>
+        MediaDescriptorAppService.DownloadAsync(id);
+}
+```
+
+A single `GET /api/cms-kit/media/{id}`. The return value is `RemoteStreamContent`, which the framework's `RemoteStreamContentResult` converter unwraps into a streamed file response with the original `Content-Type` and `Content-Disposition: attachment; filename=…`.
+
+### `BlogFeatureController`
+
+```csharp
+[RequiresGlobalFeature(typeof(BlogsFeature))]
+[Route("api/cms-kit/blogs/{blogId}/features")]
+public class BlogFeatureController : CmsKitControllerBase, IBlogFeatureAppService
+{
+    [HttpGet]
+    [Route("{featureName}")]
+    public Task<BlogFeatureDto> GetOrDefaultAsync(Guid blogId, string featureName) =>
+        BlogFeatureAppService.GetOrDefaultAsync(blogId, featureName);
+}
+```
+
+A single endpoint that lets the public site ask "is `comments` enabled for blog X?". The AppService caches the answer; the controller is just an HTTP shell.
+
+## Why the common layer exists
+
+CMS Kit could have put these controllers in the admin or public modules, but they get called from *both* sides of the application:
+
+* The public site needs `BlogFeatureController` to render or hide the comment box.
+* The admin site uses `MediaDescriptorController` for image previews in the editor.
+
+Putting them in `Common.HttpApi` lets a public-only host reach them without referencing admin assemblies, and vice versa.
+
+## URL map summary
+
+```mermaid
+graph LR
+    subgraph cms-kit-admin
+      A1[GET /api/cms-kit-admin/blogs] --> A1S[BlogAdminController]
+      A2[GET /api/cms-kit-admin/blog-posts] --> A2S[BlogPostAdminController]
+      A3[GET /api/cms-kit-admin/comments] --> A3S[CommentAdminController]
+      A4[GET /api/cms-kit-admin/pages] --> A4S[PageAdminController]
+      A5[GET /api/cms-kit-admin/menus] --> A5S[MenuItemAdminController]
+      A6[GET /api/cms-kit-admin/tags] --> A6S[TagAdminController]
+      A7[POST /api/cms-kit-admin/media] --> A7S[MediaDescriptorAdminController]
+      A8[GET /api/cms-kit-admin/global-resources] --> A8S[GlobalResourceAdminController]
+    end
+    subgraph cms-kit-public
+      P1[GET /api/cms-kit-public/comments] --> P1S[CommentPublicController]
+      P2[GET /api/cms-kit-public/reactions] --> P2S[ReactionPublicController]
+      P3[GET /api/cms-kit-public/ratings] --> P3S[RatingPublicController]
+      P4[GET /api/cms-kit-public/blog-posts] --> P4S[BlogPostPublicController]
+      P5[GET /api/cms-kit-public/pages] --> P5S[PagesPublicController]
+      P6[GET /api/cms-kit-public/menus] --> P6S[MenuItemPublicController]
+      P7[GET /api/cms-kit-public/global-resources] --> P7S[GlobalResourcePublicController]
+      P8[GET /api/cms-kit-public/tags] --> P8S[TagPublicController]
+    end
+    subgraph cms-kit-common
+      C1[GET /api/cms-kit/media/{id}] --> C1S[MediaDescriptorController]
+      C2[GET /api/cms-kit/blogs/{blogId}/features/{name}] --> C2S[BlogFeatureController]
+    end
+```
+
+## OpenAPI / Swagger
+
+Because every controller is a normal `ControllerBase`-derived class (not a dynamic proxy), Swagger picks them up automatically as part of the application's `IApiDescriptionGroupCollectionProvider`. To split admin from public in your Swagger document, configure a Swagger group per `[Area]`:
+
+```csharp
+services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("admin", new() { Title = "Admin" });
+    options.SwaggerDoc("public", new() { Title = "Public" });
+
+    options.DocInclusionPredicate((docName, apiDesc) =>
+    {
+        var area = apiDesc.ActionDescriptor.RouteValues["area"];
+        return docName switch
+        {
+            "admin"  => area == CmsKitAdminRemoteServiceConsts.ModuleName,
+            "public" => area == CmsKitPublicRemoteServiceConsts.ModuleName
+                     || area == CmsKitCommonRemoteServiceConsts.ModuleName,
+            _ => true,
+        };
+    });
+});
+```
+
+The common controllers usually ship with the public group because they're consumed by both UIs and the public site is the one that needs a public Swagger UI.
+
+## `CmsKitControllerBase`
+
+```csharp
+public abstract class CmsKitControllerBase : AbpControllerBase
+{
+    protected CmsKitControllerBase() { LocalizationResource = typeof(CmsKitResource); }
+}
+```
+
+Sets the localisation resource so all `L["..."]` calls go through the CMS Kit JSONs. Each of the three sides has its own base class (`CmsKitAdminController`, `CmsKitPublicControllerBase`, `CmsKitControllerBase`) but the logic is identical.
+
+## Gotchas
+
+* **Public area is `"cms-kit"`, not `"cms-kit-public"`.** The constant says `ModuleName = "cms-kit"`. The route prefix is `api/cms-kit-public/...` and the `RemoteServiceName` is `"CmsKitPublic"`. This is an ABP quirk — when wiring custom Swagger filters or `DynamicJavaScriptProxyOptions.DisableModule` calls, use the actual `ModuleName` constant, not the route prefix.
+* **`AddApplicationPartIfNotExists` must run in PreConfigureServices.** Adding the application part later (in `ConfigureServices`) is too late — MVC has already scanned for controllers.
+* **`[RequiresGlobalFeature]` on the controller is redundant** because the AppService already carries it, but it's also there so requests are short-circuited at the controller level before any DI hits the AppService — saving ~one allocation per request.
+* **`FormBodyBindingIgnoredTypes`** is configured by `CmsKitAdminHttpApiModule` for `CreateMediaInputWithStream`. Without it, the dynamic controller registers `application/json` model binding for the type and the multi-part upload fails.
+* **No CORS shipped.** CMS Kit doesn't configure CORS; a public site consuming the API from another origin must add its own `services.AddCors(...)` policy.
+* **Razor admin disables JS proxy generation.** The admin UI uses Razor Pages, not the dynamic JS proxy, so `CmsKitAdminWebModule` calls `Configure<DynamicJavaScriptProxyOptions>` to disable the area. SPA clients that *want* the proxy must re-enable it from their own side.
+
+## Cross-links
+
+* [Admin.HttpApi](/modules/cms-kit/admin-http-api)
+* [Public.HttpApi](/modules/cms-kit/public-http-api)
+* [Application roll-up](/modules/cms-kit/application)
+* [Web roll-up](/modules/cms-kit/web)

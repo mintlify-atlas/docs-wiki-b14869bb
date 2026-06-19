@@ -1,0 +1,212 @@
+---
+title: "@abp/virtual-file-explorer"
+description: "Tiny npm pack that depends on clipboard.js and Prism.js for the `/VirtualFileExplorer` admin page. Lets developers browse, view, and copy any file embedded in any ABP module's virtual file system."
+---
+
+`@abp/virtual-file-explorer` powers ABP's developer tool for inspecting the **Virtual File System** at
+runtime. It is the easiest pack in this section: two third-party dependencies (clipboard.js + Prism)
+and no JavaScript of its own. The visible behaviour — the file tree, the path navigation, the file
+content modal, the syntax-highlighted preview, the copy-to-clipboard button — is implemented in the
+.NET project `Volo.Abp.VirtualFileExplorer.Web`.
+
+## Package metadata
+
+```json
+{
+    "name": "@abp/virtual-file-explorer",
+    "version": "7.4.0",
+    "license": "LGPL-3.0",
+    "dependencies": {
+        "@abp/clipboard": "~7.4.0",
+        "@abp/prismjs":   "~7.4.0"
+    }
+}
+```
+
+No code, no `abp.resourcemapping.js`, no `src/`.
+
+## What is the Virtual File Explorer?
+
+ABP modules embed Razor pages, CSS, images, localization JSON, and other static assets directly into
+their assemblies and serve them through the `Volo.Abp.VirtualFileSystem` abstraction. That means there
+is no `wwwroot/` for an embedded view — yet you may need to inspect, override, or copy the file.
+
+The Virtual File Explorer module mounts a page at `/VirtualFileExplorer` (gated behind the
+`AbpVirtualFileSystem` permission) that lets developers:
+
+- Browse the merged virtual file tree of every loaded module.
+- See the embedded path, last update time, size, and icon for each file.
+- Click an action to open a modal showing the file's contents with Prism syntax highlighting.
+- Copy the rendered content to the clipboard with one click (`clipboard.js`).
+
+This is invaluable when:
+
+- You need to override an embedded view but can't remember its exact path.
+- You are debugging localization JSON resolution.
+- You are integrating a new module and want to see what assets it ships.
+
+## Files shipped to the browser
+
+```text
+@abp/virtual-file-explorer/
+├── package.json
+└── README.md
+```
+
+The visible JS lives in
+`modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Pages/VirtualFileExplorer/`:
+
+```text
+VirtualFileExplorer/
+├── Index.cshtml                ← the file-listing Razor page
+├── index.js                    ← shown below — opens the file content modal
+├── index.css
+└── FileContentModal.cshtml     ← partial that the modal loads
+```
+
+The full content of `index.js`:
+
+```js
+var _fileContentModal = new abp.ModalManager(
+    abp.appPath + 'VirtualFileExplorer/FileContentModal'
+);
+
+function showContent(filePath) {
+    _fileContentModal.open({
+        filePath: filePath
+    });
+}
+```
+
+That's the whole script. It:
+
+1. Builds an `abp.ModalManager` pointed at the `FileContentModal` Razor page.
+2. Exposes a global `showContent(filePath)` function that the table rows call from inline
+   `onclick` handlers.
+3. Lets the modal manager handle loading the partial, injecting it into the DOM, and showing the
+   Bootstrap modal.
+
+After `abp install-libs` you additionally get under `wwwroot/libs/`:
+
+```text
+clipboard/clipboard.min.js          ← from @abp/clipboard
+prismjs/prism.css                   ← from @abp/prismjs
+prismjs/prism.js
+```
+
+## The FileContentModal partial
+
+The modal partial reads the requested `filePath`, resolves it through `IVirtualFileProvider`, and
+renders the bytes inside a `<pre><code class="language-XXX">` block. On `shown.bs.modal`, Prism is
+invoked to highlight the block:
+
+```html
+@page "{handler?}"
+@model FileContentModalModel
+
+<abp-modal>
+    <abp-modal-header title="@Model.FileName"></abp-modal-header>
+    <abp-modal-body>
+        <button class="btn btn-sm btn-secondary copy-button"
+                data-clipboard-target="#file-content-code">Copy</button>
+        <pre><code id="file-content-code"
+                   class="language-@Model.Language">@Model.Content</code></pre>
+    </abp-modal-body>
+    <abp-modal-footer buttons="Close" />
+</abp-modal>
+
+<script>
+    (function () {
+        Prism.highlightAllUnder(document.querySelector('.modal-body'));
+
+        new ClipboardJS('.copy-button')
+            .on('success', function () { abp.notify.success('Copied'); });
+    })();
+</script>
+```
+
+`ClipboardJS` is the global from **`@abp/clipboard`**. `Prism` is the global from
+**`@abp/prismjs`**.
+
+## Razor view example end-to-end
+
+`Pages/VirtualFileExplorer/Index.cshtml` (excerpt):
+
+```html
+@page
+@inject IHtmlLocalizer<VirtualFileExplorerResource> L
+@inject IHtmlLocalizer<AbpUiResource> UiL
+@model IndexModel
+
+@section scripts {
+    <abp-script-bundle name="@typeof(IndexModel).FullName">
+        <abp-script src="/Pages/VirtualFileExplorer/index.js" />
+    </abp-script-bundle>
+}
+
+<abp-card id="VirtualFileExplorerWrapper">
+    <abp-card-body>
+        @Html.Raw(Model.PathNavigation)
+
+        <abp-table striped-rows="true" class="nowrap dataTable no-footer">
+            <thead>
+                <tr>
+                    <th>@UiL["Actions"]</th>
+                    <th>@L["VirtualFileName"]</th>
+                    <th>@L["VirtualFileType"]</th>
+                    <th>@L["LastUpdateTime"]</th>
+                    <th>@L["Size"]</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var item in Model.FileInfoList)
+                {
+                    <tr>
+                        <td>
+                            @if (!item.IsDirectory)
+                            {
+                                <a onclick="showContent('@item.FilePath')">@L["FileContent"]</a>
+                            }
+                        </td>
+                        <td>@item.FileName</td>
+                        <td><i class="@item.Icon"></i> @item.FileType</td>
+                        <td>@item.LastModifiedTime</td>
+                        <td>@item.Size</td>
+                    </tr>
+                }
+            </tbody>
+        </abp-table>
+    </abp-card-body>
+</abp-card>
+```
+
+The inline `onclick="showContent('@item.FilePath')"` is what binds the Razor table to the global
+function defined in `index.js`. `abp.ModalManager` does the rest.
+
+## Gotchas
+
+- **Permission gating.** The page is only reachable to users with the `AbpVirtualFileSystem` permission
+  (or its subordinate `AbpVirtualFileSystem.View`). The module disables itself entirely in production
+  unless you explicitly enable it. Don't ship the npm pack to a customer-facing production deployment.
+- **Large embedded files.** The modal loads the entire file into HTML — opening a 5 MB embedded
+  resource pegs the browser. The server-side `FileContentModal` truncates files above the configured
+  limit, but you may need to bump the limit when inspecting larger assets.
+- **Prism language auto-detection.** The server picks the language from the file extension (`.cs` →
+  `csharp`, `.js` → `javascript`). Unknown extensions render with no highlighting — you can extend
+  `FileTypes` in the C# module to register new mappings.
+- **Inline `onclick=`.** The page uses `onclick="showContent('@item.FilePath')"` rather than
+  delegated handlers. If you ship a custom CSP that forbids `unsafe-inline` scripts, you must
+  either whitelist the per-script hash or fork the partial.
+- **ClipboardJS needs HTTPS in Safari**. The copy button silently fails when the page is served over
+  plain HTTP and viewed in Safari. Use HTTPS for the developer host.
+- **No interaction with `abp.security.antiForgery`.** The page is read-only; no POSTs, no anti-forgery
+  concerns. If you fork the modal to send writes back, add the token header yourself.
+
+## Related pages
+
+- [`@abp/aspnetcore.mvc.ui.theme.shared`](/npm/aspnetcore-mvc-ui-theme-shared) — provides
+  `abp.ModalManager` and `abp.notify.success`.
+- [`@abp/third-party-packs`](/npm/third-party-packs) — `@abp/clipboard` and `@abp/prismjs` resource
+  mappings.
+- The .NET-side [Virtual File System guide](/framework/virtual-file-system/) for how files end up in
+  the explorer in the first place.

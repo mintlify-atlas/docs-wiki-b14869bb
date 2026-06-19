@@ -1,0 +1,241 @@
+---
+title: "Redis"
+description: "Deep-dive reference for wiring an external Redis server into ABP through Volo.Abp.Caching.StackExchangeRedis — version targets, connection string syntax, distributed cache replacement, and operational guidance."
+---
+
+Redis sits behind two of the most heavily-used ABP cross-cutting features: the distributed cache (`IDistributedCache`) and the distributed lock (`IAbpDistributedLock`). The `Volo.Abp.Caching.StackExchangeRedis` package wires `StackExchange.Redis` into ABP's caching pipeline and replaces the default `MemoryDistributedCache` with a Redis-backed implementation. This reference focuses on the **server side** of that integration — what Redis you need, how ABP talks to it, and what to watch in production.
+
+For the in-process abstractions (`IDistributedCache<T>`, cache key prefixes, sliding expiration), see [Distributed Cache](/framework/caching/distributed-cache). For the lock provider variant, see [Distributed Locking](/framework/cross/distributed-locking).
+
+## ABP package
+
+| Package | NuGet | Notes |
+| --- | --- | --- |
+| `Volo.Abp.Caching.StackExchangeRedis` | `Volo.Abp.Caching.StackExchangeRedis` | Adds the distributed cache provider. |
+| `Volo.Abp.DistributedLocking` | `Volo.Abp.DistributedLocking` | Required if you also want Redis-based RedLock locks. |
+| `DistributedLock.Redis` (third party, optional) | `DistributedLock.Redis` | Backs the lock provider; not pulled in by ABP itself. |
+
+The module type is `AbpCachingStackExchangeRedisModule`. It depends on `AbpCachingModule` and runs on top of `Microsoft.Extensions.Caching.StackExchangeRedis` (`AddStackExchangeRedisCache`).
+
+```csharp
+[DependsOn(typeof(AbpCachingStackExchangeRedisModule))]
+public class MyServiceHostModule : AbpModule { /* ... */ }
+```
+
+Internally the module does only three things:
+
+```csharp
+var redisEnabled = configuration["Redis:IsEnabled"];
+if (string.IsNullOrEmpty(redisEnabled) || bool.Parse(redisEnabled))
+{
+    context.Services.AddStackExchangeRedisCache(options =>
+    {
+        var redisConfiguration = configuration["Redis:Configuration"];
+        if (!redisConfiguration.IsNullOrEmpty())
+        {
+            options.Configuration = redisConfiguration;
+        }
+    });
+
+    context.Services.Replace(
+        ServiceDescriptor.Singleton<IDistributedCache, AbpRedisCache>());
+}
+```
+
+Two configuration keys, both under the top-level `Redis` section: `Redis:IsEnabled` (boolean string, default `true`) and `Redis:Configuration` (the StackExchange.Redis configuration string). When `IsEnabled` is `false`, ABP falls back to the default in-memory distributed cache — useful for local development without a Redis instance.
+
+`AbpRedisCache` is a subclass of the standard `RedisCache` that adds two batched hash operations (`HashMemberGetMany`, `HashMemberGetManyAsync`) used by ABP's bulk cache APIs. It does **not** change the underlying serialization, key format, or eviction policy — those are still pure StackExchange.Redis behaviour.
+
+## Server version requirements
+
+`StackExchange.Redis` 2.x speaks the Redis serialization protocol up to RESP3 and supports Redis 3.0 through 7.x and the Redis 7-compatible alternatives. In practice ABP runs against:
+
+- **Redis 6.x and 7.x** (recommended). Required if you want client-side caching, RESP3, ACL users, or `SUBSCRIBE`-shard semantics.
+- **Redis 5.x** still works but lacks ACLs (auth is the single shared password).
+- **Azure Cache for Redis** (Basic / Standard / Premium / Enterprise) — Premium is needed for clustering, geo-replication, persistence, and zone redundancy.
+- **AWS ElastiCache for Redis / Valkey** — both cluster and non-cluster modes.
+- **Upstash Redis**, **Redis Enterprise Cloud**, **Dragonfly** and **KeyDB** are protocol-compatible.
+
+If your workload spans more than ~5 GB of working set or needs >25k ops/sec sustained, plan for clustering. StackExchange.Redis handles cluster routing transparently provided the configuration string contains the configuration endpoint or each shard's primary.
+
+## Connection string syntax
+
+`Redis:Configuration` is parsed by `ConfigurationOptions.Parse`. The minimal form is `host:port`. Common patterns:
+
+```text
+# Single node, no auth
+localhost:6379
+
+# Production single node
+redis-prod-01.internal:6379,password=Sup3rS3cret!,ssl=true,abortConnect=false
+
+# Sentinel-backed primary discovery (ServiceName == sentinel master name)
+sentinel-1:26379,sentinel-2:26379,sentinel-3:26379,serviceName=mymaster,password=...,abortConnect=false
+
+# Cluster — list one or more shard endpoints
+redis-cluster.cache.amazonaws.com:6379,password=...,ssl=true,abortConnect=false
+
+# Azure Cache for Redis
+mycache.redis.cache.windows.net:6380,password=<primaryKey>,ssl=true,abortConnect=false,connectRetry=3
+```
+
+Always set `abortConnect=false` in production so the application starts even when Redis is temporarily unreachable; StackExchange.Redis will reconnect in the background. Without it, the first failed connection raises and the host fails to start.
+
+Other tokens you may need:
+
+| Token | Purpose |
+| --- | --- |
+| `ssl=true` | Use TLS — required by Azure Cache and most managed Redis. |
+| `sslprotocols=tls12` | Pin TLS version when fronted by older load balancers. |
+| `user=appuser` | Redis 6+ ACL user (paired with `password=...`). |
+| `defaultDatabase=2` | Select a logical DB index (ignored on cluster). |
+| `connectTimeout=5000` | Initial connect timeout in ms. |
+| `syncTimeout=5000` | Per-command sync timeout in ms. |
+| `keepAlive=180` | TCP keep-alive in seconds; lower if behind aggressive NATs. |
+| `name=my-service` | Sent with `CLIENT SETNAME` for easier `CLIENT LIST` debugging. |
+| `tiebreaker=` | Disable tiebreaker key writes when using read-only replicas. |
+| `allowAdmin=true` | Required for `FLUSHDB`, `INFO`, key scans — keep off by default. |
+
+## Sample `appsettings.json`
+
+```json
+{
+  "Redis": {
+    "IsEnabled": true,
+    "Configuration": "redis-prod-01.internal:6379,password=Sup3rS3cret!,ssl=true,abortConnect=false,connectTimeout=5000,syncTimeout=5000,name=catalog-service"
+  },
+  "Caching": {
+    "KeyPrefix": "catalog:"
+  }
+}
+```
+
+The `Caching:KeyPrefix` is read by `AbpDistributedCacheOptions` (not by this module). Setting it ensures multiple ABP applications can safely share a single Redis database without colliding on keys such as `c:ApplicationConfigurationDto,k:`.
+
+Per-environment overrides typically only swap the host, password and TLS flag. Treat the password as a secret — bind it from User Secrets, Azure Key Vault, AWS Secrets Manager or environment variable substitution.
+
+## Network and auth setup
+
+1. **TLS.** Managed Redis (Azure Cache, ElastiCache encryption-in-transit, Upstash, Redis Enterprise Cloud) terminates TLS at the server. Add `ssl=true`. Self-hosted clusters typically need `stunnel` or Redis 6's native TLS — point the connection string at the TLS port (default 6380 for Azure, 6379 with `tls-port` in `redis.conf`).
+2. **Auth.** Redis ≥ 6 supports ACL users. Use `user=` + `password=` for fine-grained permissions; restrict the ABP user to the key prefix in use and deny `FLUSHALL`, `DEBUG`, `SHUTDOWN`. For Redis ≤ 5, only `password=` (the global `requirepass`) is available.
+3. **Network reachability.** Cache nodes should sit on a private subnet, with security groups / NSGs allowing 6379/6380 only from app subnets. Avoid exposing Redis publicly even with auth.
+4. **Cluster topology.** When using a cluster, StackExchange.Redis discovers all shards via `CLUSTER SLOTS`. The configuration string only needs one reachable endpoint, but supplying several gives faster failover. Verify that all node IPs are reachable from app pods, not just the discovery endpoint.
+5. **Replicas.** ABP only writes to the primary. If you want read replicas (e.g. `Caching:KeyPrefix` read-heavy), add `,resolveDns=true` and configure `CommandFlags.PreferReplica` in custom code; this is not the default.
+
+## Pipelines, batching, multiplexer behaviour
+
+StackExchange.Redis uses a single multiplexed connection per `ConnectionMultiplexer`. ABP shares that multiplexer between cache reads/writes, distributed locking and any custom `IConnectionMultiplexer` injection. Keep the multiplexer **alive for the lifetime of the host** — do not new it up per request. If you need direct access, resolve `IConnectionMultiplexer` (it is registered as singleton by `AddStackExchangeRedisCache`).
+
+`AbpRedisCache.HashMemberGetMany` issues parallel `HMGET` calls and waits synchronously. The async sibling uses `Task.WhenAll`. Both rely on Redis's hash-of-hash storage layout used by ABP's bulk cache (key per cache entry, fields `data` and `absexp`/`sldexp`).
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `It was not possible to connect to the redis server(s). ConnectTimeout` | Wrong host/port, firewall, or `abortConnect=true` masking a transient blip on startup. | Verify reachability (`telnet`/`Test-NetConnection`), set `abortConnect=false`, increase `connectTimeout`. |
+| `WRONGPASS invalid username-password pair` | Redis 6+ ACL user expected, only `password=` supplied. | Add `user=appuser,password=...` to the connection string. |
+| `Timeout performing GET ..., inst: 0, mgr: ExecuteSelect, err: never, queue: 12, qu: 0, qs: 12` | Saturated multiplexer (large payloads, slow `KEYS`, network jitter). | Reduce payload sizes; raise `syncTimeout`; split read-heavy workloads to a second multiplexer. |
+| `MOVED 1234 10.0.0.4:6379` followed by failure | Cluster client wasn't told about the cluster — using a non-cluster client against a clustered Redis. | Ensure connection string contains a cluster endpoint and `StackExchange.Redis` >= 2.6; do not pin to single-node libraries. |
+| `OOM command not allowed when used memory > 'maxmemory'` | Redis hit its `maxmemory` limit with `maxmemory-policy=noeviction`. | Switch policy to `allkeys-lru` or `volatile-lru`, scale up, or shrink cache TTLs. |
+| First request after deploy is slow | Cold multiplexer + sync startup. | Optionally pre-warm by resolving `IConnectionMultiplexer` and calling `GetDatabase().PingAsync()` from a hosted service. |
+| Random `SocketFailure` under load | Idle TCP connection killed by NAT/load balancer. | Lower `keepAlive` (e.g. `keepAlive=60`). |
+| Keys leak across environments | Same Redis DB, no `Caching:KeyPrefix`. | Set `Caching:KeyPrefix` per app/env or assign separate `defaultDatabase` indexes. |
+
+## Observability hints
+
+- **Server-side.** Enable `INFO` scraping with a Redis Prometheus exporter (`redis_exporter` from `oliver006`). Key metrics: `connected_clients`, `instantaneous_ops_per_sec`, `used_memory`, `evicted_keys`, `keyspace_misses`, `blocked_clients`, `cluster_state`.
+- **Client-side.** `IConnectionMultiplexer.GetCounters()` returns per-connection counters (`PendingUnsentItems`, `SentItemsAwaitingResponse`) — surface them via a hosted service into your metrics pipeline.
+- **Slow log.** `CONFIG SET slowlog-log-slower-than 10000` (microseconds). Combine with `SLOWLOG GET 100` to find offending keys. Cache keys built by ABP look like `c:<CacheName>,k:<KeyValue>` with the configured `KeyPrefix`.
+- **Tracing.** StackExchange.Redis emits `EventSource` events under `Microsoft-Extensions-Caching-Performance` and `StackExchange.Redis`. The OpenTelemetry instrumentation `OpenTelemetry.Instrumentation.StackExchangeRedis` adds spans per command — wire it once for the multiplexer ABP registers.
+- **Memory profile.** Use `MEMORY USAGE <key>` and `redis-cli --bigkeys` to find oversized cache entries. ABP's distributed cache serialises with UTF-8 JSON by default; large DTOs can dominate memory.
+
+## Disabling Redis for local development
+
+When `Redis:IsEnabled=false`, ABP keeps the default `MemoryDistributedCache`. Reads, writes and bulk operations still work, but only in-process. This is the recommended switch for local CI/test runs where standing up a Redis container would slow the loop. Combine with `Caching:KeyPrefix` to make the transition between in-memory and Redis transparent.
+
+A frequent pattern is:
+
+```json
+{
+  "Redis": { "IsEnabled": false }
+}
+```
+
+in `appsettings.Development.json`, with the production setting injected via environment variables (`Redis__IsEnabled=true`, `Redis__Configuration=...`).
+
+## Sentinel and high availability
+
+For HA without managed services, use Redis Sentinel:
+
+```text
+sentinel-1:26379,sentinel-2:26379,sentinel-3:26379,serviceName=mymaster,password=...,abortConnect=false
+```
+
+StackExchange.Redis 2.5+ resolves the primary through the sentinel set automatically. Failover takes a few seconds; with `abortConnect=false` the multiplexer reconnects and pending commands replay. For zero-downtime guarantees, prefer a managed service (Azure Cache Premium, ElastiCache with automatic failover) — they expose a stable DNS name and handle promotion themselves.
+
+## TLS and certificate validation
+
+When the broker terminates TLS with a private CA, StackExchange.Redis will fail the handshake unless the chain is trusted by the .NET runtime. Options:
+
+1. Trust the CA at the OS level (mount into `/etc/ssl/certs` and re-run `update-ca-certificates` in the container build).
+2. Pass a custom `CertificateValidation` callback via `ConfigurationOptions`:
+
+```csharp
+var conf = ConfigurationOptions.Parse(connectionString);
+conf.CertificateValidation += (sender, cert, chain, errors) =>
+{
+    if (errors == SslPolicyErrors.None) return true;
+    // accept the broker's known cert thumbprint:
+    return ((X509Certificate2)cert).Thumbprint == "AB12CD34...";
+};
+var multiplexer = ConnectionMultiplexer.Connect(conf);
+```
+
+Override `IConnectionMultiplexer` registration (or subclass `AbpRedisCache`) to wire this in. Generally prefer OS-level CA trust over per-app overrides — it's auditable and avoids drift across services.
+
+## Working with secondary databases
+
+StackExchange.Redis supports the `SELECT` command via `defaultDatabase=N`. ABP doesn't change databases at runtime, so set it in the configuration string. Useful to:
+
+- Separate cache vs. distributed-lock keys (`defaultDatabase=0` for cache; resolve `IConnectionMultiplexer` and `GetDatabase(1)` for locks).
+- Isolate environments on a single shared Redis (although key prefixes are usually safer and survive cluster moves).
+
+Database indexes are **not supported on Redis Cluster**. Cluster keyspace is flat.
+
+## Connection lifecycle and health checks
+
+`AddStackExchangeRedisCache` creates the multiplexer lazily on first call. ABP triggers the first connection during settings cache hydration, distributed cache writes, or distributed lock acquisition — whichever happens first.
+
+For Kubernetes readiness probes that depend on Redis:
+
+```csharp
+services.AddHealthChecks()
+    .AddRedis(
+        connectionStringFactory: sp => sp.GetRequiredService<IConfiguration>()["Redis:Configuration"]!,
+        name: "redis",
+        tags: new[] { "ready" });
+```
+
+`AspNetCore.HealthChecks.Redis` (Xabaril) reuses the same connection string. Wire `/health/ready` against the `ready` tag.
+
+## Eviction and persistence trade-offs
+
+| Persistence mode | Use for cache? | Notes |
+| --- | --- | --- |
+| `noeviction` | ❌ | OOM blocks writes. |
+| `allkeys-lru` | ✅ default for caches | Approximates LRU; cheap. |
+| `allkeys-lfu` | ✅ for hotspot workloads | Tracks access frequency. |
+| `volatile-lru` / `volatile-lfu` | ✅ if every ABP entry has TTL | ABP cache entries do; OK. |
+| `volatile-ttl` | ⚠️ | Evicts soonest-to-expire first; can churn. |
+
+For pure cache workloads disable AOF/RDB persistence — restart latency improves and write amplification disappears. For lock-only deployments persistence doesn't matter (locks are short-lived).
+
+## Multi-tenant key isolation
+
+`AbpDistributedCacheOptions` exposes `KeyPrefix` and `HideErrors`. With multi-tenancy the cache key already includes `,k:t:<tenantId>` — there's no risk of cross-tenant reads from a shared Redis. But for compliance (data residency) you may need physically separate instances; in that case point each tenant's app deployment at a different `Redis:Configuration`.
+
+## Related references
+
+- [Distributed Cache](/framework/caching/distributed-cache) — the in-process abstractions (`IDistributedCache<T>`, bulk APIs, sliding expiration).
+- [Distributed Locking](/framework/cross/distributed-locking) — provider model where Redis is one of several lock backends.
+- [Settings cache](/framework/cross/settings) — how settings are stored in distributed cache (and hence Redis).

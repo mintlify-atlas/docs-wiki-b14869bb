@@ -1,0 +1,461 @@
+---
+title: "Blogging module HTTP endpoints"
+sidebarTitle: "Blogging endpoints"
+description: "Routes exposed by Volo.Blogging.HttpApi and Volo.Blogging.Admin.HttpApi — the legacy blogging module: blogs, posts, comments, tags and file uploads."
+---
+
+The legacy blogging module — separate from CMS Kit — ships two HTTP API
+packages:
+
+- `Volo.Blogging.HttpApi` — public read/write surface mounted at
+  `/api/blogging`.
+- `Volo.Blogging.Admin.HttpApi` — host-side blog management mounted at
+  `/api/blogging/blogs/admin`.
+
+All controllers carry `[Area("blogging")]` and the matching
+`[RemoteService]`. The `[Authorize]` policies live on the application
+service implementations (`PostAppService`, `CommentAppService`,
+`BlogManagementAppService`, …) using the
+`BloggingPermissions` constants.
+
+```text Volo.Blogging.HttpApi  /  Volo.Blogging.Admin.HttpApi
+Volo/Blogging/
+├── BlogsController.cs        → /api/blogging/blogs
+├── PostsController.cs        → /api/blogging/posts
+├── CommentsController.cs     → /api/blogging/comments
+├── TagsController.cs         → /api/blogging/tags
+├── BlogFilesController.cs    → /api/blogging/files
+└── Admin/BlogManagementController.cs
+                              → /api/blogging/blogs/admin
+```
+
+## Route summary
+
+### Blogs (read)
+
+| Verb | Path | Body | Returns |
+| ---- | ---- | ---- | ------- |
+| GET | `/api/blogging/blogs` | — | `ListResultDto<BlogDto>` |
+| GET | `/api/blogging/blogs/{id}` | — | `BlogDto` |
+| GET | `/api/blogging/blogs/by-shortname/{shortName}` | — | `BlogDto` |
+
+### Blog administration
+
+| Verb | Path | Body | Returns | Policy |
+| ---- | ---- | ---- | ------- | ------ |
+| GET    | `/api/blogging/blogs/admin` | — | `ListResultDto<BlogDto>` | `Blogging.Blog.Management` |
+| GET    | `/api/blogging/blogs/admin/{id}` | — | `BlogDto` | `Blogging.Blog.Management` |
+| POST   | `/api/blogging/blogs/admin` | `CreateBlogDto` | `BlogDto` | `Blogging.Blog.Create` |
+| PUT    | `/api/blogging/blogs/admin/{id}` | `UpdateBlogDto` | `BlogDto` | `Blogging.Blog.Update` |
+| DELETE | `/api/blogging/blogs/admin/{id}` | — | `204` | `Blogging.Blog.Delete` |
+| GET    | `/api/blogging/blogs/admin/clear-cache/{id}` | — | `204` | `Blogging.Blog.ClearCache` |
+
+### Posts
+
+| Verb | Path | Body | Returns | Policy |
+| ---- | ---- | ---- | ------- | ------ |
+| GET    | `/api/blogging/posts/{blogId}/all?tagName=...` | — | `ListResultDto<PostWithDetailsDto>` | none |
+| GET    | `/api/blogging/posts/{blogId}/all/by-time` | — | `ListResultDto<PostWithDetailsDto>` | none |
+| GET    | `/api/blogging/posts/read?Url=&BlogId=` | — | `PostWithDetailsDto` | none |
+| GET    | `/api/blogging/posts/{id}` | — | `PostWithDetailsDto` | none |
+| GET    | `/api/blogging/posts/user/{userId}` | — | `List<PostWithDetailsDto>` | none |
+| GET    | `/api/blogging/posts/{blogId}/latest/{count}` | — | `List<PostWithDetailsDto>` | none |
+| POST   | `/api/blogging/posts` | `CreatePostDto` | `PostWithDetailsDto` | `Blogging.Post.Create` |
+| PUT    | `/api/blogging/posts/{id}` | `UpdatePostDto` | `PostWithDetailsDto` | `Blogging.Post.Update` |
+| DELETE | `/api/blogging/posts/{id}` | — | `204` | `Blogging.Post.Delete` |
+
+### Comments
+
+| Verb | Path | Body | Returns |
+| ---- | ---- | ---- | ------- |
+| GET    | `/api/blogging/comments/hierarchical/{postId}` | — | `List<CommentWithRepliesDto>` |
+| POST   | `/api/blogging/comments` | `CreateCommentDto` | `CommentWithDetailsDto` |
+| PUT    | `/api/blogging/comments/{id}` | `UpdateCommentDto` | `CommentWithDetailsDto` |
+| DELETE | `/api/blogging/comments/{id}` | — | `204` |
+
+### Tags
+
+| Verb | Path | Body | Returns |
+| ---- | ---- | ---- | ------- |
+| GET | `/api/blogging/tags/popular/{blogId}` | `GetPopularTagsInput` | `List<TagDto>` |
+
+### Files
+
+| Verb | Path | Body | Returns |
+| ---- | ---- | ---- | ------- |
+| GET  | `/api/blogging/files/{name}` | — | `RawFileDto` (bytes wrapped in JSON) |
+| GET  | `/api/blogging/files/www/{name}` | — | `IRemoteStreamContent` (raw bytes) |
+| POST | `/api/blogging/files/images/upload` | `FileUploadInputDto` (multipart) | `FileUploadOutputDto` |
+
+## BlogsController
+
+```csharp modules/blogging/src/Volo.Blogging.HttpApi/Volo/Blogging/BlogsController.cs
+[RemoteService(Name = BloggingRemoteServiceConsts.RemoteServiceName)]
+[Area(BloggingRemoteServiceConsts.ModuleName)]
+[Route("api/blogging/blogs")]
+public class BlogsController : AbpControllerBase, IBlogAppService
+{
+    [HttpGet]
+    public virtual async Task<ListResultDto<BlogDto>> GetListAsync()
+        => await _blogAppService.GetListAsync();
+
+    [HttpGet] [Route("by-shortname/{shortName}")]
+    public virtual async Task<BlogDto> GetByShortNameAsync(string shortName)
+        => await _blogAppService.GetByShortNameAsync(shortName);
+
+    [HttpGet] [Route("{id}")]
+    public virtual async Task<BlogDto> GetAsync(Guid id) => await _blogAppService.GetAsync(id);
+}
+```
+
+A blog's `ShortName` is the URL slug — `by-shortname/{shortName}` is the
+front-end's lookup path.
+
+```http
+GET /api/blogging/blogs HTTP/1.1
+```
+
+```json
+{
+  "items": [
+    {
+      "id": "ba9e8000-...",
+      "name": "Company blog",
+      "shortName": "company",
+      "description": "Engineering & product"
+    }
+  ]
+}
+```
+
+## PostsController
+
+```csharp modules/blogging/src/Volo.Blogging.HttpApi/Volo/Blogging/PostsController.cs (excerpt)
+[Route("api/blogging/posts")]
+public class PostsController : AbpControllerBase, IPostAppService
+{
+    [HttpGet] [Route("{blogId}/all")]
+    public Task<ListResultDto<PostWithDetailsDto>> GetListByBlogIdAndTagNameAsync(Guid blogId, string tagName)
+        => _postAppService.GetListByBlogIdAndTagNameAsync(blogId, tagName);
+
+    [HttpGet] [Route("read")]
+    public Task<PostWithDetailsDto> GetForReadingAsync(GetPostInput input)
+        => _postAppService.GetForReadingAsync(input);
+
+    [HttpPost]
+    public Task<PostWithDetailsDto> CreateAsync(CreatePostDto input)
+        => _postAppService.CreateAsync(input);
+
+    [HttpPut] [Route("{id}")]
+    public Task<PostWithDetailsDto> UpdateAsync(Guid id, UpdatePostDto input)
+        => _postAppService.UpdateAsync(id, input);
+
+    [HttpDelete] [Route("{id}")]
+    public Task DeleteAsync(Guid id) => _postAppService.DeleteAsync(id);
+
+    // GetTimeOrderedListAsync, GetAsync, GetListByUserIdAsync, GetLatestBlogPostsAsync omitted
+}
+```
+
+### `GET /api/blogging/posts/read`
+
+`GetForReadingAsync` increments the post's `ReadCount` and is the only
+endpoint that the public-reader uses by URL:
+
+```http
+GET /api/blogging/posts/read?Url=hello&BlogId=ba9e8000-... HTTP/1.1
+```
+
+`GetPostInput` requires both fields:
+
+```csharp
+public class GetPostInput
+{
+    [Required] public string Url { get; set; }
+    public Guid BlogId { get; set; }
+}
+```
+
+The response shape:
+
+```csharp
+public class PostWithDetailsDto : FullAuditedEntityDto<Guid>, IHasConcurrencyStamp
+{
+    public Guid BlogId { get; set; }
+    public string Title { get; set; }
+    public string CoverImage { get; set; }
+    public string Url { get; set; }
+    public string Content { get; set; }
+    public string Description { get; set; }
+    public int ReadCount { get; set; }
+    public int CommentCount { get; set; }
+    public BlogUserDto Writer { get; set; }
+    public List<TagDto> Tags { get; set; }
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+```json
+{
+  "id": "3fa85f64-...",
+  "blogId": "ba9e8000-...",
+  "title": "Hello world",
+  "coverImage": "cover.png",
+  "url": "hello",
+  "content": "<p>Hello!</p>",
+  "description": "First post.",
+  "readCount": 124,
+  "commentCount": 3,
+  "writer": {
+    "id": "bd0c2b00-...",
+    "userName": "alice",
+    "name": "Alice"
+  },
+  "tags": [ { "id": "...", "name": "news" } ],
+  "concurrencyStamp": "8f0a..."
+}
+```
+
+### `POST /api/blogging/posts`
+
+```csharp
+public class CreatePostDto
+{
+    public Guid BlogId { get; set; }
+    [Required] public string Title { get; set; }
+    [Required] public string CoverImage { get; set; }
+    [Required] public string Url { get; set; }
+    [Required] public string Content { get; set; }
+    public string Tags { get; set; }
+    public string Description { get; set; }
+}
+```
+
+```json
+{
+  "blogId": "ba9e8000-...",
+  "title": "Hello world",
+  "coverImage": "cover.png",
+  "url": "hello",
+  "content": "<p>Hello!</p>",
+  "description": "First post.",
+  "tags": "news, intro"
+}
+```
+
+`Tags` is a comma-separated string — `PostAppService` splits it and
+upserts the per-blog tag rows.
+
+### `PUT /api/blogging/posts/{id}`
+
+`UpdatePostDto` mirrors `CreatePostDto` and adds the `ConcurrencyStamp`
+the service stores on `Post` for optimistic locking.
+
+## CommentsController
+
+```csharp modules/blogging/src/Volo.Blogging.HttpApi/Volo/Blogging/CommentsController.cs
+[Route("api/blogging/comments")]
+public class CommentsController : AbpControllerBase, ICommentAppService
+{
+    [HttpGet] [Route("hierarchical/{postId}")]
+    public Task<List<CommentWithRepliesDto>> GetHierarchicalListOfPostAsync(Guid postId)
+        => _commentAppService.GetHierarchicalListOfPostAsync(postId);
+
+    [HttpPost]
+    public Task<CommentWithDetailsDto> CreateAsync(CreateCommentDto input)
+        => _commentAppService.CreateAsync(input);
+
+    [HttpPut] [Route("{id}")]
+    public Task<CommentWithDetailsDto> UpdateAsync(Guid id, UpdateCommentDto input)
+        => _commentAppService.UpdateAsync(id, input);
+
+    [HttpDelete] [Route("{id}")]
+    public Task DeleteAsync(Guid id) => _commentAppService.DeleteAsync(id);
+}
+```
+
+`CreateCommentDto` references the parent comment for nested replies:
+
+```csharp
+public class CreateCommentDto
+{
+    public Guid? RepliedCommentId { get; set; }
+    public Guid PostId { get; set; }
+    [Required] public string Text { get; set; }
+}
+```
+
+```http
+POST /api/blogging/comments HTTP/1.1
+Authorization: Bearer <user-token>
+Content-Type: application/json
+
+{ "postId": "3fa85f64-...", "repliedCommentId": null, "text": "Great post!" }
+```
+
+`UpdateAsync`/`DeleteAsync` enforce that the caller is the comment
+author (or has the right permission).
+
+## TagsController
+
+```csharp modules/blogging/src/Volo.Blogging.HttpApi/Volo/Blogging/TagsController.cs
+[Route("api/blogging/tags")]
+public class TagsController : AbpControllerBase, ITagAppService
+{
+    [HttpGet] [Route("popular/{blogId}")]
+    public Task<List<TagDto>> GetPopularTagsAsync(Guid blogId, GetPopularTagsInput input)
+        => _tagAppService.GetPopularTagsAsync(blogId, input);
+}
+```
+
+```http
+GET /api/blogging/tags/popular/ba9e8000-...?ResultCount=10&MinimumPostCount=1 HTTP/1.1
+```
+
+## BlogFilesController
+
+The file controller serves two GET shapes — a JSON byte wrapper
+(`RawFileDto`) and a raw stream (`IRemoteStreamContent`) — plus the
+upload endpoint used by the rich-text editor:
+
+```csharp modules/blogging/src/Volo.Blogging.HttpApi/Volo/Blogging/BlogFilesController.cs
+[Route("api/blogging/files")]
+public class BlogFilesController : AbpControllerBase, IFileAppService
+{
+    [HttpGet] [Route("{name}")]
+    public Task<RawFileDto> GetAsync(string name) => _fileAppService.GetAsync(name);
+
+    [HttpGet] [Route("www/{name}")]
+    public virtual async Task<IRemoteStreamContent> GetFileAsync(string name)
+        => await _fileAppService.GetFileAsync(name);
+
+    [HttpPost] [Route("images/upload")]
+    public Task<FileUploadOutputDto> CreateAsync(FileUploadInputDto input)
+        => _fileAppService.CreateAsync(input);
+}
+```
+
+```csharp
+public class FileUploadInputDto
+{
+    [Required] public IRemoteStreamContent File { get; set; }
+    [Required] public string Name { get; set; }
+}
+
+public class FileUploadOutputDto
+{
+    public string Name { get; set; }
+    public string WebUrl { get; set; }
+}
+```
+
+`WebUrl` is the relative path the editor will write into the HTML body —
+usually `/api/blogging/files/www/<random-name>.png`.
+
+## BlogManagementController (admin)
+
+```csharp modules/blogging/src/Volo.Blogging.Admin.HttpApi/Volo/Blogging/Admin/BlogManagementController.cs
+[RemoteService(Name = BloggingAdminRemoteServiceConsts.RemoteServiceName)]
+[Area(BloggingAdminRemoteServiceConsts.ModuleName)]
+[Route("api/blogging/blogs/admin")]
+public class BlogManagementController : AbpControllerBase, IBlogManagementAppService
+{
+    [HttpGet]
+    public virtual async Task<ListResultDto<BlogDto>> GetListAsync() => ...;
+
+    [HttpGet] [Route("{id}")]
+    public virtual async Task<BlogDto> GetAsync(Guid id) => ...;
+
+    [HttpPost]
+    public virtual async Task<BlogDto> CreateAsync(CreateBlogDto input) => ...;
+
+    [HttpPut] [Route("{id}")]
+    public virtual async Task<BlogDto> UpdateAsync(Guid id, UpdateBlogDto input) => ...;
+
+    [HttpDelete] [Route("{id}")]
+    public virtual async Task DeleteAsync(Guid id) => ...;
+
+    [HttpGet] [Route("clear-cache/{id}")]
+    public virtual async Task ClearCacheAsync(Guid id) => ...;
+}
+```
+
+```csharp
+public class CreateBlogDto
+{
+    [Required] public string Name { get; set; }
+    [Required] public string ShortName { get; set; }
+    public string Description { get; set; }
+}
+
+public class UpdateBlogDto : IHasConcurrencyStamp
+{
+    [Required] public string Name { get; set; }
+    [Required] public string ShortName { get; set; }
+    public string Description { get; set; }
+    public string ConcurrencyStamp { get; set; }
+}
+```
+
+`clear-cache/{id}` flushes the cached blog DTOs — used after a bulk
+external update.
+
+## Permissions
+
+```csharp modules/blogging/src/Volo.Blogging.Application.Contracts.Shared/Volo/Blogging/BloggingPermissions.cs
+public class BloggingPermissions
+{
+    public const string GroupName = "Blogging";
+
+    public static class Blogs    { public const string Default = "Blogging.Blog";
+                                   public const string Management = …;
+                                   public const string Delete = …;
+                                   public const string Update = …;
+                                   public const string Create = …;
+                                   public const string ClearCache = …; }
+
+    public static class Posts    { public const string Default = "Blogging.Post";
+                                   public const string Delete = …; public const string Update = …; public const string Create = …; }
+
+    public static class Tags     { public const string Default = "Blogging.Tag";
+                                   public const string Delete = …; public const string Update = …; public const string Create = …; }
+
+    public static class Comments { public const string Default = "Blogging.Comment";
+                                   public const string Delete = …; public const string Update = …; public const string Create = …; }
+}
+```
+
+## Multi-tenancy
+
+The blogging module is tenant-aware. A blog created with `__tenant: contoso`
+is visible only to that tenant's readers. The most common deployment puts
+the blog inside a tenant; the URL prefix the front-end uses is
+unaffected — only the data behind the controllers changes.
+
+```http
+GET /api/blogging/blogs HTTP/1.1
+__tenant: contoso
+```
+
+## Common error envelope
+
+```json
+{
+  "error": {
+    "code": "Volo.Blogging:UrlAlreadyExist",
+    "message": "Specified url 'hello' already exists in this blog.",
+    "details": null
+  }
+}
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="CMS Kit admin endpoints" icon="user-tie" href="/reference/api/cms-kit-admin-endpoints">
+    The successor surface — same domain, richer feature set.
+  </Card>
+  <Card title="Dynamic controllers" icon="bolt" href="/reference/api/dynamic-controllers">
+    How the routes shown here are reachable directly from the application services.
+  </Card>
+</CardGroup>

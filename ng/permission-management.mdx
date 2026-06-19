@@ -1,0 +1,218 @@
+---
+title: "@abp/ng.permission-management"
+description: "The <abp-permission-management> grid — checkable permission tree backed by the auto-generated PermissionsService, embedded in the Identity and Tenant screens."
+---
+
+`@abp/ng.permission-management` exposes a single high-fidelity component, `<abp-permission-management>`. It renders the permission grid that you reach by clicking *Permissions* on a Role, User, Tenant or Client — grouped checkboxes with indeterminate state propagation, provider context (Role / User / Tenant), and an optional permission tree on the side.
+
+The proxy entry `@abp/ng.permission-management/proxy` ships the `PermissionsService` and DTOs.
+
+## File tree
+
+```text
+packages/permission-management/
+├── package.json            # "@abp/ng.permission-management" — version 7.4.0
+├── proxy/                  # @abp/ng.permission-management/proxy
+└── src/
+    ├── public-api.ts
+    └── lib/
+        ├── permission-management.module.ts
+        ├── components/
+        │   ├── permission-management.component.ts
+        │   ├── permission-management.component.html
+        │   └── index.ts
+        ├── enums/
+        │   └── components.ts (ePermissionManagementComponents)
+        └── models/
+            └── permission-management.ts
+```
+
+## `public-api.ts`
+
+```typescript
+// packages/permission-management/src/public-api.ts
+export * from './lib/components';
+export * from './lib/enums/components';
+export * from './lib/models';
+export * from './lib/permission-management.module';
+```
+
+```typescript
+// packages/permission-management/src/lib/enums/components.ts
+export const enum ePermissionManagementComponents {
+  PermissionManagement = 'PermissionManagement.PermissionManagementComponent',
+}
+```
+
+## Module
+
+```typescript
+// packages/permission-management/src/lib/permission-management.module.ts
+@NgModule({
+  declarations: [PermissionManagementComponent],
+  imports: [CoreModule, ThemeSharedModule],
+  exports: [PermissionManagementComponent],
+})
+export class PermissionManagementModule {}
+```
+
+No `forRoot`/`forChild` factory — the module is purely declarative because the component is fully driven by `@Input()` properties and the `PermissionsService` provided by the proxy entry.
+
+## PermissionManagementComponent
+
+```typescript
+// packages/permission-management/src/lib/components/permission-management.component.ts (excerpt)
+type PermissionWithStyle      = PermissionGrantInfoDto & { style: string };
+type PermissionWithGroupName  = PermissionGrantInfoDto & { groupName: string };
+
+@Component({
+  selector: 'abp-permission-management',
+  templateUrl: './permission-management.component.html',
+  exportAs: 'abpPermissionManagement',
+  styles: [
+    `
+      .overflow-scroll { max-height: 70vh; overflow-y: scroll; }
+      .scroll-in-modal { overflow: auto; max-height: calc(100vh - 15rem) }
+    `,
+  ],
+})
+export class PermissionManagementComponent
+  implements
+    PermissionManagement.PermissionManagementComponentInputs,
+    PermissionManagement.PermissionManagementComponentOutputs
+{
+  @Input() readonly providerName!: string;
+  @Input() readonly providerKey!: string;
+  /* + visible getter/setter, output emitters, internal state */
+}
+```
+
+The internal `selectThisTab`, `onToggle`, `onSelectAllPermissions`, `submit` methods implement:
+
+* indeterminate checkbox propagation when a child permission depends on a parent;
+* the *Grant all* and *Revoke all* shortcuts;
+* a save submission that diffs the current state against the original and posts only the deltas to `PermissionsService.update()`.
+
+### Inputs
+
+| Input | Description |
+| ----- | ----------- |
+| `providerName` | provider key understood by the backend: `'R'` (role), `'U'` (user), `'C'` (client), `'T'` (tenant) |
+| `providerKey` | identifier within that scope (role name, user id, client id, tenant id) |
+| `visible` | two-way binding controlling the modal |
+| `hideBadges` | hide the "x of y granted" badges in group headers |
+
+### Outputs
+
+| Output | When |
+| ------ | ---- |
+| `visibleChange` | modal opens/closes |
+
+### Saved diff
+
+The component keeps two copies of `PermissionGrantInfoDto[]` — `permissions` (current edits) and `_modalPermissions` (the originally-loaded snapshot). On submit it produces an `UpdatePermissionDto[]` containing only entries whose `isGranted` differs:
+
+```typescript
+const updates = permissions
+  .filter((perm, i) => perm.isGranted !== _modalPermissions[i].isGranted)
+  .map(({ name, isGranted }) => ({ name, isGranted } as UpdatePermissionDto));
+```
+
+This minimises the backend round-trip and avoids race conditions when another admin changes a sibling permission concurrently.
+
+## Embedding inside another component
+
+```typescript
+@Component({
+  selector: 'app-roles-actions',
+  template: `
+    <button (click)="open(role)">Permissions</button>
+
+    <abp-permission-management
+      [(visible)]="visible"
+      providerName="R"
+      [providerKey]="role.name"
+      (visibleChange)="onClose($event)">
+    </abp-permission-management>
+  `,
+})
+export class RolesActionsComponent {
+  visible = false;
+  role!: { name: string };
+
+  open(role: { name: string }) {
+    this.role = role;
+    this.visible = true;
+  }
+
+  onClose(open: boolean) {
+    if (!open) console.log('modal closed');
+  }
+}
+```
+
+The Users/Roles components in `@abp/ng.identity` use the same template, keyed off `ePermissionManagementComponents.PermissionManagement` so consumers can swap the entire UI by replacing the component.
+
+## Replacing the modal
+
+```typescript
+import { ePermissionManagementComponents } from '@abp/ng.permission-management';
+
+constructor(replaceable: ReplaceableComponentsService) {
+  replaceable.add({
+    key: ePermissionManagementComponents.PermissionManagement,
+    component: MyPermissionsComponent, // implement PermissionManagementComponentInputs
+  });
+}
+```
+
+`MyPermissionsComponent` must declare the same `providerName` / `providerKey` / `visible` inputs and emit `visibleChange` — `UsersComponent` binds to these by interface.
+
+## Proxy
+
+`@abp/ng.permission-management/proxy` exports:
+
+* `PermissionsService` — `apiName: 'AbpPermissionManagement'`
+  * `get(providerName: string, providerKey: string): Observable<GetPermissionListResultDto>`
+  * `update(providerName, providerKey, body: UpdatePermissionsDto): Observable<void>`
+* `PermissionGroupDto`, `PermissionGrantInfoDto`, `ProviderInfoDto`, `UpdatePermissionDto`, `UpdatePermissionsDto`, `GetPermissionListResultDto`.
+
+```typescript
+import { PermissionsService } from '@abp/ng.permission-management/proxy';
+
+constructor(private permissions: PermissionsService) {}
+
+ngOnInit() {
+  this.permissions.get('R', 'admin').subscribe(({ groups, entityDisplayName }) => {
+    console.log(entityDisplayName, groups);
+  });
+}
+```
+
+## Usage
+
+```typescript
+// app.module.ts (or feature module that needs the modal directly)
+import { PermissionManagementModule } from '@abp/ng.permission-management';
+
+@NgModule({
+  imports: [PermissionManagementModule],
+  declarations: [RolesActionsComponent],
+})
+export class RolesModule {}
+```
+
+## Gotchas
+
+* The component is stateful — re-opening it with a *different* `providerKey` correctly reloads, but mutating `providerKey` while `visible === true` triggers a reload mid-edit and discards unsaved changes.
+* `providerName` codes are short single letters in the framework defaults (`'R'`, `'U'`, `'C'`, `'T'`). Application modules can register custom providers — read the active list from `PermissionsService.get(...).providers` if you need a UI for them.
+* No `providedIn: 'root'` for the component — you must import `PermissionManagementModule` in *every* feature module that references the selector.
+* The styles `.overflow-scroll` and `.scroll-in-modal` are inlined and target the modal heights. If you embed the component outside an `<abp-modal>` (for example as a full page), wrap it in your own scroll container or those rules will clip it.
+* `update()` does a single roundtrip even when the diff is empty — the component short-circuits and just closes the modal without calling the service in that case.
+* Permission *groups* are derived from the backend metadata (e.g. `AbpIdentity` → `Identity Management`). Reordering them client-side will not survive a refresh — the backend is the source of truth.
+
+## Related pages
+
+* `ng/identity.mdx` — Users / Roles screens consume this modal.
+* `ng/feature-management.mdx` — sibling modal with the same input/output shape.
+* `ng/core.mdx` — `PermissionService` (read-only) and `PermissionGuard` (route protection).

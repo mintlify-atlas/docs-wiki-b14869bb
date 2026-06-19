@@ -1,0 +1,271 @@
+---
+title: "IdentityServer4"
+description: "External-service reference for IdentityServer4 — Volo.Abp.IdentityServer integration, supported versions, signing credentials, store providers, and migration notes to OpenIddict."
+---
+
+`Volo.Abp.IdentityServer` (the IS4 integration) is the legacy ABP OAuth2 / OpenID Connect server. It wires Duende's IdentityServer4 into ABP — including AspNet Identity bridging, persisted stores, claims service, and management UIs. This page covers the integration's external surface: which IS4 versions are supported, what stores are required, how signing keys are sourced, and what to consider when moving to the OpenIddict-based replacement.
+
+For the wider auth abstractions see [ABP Auth](/framework/auth) — JWT bearer, OpenID Connect client, and the cookie pipeline. The newer OAuth server module is documented at [OpenIddict](/reference/integrations/openiddict).
+
+## ABP packages
+
+| Package | Purpose |
+| --- | --- |
+| `Volo.Abp.IdentityServer.Domain.Shared` | Domain constants and DTOs. |
+| `Volo.Abp.IdentityServer.Domain` | Domain services, store interfaces, builder. |
+| `Volo.Abp.IdentityServer.EntityFrameworkCore` | EF Core stores for clients, resources, persisted grants. |
+| `Volo.Abp.IdentityServer.MongoDB` | MongoDB stores. |
+| `Volo.Abp.IdentityServer.Installer` | Schema installer for module registration. |
+| `Volo.Abp.PermissionManagement.Domain.IdentityServer` | Permission definitions wired to clients. |
+
+The main module is `AbpIdentityServerDomainModule`. It depends on `AbpIdentityDomainModule` (the user/identity module), `AbpSecurityModule`, `AbpCachingModule`, and the AutoMapper module. The persistence package (`EntityFrameworkCore` or `MongoDB`) provides the IS4 stores.
+
+## Builder options
+
+`AbpIdentityServerBuilderOptions` exposes the high-level toggles:
+
+```csharp
+public class AbpIdentityServerBuilderOptions
+{
+    public bool UpdateJwtSecurityTokenHandlerDefaultInboundClaimTypeMap { get; set; } = true;
+    public bool UpdateAbpClaimTypes { get; set; } = true;
+    public bool IntegrateToAspNetIdentity { get; set; } = true;
+    public bool AddDeveloperSigningCredential { get; set; } = true;
+    public bool AddIdentityServerCookieAuthentication { get; set; } = true;
+}
+```
+
+- `UpdateJwtSecurityTokenHandlerDefaultInboundClaimTypeMap` — clears MS claim mapping (Microsoft's URI-style claims) so JWTs come through with their original short names (`sub`, `role`, `name`).
+- `UpdateAbpClaimTypes` — points `AbpClaimTypes.UserId`/`Role`/`UserName`/`Email` at the IS4 / OIDC names.
+- `IntegrateToAspNetIdentity` — wires `AddAspNetIdentity<IdentityUser>()` on the IS4 builder. Disable only if your user store isn't ABP Identity.
+- `AddDeveloperSigningCredential` — calls `AddDeveloperSigningCredential()` in non-production. Always **false** in production (use real certificate).
+- `AddIdentityServerCookieAuthentication` — adds default IS4 cookies. Disable if you wire cookies elsewhere.
+
+Pre-configure them before module load:
+
+```csharp
+PreConfigure<AbpIdentityServerBuilderOptions>(options =>
+{
+    options.AddDeveloperSigningCredential = false;
+});
+```
+
+## IS4 versions
+
+- **IdentityServer4 v4.x** (LTS line) is the only line ABP wires. Open-source updates ended December 2022; security fixes for IS4 are now part of Duende's commercial successor.
+- Running IS4 in production after 2022 requires a careful security review. ABP's new template projects use **OpenIddict** instead — see the [OpenIddict reference](/reference/integrations/openiddict) and the migration guide in your ABP release notes.
+
+If you remain on IS4:
+
+- Pin to the latest 4.x patch.
+- Apply your own security audits — there are no upstream updates for new CVEs.
+- Plan a migration to OpenIddict (or Duende IdentityServer if you take a commercial licence).
+
+## Signing credentials
+
+By default the integration calls `AddDeveloperSigningCredential()`, which writes a generated RSA key to `tempkey.jwk` in the content root. **Not safe for production** — every deploy that loses the file invalidates all issued tokens.
+
+In production, replace it with a real certificate via the builder pre-configure:
+
+```csharp
+PreConfigure<IIdentityServerBuilder>(builder =>
+{
+    var cert = LoadCertificateFromKeyVault();
+    builder.AddSigningCredential(cert);
+    // Optional validation key during cert rotation:
+    builder.AddValidationKey(cert);
+});
+PreConfigure<AbpIdentityServerBuilderOptions>(options =>
+{
+    options.AddDeveloperSigningCredential = false;
+});
+```
+
+Cert sources commonly used:
+
+- Azure Key Vault (`Azure.Security.KeyVault.Certificates`).
+- AWS Certificate Manager (private CA) — load PEM bytes.
+- Kubernetes secret mounted as PEM.
+- Hardware Security Module via `CngKey`.
+
+Plan a **dual-signing-key rotation**: load both old and new certs, sign with new, validate against both for the JWT lifetime, then drop the old key.
+
+## Store providers
+
+Three storage options for clients, API resources, identity resources, persisted grants and device codes:
+
+| Package | Storage |
+| --- | --- |
+| `Volo.Abp.IdentityServer.EntityFrameworkCore` | EF Core (SQL Server, PostgreSQL, MySQL, Oracle, SQLite). Recommended. |
+| `Volo.Abp.IdentityServer.MongoDB` | MongoDB. |
+| (none) | In-memory; ABP falls back to `InMemoryPersistedGrantStore` and `InMemoryDeviceFlowStore` if you haven't registered a real one. Only suitable for dev. |
+
+The integration code:
+
+```csharp
+if (!services.IsAdded<IPersistedGrantService>())
+{
+    services.TryAddSingleton<IPersistedGrantStore, InMemoryPersistedGrantStore>();
+}
+if (!services.IsAdded<IDeviceFlowStore>())
+{
+    services.TryAddSingleton<IDeviceFlowStore, InMemoryDeviceFlowStore>();
+}
+if (!services.IsAdded<IClientStore>())
+{
+    identityServerBuilder.AddInMemoryClients(configuration.GetSection("IdentityServer:Clients"));
+}
+if (!services.IsAdded<IResourceStore>())
+{
+    identityServerBuilder.AddInMemoryApiResources(configuration.GetSection("IdentityServer:ApiResources"));
+    identityServerBuilder.AddInMemoryIdentityResources(configuration.GetSection("IdentityServer:IdentityResources"));
+}
+```
+
+So the EF/MongoDB packages "win" simply by registering the real stores in their `ConfigureServices`. If you don't reference one, in-memory takes over.
+
+## Sample `appsettings.json` — in-memory bootstrap
+
+The in-memory fallbacks read from `IdentityServer:Clients`, `IdentityServer:ApiResources`, `IdentityServer:IdentityResources`. Useful for dev or for the data seeder:
+
+```json
+{
+  "IdentityServer": {
+    "Clients": [
+      {
+        "ClientId": "MyApp_Web",
+        "ClientSecrets": [{ "Value": "1q2w3e*" }],
+        "AllowedGrantTypes": [ "authorization_code" ],
+        "RedirectUris": [ "https://app.example.com/signin-oidc" ],
+        "PostLogoutRedirectUris": [ "https://app.example.com/signout-callback-oidc" ],
+        "AllowedScopes": [ "openid", "profile", "MyApp" ]
+      }
+    ],
+    "ApiResources": [
+      { "Name": "MyApp", "Scopes": [ "MyApp" ] }
+    ],
+    "IdentityResources": [
+      { "Name": "openid" }, { "Name": "profile" }, { "Name": "email" }
+    ]
+  }
+}
+```
+
+For production use the seeder that comes with the ABP startup template — it inserts the same data into the EF/Mongo stores.
+
+## Token cleanup
+
+`TokenCleanupOptions` (re-exposed through `Volo.Abp.IdentityServer.Tokens`) controls the background job that purges expired persisted grants. It runs through the ABP background-worker abstraction; enable a worker host (Hangfire, Quartz or default) to pick it up.
+
+## Token signing & encryption notes
+
+- IS4 issues JWTs by default. Use `AccessTokenType=Reference` on a client to switch to reference tokens (introspection required).
+- Set `AccessTokenLifetime` per client (default 3600 s).
+- For client credentials clients used only for service-to-service, lifetimes 600–1800 s + short retry windows are typical.
+- Enable PKCE for all interactive clients. ABP templates do this automatically.
+
+## Network setup
+
+1. **Authority URL.** Public HTTPS URL of your STS, e.g. `https://auth.example.com`. The discovery doc lives at `/.well-known/openid-configuration`. Clients (including ABP `OpenIdConnect` consumers) hit this on startup.
+2. **Behind a reverse proxy.** Set `app.UseForwardedHeaders(...)` and `ASPNETCORE_FORWARDEDHEADERS_ENABLED=true` so issued tokens use the proxy host, not the internal pod IP.
+3. **Cookies.** If the STS is behind a different host than the SPAs, configure cookie SameSite/secure attributes and CORS.
+4. **CORS.** Add the CORS origins for JS clients via the IS4 `Clients` `AllowedCorsOrigins`.
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `IDX10501: Signature validation failed. Unable to match key` on relying party | Signing cert rotated, RP cached old discovery. | Force refresh via `RequireHttpsMetadata=true` and proper cache duration; or roll using `AddValidationKey` overlap. |
+| Tokens issued for `http://internal-pod-ip` | Forwarded headers ignored. | Configure forwarded headers middleware. |
+| `invalid_client` on token endpoint | Wrong client secret or PKCE missing. | Verify secret; ensure SPA uses PKCE. |
+| `invalid_scope` | Scope not defined in resource/identity resources. | Add scope to the resource store and to client's `AllowedScopes`. |
+| Persistent `tempkey.jwk` regenerated on every container restart | `AddDeveloperSigningCredential` enabled in prod. | Disable it; load real cert. |
+| Migrations fail with FK error to `AbpUsers` | Identity / IS4 schemas out of sync. | Run all module migrations together; both share a DbContext or use distinct contexts with consistent user id type. |
+| `404` on `/account/login` | Login UI not added. | The IS4 UI is not auto-installed; use ABP's account module or your own Razor pages. |
+
+## Migration to OpenIddict
+
+ABP 6.0+ recommends OpenIddict for new applications. Migration steps (high level):
+
+1. Reference `Volo.Abp.OpenIddict.AspNetCore` instead of `Volo.Abp.IdentityServer.AspNetCore`.
+2. Replace IS4 EF stores with OpenIddict EF stores (different schema; data must be re-seeded).
+3. Update consumers' authority discovery (URL stays the same; endpoint paths differ slightly — `connect/authorize`, `connect/token`, `connect/userinfo`).
+4. Re-issue refresh tokens — formats are incompatible.
+
+See the [OpenIddict reference](/reference/integrations/openiddict) for endpoint paths and options.
+
+## Observability hints
+
+- **IS4 events.** `IdentityServerOptions.Events` raises information/failure/error events; subscribe via `IEventSink`. ABP enables `RaiseErrorEvents`/`RaiseInformationEvents`/`RaiseFailureEvents` by default — ship to your log pipeline.
+- **OpenTelemetry.** Add `OpenTelemetry.Instrumentation.AspNetCore`; STS endpoints get spans, including `/connect/token` latency.
+- **Persisted grants growth.** Monitor row count in `IdentityServerPersistedGrants`; spikes indicate refresh-token leaks. Token cleanup background worker should keep this flat.
+- **Failed signin counters.** Pair the AspNet Identity events with rate-limiting (`Microsoft.AspNetCore.RateLimiting`) to throttle brute force.
+
+## Persisted-grant store schema
+
+EF Core schema (default mapping):
+
+| Table | Purpose |
+| --- | --- |
+| `IdentityServerClients` | Client config: id, secrets, grants, scopes, redirect URIs. |
+| `IdentityServerApiResources` | API resource definitions and scopes. |
+| `IdentityServerIdentityResources` | Identity resources (`openid`, `profile`). |
+| `IdentityServerApiScopes` | Standalone scopes. |
+| `IdentityServerPersistedGrants` | Refresh tokens, reference tokens, codes, consents. |
+| `IdentityServerDeviceFlowCodes` | Device-flow codes. |
+
+The `PersistedGrants` table is the noisiest — every refresh-token rotation writes a new row. Schedule a cleanup job (the integration includes one driven by `TokenCleanupOptions`).
+
+MongoDB uses one collection per aggregate. Indexes on `SubjectId`, `ClientId`, `Type`, and `Expiration` are required for cleanup performance.
+
+## Caching
+
+`Volo.Abp.IdentityServer.Domain` depends on `Volo.Abp.Caching`. Client and resource lookups are cached via `IDistributedCache` — wire Redis (see [Redis](/reference/integrations/redis)) before production deploy. Without it the same SQL fires per token request.
+
+`AbpClaimsServiceOptions.RequestedClaims` registers `TenantId` and `EditionId` claims by default; for additional claims add them in `ConfigureServices`:
+
+```csharp
+Configure<AbpClaimsServiceOptions>(options =>
+{
+    options.RequestedClaims.Add("custom_org_id");
+});
+```
+
+## Multi-tenancy
+
+IS4 doesn't know about tenants natively. ABP adds tenant resolution via:
+
+- `TenantClaimsMappingExtensions` — adds `tenantid` claim to tokens.
+- `AbpClaimsService` — pulls tenant id from `ICurrentTenant` during issuance.
+
+Clients can be tenant-scoped by setting the `TenantId` property on the client record. Per-tenant client secrets, scopes, and redirect URIs are stored alongside the global ones.
+
+## Device flow / extension grants
+
+`InMemoryDeviceFlowStore` is the dev default; switch to `EfDeviceFlowStore` or `MongoDeviceFlowStore` automatically by adding the persistence package.
+
+Extension grants (e.g. token exchange, impersonation) are registered with IS4's `ITokenExtensionGrantValidator`:
+
+```csharp
+services.AddTransient<IExtensionGrantValidator, TokenExchangeGrantValidator>();
+```
+
+ABP's startup template includes a `LinkUserExtensionGrantValidator` for the user-link feature.
+
+## CSP and embedded UI
+
+The default account UI (Volo.Abp.Account) renders inside iframes for some flows (consent, prompt=none). Configure CSP appropriately in your reverse proxy — too-strict CSP breaks the silent-renew flow.
+
+## Database upgrades
+
+When upgrading ABP versions that touch IS4 schemas:
+
+1. Pin the previous module versions, run migrations to catch up.
+2. Update ABP packages.
+3. Generate new migration with `dotnet ef migrations add ...` for the IS4 DbContext.
+4. Apply with downtime — IS4 token issuance during a migration that re-keys a column is risky.
+
+## Related references
+
+- [OpenIddict](/reference/integrations/openiddict) — modern replacement.
+- [JWT Bearer](/framework/auth/jwt-bearer), [OpenID Connect client](/framework/auth/openid-connect) — relying-party side.
